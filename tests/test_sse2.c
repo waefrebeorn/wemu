@@ -4,9 +4,11 @@
  * rule as test_isa: the oracle is written from the SDM semantics, not
  * from the implementation. */
 #include "wemu.h"
+#include "wemu_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <stdint.h>
 
 #define FAIL(...) do { fprintf(stderr, "FAIL: " __VA_ARGS__); exit(1); } while (0)
@@ -410,6 +412,75 @@ int main(void) {
                     check("shiftgrp-psw-legacy", out, want, 16);
                 }
             }
+        }
+    }
+    /* Named regression: (v)comisd/(v)ucomisd scalar compare -> EFLAGS.
+     * busybox seq faulted #UD on comisd %xmm1,%xmm5. Gate the four
+     * outcomes (less/greater/equal/unordered) for double + single,
+     * reg and memory forms, legacy and VEX. */
+    {
+        struct { double a, b; uint64_t want; } T[] = {
+            { 1.0, 2.0, WF_CF },
+            { 2.0, 1.0, 0 },
+            { 1.0, 1.0, WF_ZF },
+        };
+        for (int t = 0; t < 3; t++) {
+            for (int form = 0; form < 4; form++) {
+                WemuCpu *c = wemu_cpu_create(0x10000);
+                uint8_t code[16]; int n = 0;
+                int vexf = form >= 2, memf = form & 1;
+                if (vexf) { code[n++]=0xC5; code[n++]=0xF9; } /* pp=1: double */
+                else { code[n++]=0x66; code[n++]=0x0F; }
+                code[n++]=0x2F; /* VEX C5 already implies the 0F map */
+                if (memf) {
+                    /* absolute [0x2000] needs SIB (modrm 04, SIB 25):
+                     * modrm 05 alone is RIP-relative in 64-bit mode */
+                    code[n++]=0x04; code[n++]=0x25; code[n++]=0x00;
+                    code[n++]=0x20; code[n++]=0x00; code[n++]=0x00;
+                    wemu_mem_write(c, 0x2000, &T[t].b, 8);
+                } else {
+                    code[n++]=0xC1; /* xmm0, xmm1 */
+                    memcpy(c->xmm[1], &T[t].b, 8);
+                }
+                code[n++]=0xF4;
+                memcpy(c->xmm[0], &T[t].a, 8);
+                wemu_mem_write(c, 0x1000, code, (size_t)n);
+                wemu_cpu_set_rip(c, 0x1000);
+                wemu_cpu_run(c, 4);
+                if (wemu_cpu_fault(c)) FAIL("comisd form%d fault %d\n", form, wemu_cpu_fault(c));
+                uint64_t f = wemu_cpu_rflags(c) & (WF_ZF|WF_PF|WF_CF|WF_OF|WF_SF|WF_AF);
+                if (f != T[t].want)
+                    FAIL("comisd form%d %g vs %g flags=%llx want %llx\n",
+                         form, T[t].a, T[t].b,
+                         (unsigned long long)f, (unsigned long long)T[t].want);
+                wemu_cpu_destroy(c);
+            }
+        }
+        /* unordered (NaN): ZF=PF=CF=1 */
+        {
+            WemuCpu *c = wemu_cpu_create(0x10000);
+            uint8_t code[] = { 0x66,0x0F,0x2F,0xC1, 0xF4 };
+            double one = 1.0, nan = NAN;
+            memcpy(c->xmm[0], &one, 8); memcpy(c->xmm[1], &nan, 8);
+            wemu_mem_write(c, 0x1000, code, sizeof code);
+            wemu_cpu_set_rip(c, 0x1000);
+            wemu_cpu_run(c, 4);
+            uint64_t f = wemu_cpu_rflags(c) & (WF_ZF|WF_PF|WF_CF);
+            if (f != (WF_ZF|WF_PF|WF_CF)) FAIL("comisd unordered flags=%llx\n", (unsigned long long)f);
+            wemu_cpu_destroy(c);
+        }
+        /* single-precision comiss (no 66) */
+        {
+            WemuCpu *c = wemu_cpu_create(0x10000);
+            uint8_t code[] = { 0x0F,0x2F,0xC1, 0xF4 };
+            float fa = 1.0f, fb = 2.0f;
+            memcpy(c->xmm[0], &fa, 4); memcpy(c->xmm[1], &fb, 4);
+            wemu_mem_write(c, 0x1000, code, sizeof code);
+            wemu_cpu_set_rip(c, 0x1000);
+            wemu_cpu_run(c, 4);
+            if (wemu_cpu_fault(c)) FAIL("comiss fault %d\n", wemu_cpu_fault(c));
+            if (!(wemu_cpu_rflags(c) & WF_CF)) FAIL("comiss less CF\n");
+            wemu_cpu_destroy(c);
         }
     }
     printf("SSE2 GATE PASS (100 random rounds x 128/256 vs C oracle)\n");

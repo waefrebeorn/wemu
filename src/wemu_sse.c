@@ -3,6 +3,7 @@
  * triple-faulted the WuBuOS CI boot (gcc14 vectorized memset). WEMU
  * executes them instead of dying. One concern: vector register ops. */
 #include "wemu_internal.h"
+#include <math.h>
 
 #define REX_R(in) (((in)->rex >> 2) & 1)
 #define REX_B(in) ((in)->rex & 1)
@@ -451,6 +452,39 @@ int wemu_exec_sse(WemuCpu *c, const WemuInsn *in) {
             } else if (wemu_mem_write(c, wemu_eff_addr(c, in), v, (size_t)bytes) != 0)
                 return -1;
         }
+        return 1;
+    }
+    if (full == 0x12E || full == 0x12F) {
+        /* (v)ucomisd/(v)comisd (66) and (v)ucomiss/(v)comiss (none):
+         * scalar compare -> EFLAGS (ZF/PF/CF; OF/SF/AF cleared).
+         * busybox seq's FP formatting path compares with comisd. */
+        int pp = vex ? ((in->vex_len == 3 ? in->vex[2] : in->vex[1]) & 3)
+                     : (sse66 ? 1 : 0);
+        int dbl = pp == 1;
+        if (vex && L) return 0; /* VEX.L=1 is #UD for scalar compares */
+        double a, b;
+        if (dbl) {
+            memcpy(&a, c->xmm[dst], 8);
+            if ((in->modrm >> 6) == 3) {
+                int rm = (in->modrm & 7) | (REX_B(in) << 3);
+                memcpy(&b, c->xmm[rm], 8);
+            } else if (wemu_mem_read(c, wemu_eff_addr(c, in), &b, 8) != 0)
+                return -1;
+        } else {
+            float fa, fb;
+            memcpy(&fa, c->xmm[dst], 4);
+            if ((in->modrm >> 6) == 3) {
+                int rm = (in->modrm & 7) | (REX_B(in) << 3);
+                memcpy(&fb, c->xmm[rm], 4);
+            } else if (wemu_mem_read(c, wemu_eff_addr(c, in), &fb, 4) != 0)
+                return -1;
+            a = (double)fa; b = (double)fb;
+        }
+        uint64_t f = c->rflags & ~(WF_ZF | WF_PF | WF_CF | WF_OF | WF_SF | WF_AF);
+        if (isnan(a) || isnan(b)) f |= WF_ZF | WF_PF | WF_CF;
+        else if (a < b) f |= WF_CF;
+        else if (a == b) f |= WF_ZF;
+        c->rflags = f;
         return 1;
     }
     if ((full == 0x128 || full == 0x129 || full == 0x110 || full == 0x111) &&
