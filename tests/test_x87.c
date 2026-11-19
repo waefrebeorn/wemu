@@ -222,6 +222,49 @@ int main(void) {
         if (em != hw || em != 0x037F) FAIL("fninit cw emu=%04x hw=%04x\n", em, hw);
         wemu_cpu_destroy(c);
     }
+    /* 11. fxam class table (SDM C3 C2 C0): glibc __printf_fp classifies
+     * with fxam — the seq-all-zeros bug was normal misclassified. */
+    {
+        struct { double v; int c0, c2, c3; } T[] = {
+            { 1.0,  0, 1, 0 },  /* normal */
+            { -1.0, 1, 1, 0 },  /* normal negative: C0=sign */
+            { 0.0,  0, 0, 1 },  /* zero */
+            { -0.0, 1, 0, 1 },  /* negative zero */
+        };
+        for (int t = 0; t < 4; t++) {
+            uint8_t code[] = { 0xDD, M64(0), 0xD9, 0xE5, 0xDF, 0xE0, 0xF4 };
+            WemuCpu *c = wemu_cpu_create(0x10000);
+            put64(c, 0x2000, T[t].v);
+            wemu_mem_write(c, 0x1000, code, sizeof code);
+            wemu_cpu_set_rip(c, 0x1000);
+            wemu_cpu_run(c, 10);
+            if (wemu_cpu_fault(c)) FAIL("fxam fault\n");
+            uint16_t sw = (uint16_t)wemu_cpu_reg(c, 0);
+            int c0 = (sw >> 8) & 1, c2 = (sw >> 10) & 1, c3 = (sw >> 14) & 1;
+            if (c0 != T[t].c0 || c2 != T[t].c2 || c3 != T[t].c3)
+                FAIL("fxam %g: cc=%d%d%d want %d%d%d\n", T[t].v,
+                     c0, c2, c3, T[t].c0, T[t].c2, T[t].c3);
+            wemu_cpu_destroy(c);
+        }
+        /* infinity: C3=0 C2=1 C0=1 ; NaN: C3=0 C2=0 C0=1 */
+        struct { double v; int c0, c2, c3; } U[] = {
+            { INFINITY, 1, 1, 0 }, { NAN, 1, 0, 0 },
+        };
+        for (int t = 0; t < 2; t++) {
+            uint8_t code[] = { 0xDD, M64(0), 0xD9, 0xE5, 0xDF, 0xE0, 0xF4 };
+            WemuCpu *c = wemu_cpu_create(0x10000);
+            put64(c, 0x2000, U[t].v);
+            wemu_mem_write(c, 0x1000, code, sizeof code);
+            wemu_cpu_set_rip(c, 0x1000);
+            wemu_cpu_run(c, 10);
+            uint16_t sw = (uint16_t)wemu_cpu_reg(c, 0);
+            int c0 = (sw >> 8) & 1, c2 = (sw >> 10) & 1, c3 = (sw >> 14) & 1;
+            if (c0 != U[t].c0 || c2 != U[t].c2 || c3 != U[t].c3)
+                FAIL("fxam special %d: cc=%d%d%d want %d%d%d\n", t,
+                     c0, c2, c3, U[t].c0, U[t].c2, U[t].c3);
+            wemu_cpu_destroy(c);
+        }
+    }
     printf("X87 GATE PASS (round-trips, IEEE arith, cc table, rounding, native cw)\n");
     return 0;
 }

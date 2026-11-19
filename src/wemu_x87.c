@@ -163,14 +163,21 @@ int wemu_x87_exec(WemuCpu *c, const WemuInsn *in) {
             case 0xE0: *st(c, 0) = -*st(c, 0); return 1;      /* fchs */
             case 0xE1: *st(c, 0) = fabs(*st(c, 0)); return 1; /* fabs */
             case 0xE4: x87_compare(c, *st(c, 0), 0.0); return 1; /* ftst */
-            case 0xE5: { /* fxam: C0=sign/class, C2=class, C3=class */
+            case 0xE5: { /* fxam: SDM class table C3 C2 C0 (+C1=sign):
+                * unsupported 000, NaN 001, normal 010, inf 011,
+                * zero 100, empty 101, denormal 110. glibc __printf_fp
+                * classifies with fxam — a wrong class prints 0. */
                 double v = *st(c, 0);
-                int c0 = (signbit(v) != 0), c2 = 0, c3 = 0;
+                int c0, c2, c3;
                 if (isnan(v)) { c0 = 1; c2 = 0; c3 = 0; }
-                else if (isinf(v)) { c2 = 1; c3 = 0; }
-                else if (v == 0.0) { c2 = 0; c3 = 1; }
-                else { c2 = 1; c3 = 1; } /* normal */
+                else if (isinf(v)) { c0 = 1; c2 = 1; c3 = 0; }
+                else if (v == 0.0) { c0 = (signbit(v) != 0); c2 = 0; c3 = 1; }
+                else if (isnormal(v)) { c0 = (signbit(v) != 0); c2 = 1; c3 = 0; }
+                else { c0 = (signbit(v) != 0); c2 = 1; c3 = 1; } /* denormal */
                 set_cc(c, c0, c2, c3);
+                uint16_t sw = c->x87_sw & ~X87_SW_C1;
+                if (signbit(v)) sw |= X87_SW_C1;
+                c->x87_sw = sw;
                 return 1;
             }
             case 0xE8: x87_push(c, 1.0); return 1;
