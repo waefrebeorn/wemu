@@ -566,6 +566,47 @@ int main(void) {
             wemu_cpu_destroy(c);
         }
     }
+    /* Named regression: movq xmm -> r64 (66 REX.W 0F 7E) must move all
+     * 64 bits. glibc __printf_fp extracts doubles with movq; the old
+     * 32-bit-only handler printed every integer-valued double as 0
+     * (busybox seq 1 5 -> five zeros, awk 2+3 -> 0). Also movd 32-bit
+     * merge semantics + the r64 -> xmm direction (0F 6E REX.W). */
+    {
+        WemuCpu *c = wemu_cpu_create(0x10000);
+        uint8_t code[] = { 0x66,0x48,0x0F,0x7E,0xC0, 0xF4 }; /* movq xmm0,rax */
+        double d = 5.0; /* 0x4014000000000000: low half is ZERO */
+        memcpy(c->xmm[0], &d, 8);
+        wemu_mem_write(c, 0x1000, code, sizeof code);
+        wemu_cpu_set_rip(c, 0x1000);
+        wemu_cpu_run(c, 4);
+        if (wemu_cpu_fault(c)) FAIL("movq fault %d\n", wemu_cpu_fault(c));
+        uint64_t bits = wemu_cpu_reg(c, 0), want;
+        memcpy(&want, &d, 8);
+        if (bits != want) FAIL("movq xmm0,rax: got %llx want %llx\n",
+            (unsigned long long)bits, (unsigned long long)want);
+        wemu_cpu_destroy(c);
+        /* round-trip r64 -> xmm0 (66 REX.W 0F 6E) */
+        c = wemu_cpu_create(0x10000);
+        uint8_t code2[] = { 0x66,0x48,0x0F,0x6E,0xC0,
+                            0x66,0x48,0x0F,0x7E,0xC1, 0xF4 };
+        wemu_cpu_set_reg(c, 0, want);
+        wemu_mem_write(c, 0x1000, code2, sizeof code2);
+        wemu_cpu_set_rip(c, 0x1000);
+        wemu_cpu_run(c, 6);
+        if (wemu_cpu_reg(c, 1) != want) FAIL("movq roundtrip\n");
+        wemu_cpu_destroy(c);
+        /* movd (no REX.W): 32-bit merge keeps upper GPR bits */
+        c = wemu_cpu_create(0x10000);
+        uint8_t code3[] = { 0x66,0x0F,0x7E,0xC0, 0xF4 };
+        uint32_t lo = 0xdeadbeef;
+        memcpy(c->xmm[0], &lo, 4);
+        wemu_cpu_set_reg(c, 0, 0x1122334400000000ull);
+        wemu_mem_write(c, 0x1000, code3, sizeof code3);
+        wemu_cpu_set_rip(c, 0x1000);
+        wemu_cpu_run(c, 4);
+        if (wemu_cpu_reg(c, 0) != 0x11223344deadbeefull) FAIL("movd merge\n");
+        wemu_cpu_destroy(c);
+    }
     printf("SSE2 GATE PASS (100 random rounds x 128/256 vs C oracle)\n");
     return 0;
 }

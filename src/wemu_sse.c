@@ -156,13 +156,19 @@ int wemu_exec_sse(WemuCpu *c, const WemuInsn *in) {
             memcpy(c->xmm[dst], &v, 8);
             return 1;
         }
-        uint32_t v;
-        memcpy(&v, c->xmm[dst], 4);
+        /* 66 0F 7E: movd r/m32, xmm; 66 REX.W 0F 7E: movq r/m64, xmm.
+         * The REX.W form moves ALL 64 bits — glibc __printf_fp extracts
+         * the double with movq; dropping the upper half printed every
+         * integer-valued double as 0 (busybox seq/awk). */
+        int bytes = (in->rex & 8) ? 8 : 4;
+        uint64_t v = 0;
+        memcpy(&v, c->xmm[dst], (size_t)bytes);
         if ((in->modrm >> 6) == 3) {
             int rm = (in->modrm & 7) | (REX_B(in) << 3);
-            c->r[rm] = (c->r[rm] & ~0xffffffffull) | v;
+            if (bytes == 4) c->r[rm] = (c->r[rm] & ~0xffffffffull) | (uint32_t)v;
+            else c->r[rm] = v;
         } else {
-            wemu_mem_write(c, wemu_eff_addr(c, in), &v, 4);
+            wemu_mem_write(c, wemu_eff_addr(c, in), &v, (size_t)bytes);
         }
         return 1;
     }
