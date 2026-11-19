@@ -212,6 +212,14 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
         if (sh < 0) return -1;
     }
 
+    /* x87 FPU: PRIMARY-map escapes D8-DF (no 0F prefix) — one leaf */
+    if (!in->vex_len && o >= 0xD8 && o <= 0xDF) {
+        int xr = wemu_x87_exec(c, in);
+        if (xr == 1) { c->rip += in->len; return 0; }
+        if (xr < 0) { c->fault = 14; return -1; }
+        goto ud;
+    }
+
     if (full < 0x100 && o <= 0x3D && (o & 7) <= 5 && (o & 0xC0) == 0) {
         int op = (o >> 3) & 7;
         int form = o & 7;

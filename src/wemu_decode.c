@@ -95,7 +95,8 @@ int wemu_decode(WemuCpu *cpu, WemuInsn *in) {
         else if (b == 0xF2 || b == 0xF3) { in->rep = b; take(&f); }
         else if (b == 0x64 || b == 0x65) { in->seg = b; take(&f); }
         else if (b == 0xF0 || b == 0x2E || b == 0x36 || b == 0x3E ||
-                 b == 0x26) { take(&f); }
+                 b == 0x26 || b == 0x9B) { take(&f); } /* 9B = fwait: x87
+                 sync prefix, no-op for the interpreter (no async FP) */
         else break;
         rex = 0; /* REX must be last prefix */
     }
@@ -161,6 +162,7 @@ modrm:;
         if (o >= 0xC0 && o <= 0xC1) need_modrm = 1;
         if (o == 0xC6 || o == 0xC7) need_modrm = 1;
         if (o == 0xD0 || o == 0xD1 || o == 0xD2 || o == 0xD3) need_modrm = 1;
+        if (o >= 0xD8 && o <= 0xDF) need_modrm = 1; /* x87 escapes */
         if (o == 0xF6 || o == 0xF7) need_modrm = 1;
         if (o == 0xFE || o == 0xFF) need_modrm = 1;
         if (o == 0x8F) need_modrm = 1;

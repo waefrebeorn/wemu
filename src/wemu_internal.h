@@ -15,6 +15,10 @@ struct WemuCpu {
     uint8_t  ymm_hi[16][16];   /* upper 128 bits of YMM (VEX.256) */
     uint64_t cr0, cr2, cr3, cr4, efer;
     uint64_t fs_base, gs_base; /* user-mode TLS segment bases */
+    /* x87 FPU (wemu_x87.c owns semantics); st(0) = x87_st[x87_top] */
+    double   x87_st[8];
+    int      x87_top;
+    uint16_t x87_cw, x87_sw;
     uint64_t elf_brk;          /* page-aligned end of loaded ELF image */
     uint8_t *ram;
     uint64_t ram_size;
@@ -71,6 +75,7 @@ uint64_t wemu_translate(WemuCpu *cpu, uint64_t va, int *fault);
 
 /* effective address for a ModRM memory operand (one owner: exec + sse) */
 uint64_t wemu_eff_addr(WemuCpu *cpu, const WemuInsn *in);
+int wemu_x87_exec(WemuCpu *cpu, const WemuInsn *in); /* 1 ok, 0 #UD, -1 mem */
 
 /* port I/O (wemu_machine.c owns devices; bare CPU ignores/returns ~0) */
 void wemu_port_out(WemuCpu *cpu, uint16_t port, uint32_t val, int bytes);

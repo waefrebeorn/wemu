@@ -62,6 +62,7 @@ WemuCpu *wemu_cpu_create(uint64_t ram_size) {
     cpu->rflags = 2;
     cpu->cr0 = 0x11; /* PE|MP: long mode ready, paging OFF until enabled */
     cpu->efer = 0xd00;        /* LME|LMA|NXE */
+    cpu->x87_cw = 0x037F;     /* x87 reset: all exceptions masked, round-nearest */
     cpu->r[4] = ram_size - 0x1000; /* default stack near RAM top */
     return cpu;
 }
