@@ -59,6 +59,10 @@ int wemu_cpu_halted(const WemuCpu *cpu);
  * uses this; the guest itself halts via HLT or the default hook). */
 void wemu_cpu_halt(WemuCpu *cpu);
 int wemu_cpu_fault(const WemuCpu *cpu);      /* 0 = none, else x86 vector */
+/* Clear a pending fault (a syscall hook that translated a bad guest
+ * pointer to -EFAULT uses this: the guest gets the errno, not a CPU
+ * exception it never architecturally took). */
+void wemu_cpu_clear_fault(WemuCpu *cpu);
 uint64_t wemu_cpu_fault_addr(const WemuCpu *cpu); /* CR2 for #PF */
 
 /* XMM register read (16 bytes). */

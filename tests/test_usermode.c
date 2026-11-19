@@ -275,6 +275,195 @@ static void test_grp1_imm8(void) {
     printf("ok: grp1 imm8 (80 /r ib) length + CH semantics\n");
 }
 
+static void test_alu_imm8(void) {
+    /* the busybox-found gap: accumulator imm8 forms (04/0C/.../3C)
+     * must consume their immediate. cmp al,2 with AL=2 -> ZF=1, and
+     * the following mov must execute intact (length differential). */
+    WemuCpu *cpu = wemu_cpu_create(0x10000);
+    uint8_t code[] = { 0x3C, 0x02, 0xB8, 0x07, 0x00, 0x00, 0x00, 0xF4 };
+    wemu_cpu_load(cpu, 0x1000, code, sizeof code);
+    wemu_cpu_set_rip(cpu, 0x1000);
+    wemu_cpu_set_reg(cpu, 0, 2);
+    wemu_cpu_run(cpu, 6);
+    if (wemu_cpu_fault(cpu)) FAIL("cmp al,imm8 fault %d\n",
+        wemu_cpu_fault(cpu));
+    if (wemu_cpu_reg(cpu, 0) != 7) FAIL("cmp al,imm8 length: eax=%llu\n",
+        (unsigned long long)wemu_cpu_reg(cpu, 0));
+    if (!(wemu_cpu_rflags(cpu) & 0x40)) FAIL("cmp al,2 with al=2: ZF=0\n");
+    wemu_cpu_destroy(cpu);
+    printf("ok: accumulator imm8 (cmp al,ib) length + flags\n");
+}
+
+static void test_two_byte_not_string(void) {
+    /* the strtol root cause: the string leaf matched low opcode bytes
+     * and ate 0F AF (imul) as SCAS, 0F AB (bts) as STOS. Regression:
+     * imul r,rm multiplies; bts sets a bit without storing AL. */
+    WemuCpu *cpu = wemu_cpu_create(0x10000);
+    uint8_t code[] = {
+        0xBF, 0x0A, 0x00, 0x00, 0x00,             /* mov edi,10 */
+        0x4C, 0x63, 0xFF,                         /* movslq edi,r15 */
+        0xBE, 0x07, 0x00, 0x00, 0x00,             /* mov esi,7 */
+        0x49, 0x0F, 0xAF, 0xF7,                   /* imul r15,rsi -> 70 */
+        0x48, 0x0F, 0xAB, 0xFE,                   /* bts rsi,rdi (bit10) */
+        0xF4,
+    };
+    wemu_cpu_load(cpu, 0x1000, code, sizeof code);
+    wemu_cpu_set_rip(cpu, 0x1000);
+    wemu_cpu_run(cpu, 10);
+    if (wemu_cpu_fault(cpu)) FAIL("two-byte/string fault %d\n",
+        wemu_cpu_fault(cpu));
+    if (wemu_cpu_reg(cpu, 6) != (70 | (1ull << 10)))
+        FAIL("imul r,rm / bts: rsi=%llx want %llx\n",
+             (unsigned long long)wemu_cpu_reg(cpu, 6),
+             (unsigned long long)(70 | (1ull << 10)));
+    wemu_cpu_destroy(cpu);
+    printf("ok: 0F AF imul / 0F AB bts not eaten by string leaf\n");
+}
+
+static void test_xchg_rax(void) {
+    /* busybox-found gap: 90+r is xchg rAX,r (only 90 without REX.B is
+     * nop). 64- and 32-bit forms, vs C oracle. */
+    WemuCpu *cpu = wemu_cpu_create(0x10000);
+    uint8_t code64[] = { 0x48, 0x93, 0xF4 };       /* xchg rax,rbx */
+    wemu_cpu_load(cpu, 0x1000, code64, sizeof code64);
+    wemu_cpu_set_rip(cpu, 0x1000);
+    wemu_cpu_set_reg(cpu, 0, 0x1111222233334444ull);
+    wemu_cpu_set_reg(cpu, 3, 0xAAAA5555AAAA5555ull);
+    wemu_cpu_run(cpu, 4);
+    if (wemu_cpu_reg(cpu, 0) != 0xAAAA5555AAAA5555ull ||
+        wemu_cpu_reg(cpu, 3) != 0x1111222233334444ull)
+        FAIL("xchg rax,rbx 64\n");
+    wemu_cpu_destroy(cpu);
+    cpu = wemu_cpu_create(0x10000);
+    uint8_t code32[] = { 0x93, 0xF4 };             /* xchg eax,ebx */
+    wemu_cpu_load(cpu, 0x1000, code32, sizeof code32);
+    wemu_cpu_set_rip(cpu, 0x1000);
+    wemu_cpu_set_reg(cpu, 0, 0xFFFFFFFF00000001ull);
+    wemu_cpu_set_reg(cpu, 3, 0xFFFFFFFF00000002ull);
+    wemu_cpu_run(cpu, 4);
+    if (wemu_cpu_reg(cpu, 0) != 2 || wemu_cpu_reg(cpu, 3) != 1)
+        FAIL("xchg eax,ebx 32 zero-extend: rax=%llx rbx=%llx\n",
+             (unsigned long long)wemu_cpu_reg(cpu, 0),
+             (unsigned long long)wemu_cpu_reg(cpu, 3));
+    wemu_cpu_destroy(cpu);
+    printf("ok: xchg rAX,r 64/32 (90+r, nop only for plain 90)\n");
+}
+
+static void test_xadd(void) {
+    /* lock xadd %eax,(%rbx): memory += reg, reg <- old memory.
+     * Differential vs C oracle incl. wrap (CF) and sign overflow. */
+    struct { uint64_t rm, reg; int bytes; } cases[] = {
+        { 5, 3, 4 }, { 0xFFFFFFFF, 1, 4 }, { 0x7FFFFFFF, 1, 4 },
+        { 5, 3, 8 }, { ~0ull, 1, 8 }, { 0x7FFFFFFFFFFFFFFFull, 1, 8 },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        WemuCpu *cpu = wemu_cpu_create(0x10000);
+        uint64_t v = cases[i].rm;
+        wemu_mem_write(cpu, 0x2000, &v, 8);
+        uint8_t code[40];
+        int n = 0;
+        if (cases[i].bytes == 4) {
+            code[n++]=0xB8; uint32_t g32=(uint32_t)cases[i].reg;
+            memcpy(code+n,&g32,4); n+=4;
+            code[n++]=0xF0; code[n++]=0x0F; code[n++]=0xC1; code[n++]=0x05;
+        } else {
+            code[n++]=0x48; code[n++]=0xB8; uint64_t g64=cases[i].reg;
+            memcpy(code+n,&g64,8); n+=8;
+            code[n++]=0xF0; code[n++]=0x48; code[n++]=0x0F; code[n++]=0xC1; code[n++]=0x05;
+        }
+        int32_t d = (int32_t)(0x2000 - (0x1000 + n + 4));
+        memcpy(code+n,&d,4); n+=4;
+        code[n++]=0xF4;
+        wemu_cpu_load(cpu, 0x1000, code, (size_t)n);
+        wemu_cpu_set_rip(cpu, 0x1000);
+        wemu_cpu_run(cpu, 6);
+        if (wemu_cpu_fault(cpu)) FAIL("xadd fault %d case %zu\n",
+            wemu_cpu_fault(cpu), i);
+        int bits = cases[i].bytes * 8;
+        uint64_t mask = bits >= 64 ? ~0ull : ((1ull << bits) - 1);
+        uint64_t want_mem = (cases[i].rm + cases[i].reg) & mask;
+        uint64_t got_mem = 0;
+        wemu_mem_read(cpu, 0x2000, &got_mem, 8);
+        got_mem &= mask;
+        if (got_mem != want_mem) FAIL("xadd mem case %zu: %llx want %llx\n",
+            i, (unsigned long long)got_mem, (unsigned long long)want_mem);
+        if ((wemu_cpu_reg(cpu, 0) & mask) != (cases[i].rm & mask))
+            FAIL("xadd reg case %zu\n", i);
+        int cf = (wemu_cpu_rflags(cpu) & 1) != 0;
+        int want_cf = bits >= 64
+            ? (cases[i].rm + cases[i].reg < cases[i].rm)
+            : ((cases[i].rm & mask) + (cases[i].reg & mask) > mask);
+        if (cf != want_cf) FAIL("xadd CF case %zu\n", i);
+        wemu_cpu_destroy(cpu);
+    }
+    printf("ok: (lock) xadd 32/64 wrap/overflow vs C oracle\n");
+}
+
+static void test_cmpxchg(void) {
+    /* glibc malloc's lll_lock: lock cmpxchg %edx,(%rbx). Differential
+     * vs C oracle: equal and unequal, 32/64-bit, reg and memory. */
+    struct { uint64_t rax, rm, reg; int bytes; } cases[] = {
+        { 5, 5, 9, 4 }, { 5, 7, 9, 4 }, { 5, 5, 9, 8 }, { 5, 7, 9, 8 },
+        { 0xFFFFFFFF00000000ull, 0xFFFFFFFF00000000ull, 1, 4 },
+        { 0x123456789ABCDEFull, 0x123456789ABCDEF0ull, 0x11, 8 },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        WemuCpu *cpu = wemu_cpu_create(0x10000);
+        /* mov [0x2000], rm-init via store: use mov rax,imm; mov [rip],rax
+         * simpler: write guest RAM directly, then cmpxchg [0x2000], reg */
+        uint64_t v = cases[i].rm;
+        wemu_mem_write(cpu, 0x2000, &v, 8);
+        uint8_t code[40];
+        int n = 0;
+        if (cases[i].bytes == 4) {
+            /* mov eax, imm32 ; mov edx, imm32 ; lock cmpxchg [rip+d], edx */
+            code[n++]=0xB8; uint32_t a32=(uint32_t)cases[i].rax;
+            memcpy(code+n,&a32,4); n+=4;
+            code[n++]=0xBA; uint32_t g32=(uint32_t)cases[i].reg;
+            memcpy(code+n,&g32,4); n+=4;
+            code[n++]=0xF0; code[n++]=0x0F; code[n++]=0xB1; code[n++]=0x15;
+            int32_t d = (int32_t)(0x2000 - (0x1000 + n + 4));
+            memcpy(code+n,&d,4); n+=4;
+        } else {
+            code[n++]=0x48; code[n++]=0xB8; uint64_t a64=cases[i].rax;
+            memcpy(code+n,&a64,8); n+=8;
+            code[n++]=0x48; code[n++]=0xBA; uint64_t g64=cases[i].reg;
+            memcpy(code+n,&g64,8); n+=8;
+            code[n++]=0xF0; code[n++]=0x48; code[n++]=0x0F; code[n++]=0xB1; code[n++]=0x15;
+            int32_t d = (int32_t)(0x2000 - (0x1000 + n + 4));
+            memcpy(code+n,&d,4); n+=4;
+        }
+        code[n++]=0xF4;
+        wemu_cpu_load(cpu, 0x1000, code, (size_t)n);
+        wemu_cpu_set_rip(cpu, 0x1000);
+        wemu_cpu_run(cpu, 10);
+        if (wemu_cpu_fault(cpu)) FAIL("cmpxchg fault %d case %zu\n",
+            wemu_cpu_fault(cpu), i);
+        uint64_t want_mem = cases[i].rax == cases[i].rm
+                          ? cases[i].reg : cases[i].rm;
+        uint64_t want_rax = cases[i].rax == cases[i].rm
+                          ? cases[i].rax : cases[i].rm;
+        if (cases[i].bytes == 4) {
+            want_mem &= 0xffffffffull;
+            want_rax &= 0xffffffffull;
+        }
+        uint64_t got_mem = 0;
+        wemu_mem_read(cpu, 0x2000, &got_mem, 8);
+        if (cases[i].bytes == 4) got_mem &= 0xffffffffull;
+        if (got_mem != want_mem) FAIL("cmpxchg mem case %zu: %llx want %llx\n",
+            i, (unsigned long long)got_mem, (unsigned long long)want_mem);
+        if (wemu_cpu_reg(cpu, 0) != want_rax)
+            FAIL("cmpxchg rax case %zu: %llx want %llx\n", i,
+                 (unsigned long long)wemu_cpu_reg(cpu, 0),
+                 (unsigned long long)want_rax);
+        int zf = (wemu_cpu_rflags(cpu) & 0x40) != 0;
+        if (zf != (cases[i].rax == cases[i].rm))
+            FAIL("cmpxchg ZF case %zu\n", i);
+        wemu_cpu_destroy(cpu);
+    }
+    printf("ok: (lock) cmpxchg 32/64 equal/unequal vs C oracle\n");
+}
+
 /* ---- real busybox: run to first syscall ---- */
 static uint64_t first_nr = ~0ull;
 static int64_t probe_hook(WemuCpu *cpu, uint64_t nr,
@@ -323,6 +512,11 @@ int main(void) {
     test_cet_nop_bmi();
     test_near_jcc_rel32();
     test_grp1_imm8();
+    test_alu_imm8();
+    test_two_byte_not_string();
+    test_xchg_rax();
+    test_xadd();
+    test_cmpxchg();
     test_real_busybox();
     printf("USERMODE GATE PASS\n");
     return 0;

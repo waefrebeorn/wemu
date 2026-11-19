@@ -295,6 +295,26 @@ int wemu_exec_sse(WemuCpu *c, const WemuInsn *in) {
         else if (vex) memset(c->ymm_hi[dst], 0, 16);
         return 1;
     }
+    if (full == 0x150 && (vex || in->rep == 0)) {
+        /* (v)movmskps r32, xmm/ymm (no prefix): bit31 of each dword;
+         * (v)movmskpd (66): bit63 of each qword */
+        if ((in->modrm >> 6) != 3) return 0;
+        int rm = (in->modrm & 7) | (REX_B(in) << 3);
+        uint8_t src[32];
+        memcpy(src, c->xmm[rm], 16);
+        memcpy(src + 16, c->ymm_hi[rm], 16);
+        uint32_t mask = 0;
+        if (in->opsize == 2) { /* 66 / VEX.pp=1: pd (qword sign bits) */
+            for (int i = 0; i < nb / 8; i++)
+                if (src[8 * i + 7] & 0x80) mask |= 1u << i;
+        } else {
+            for (int i = 0; i < nb / 4; i++)
+                if (src[4 * i + 3] & 0x80) mask |= 1u << i;
+        }
+        int gr = REG(in) | (REX_R(in) << 3);
+        c->r[gr] = mask;
+        return 1;
+    }
     if (full == 0x1D7 && (vex || sse66)) { /* (v)pmovmskb r32, xmm/ymm */
         if ((in->modrm >> 6) != 3) return 0;
         int rm = (in->modrm & 7) | (REX_B(in) << 3);

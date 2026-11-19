@@ -296,11 +296,17 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
         write_regop(c, in, os, eff_addr(c, &noseg));
         break;
     }
-    case 0x90:
-        if (REX_B(in)) { /* xchg r8, rax */
-            a = c->r[0]; c->r[0] = c->r[8]; c->r[8] = a;
-        }
-        break; /* plain nop */
+    case 0x90: case 0x91: case 0x92: case 0x93:
+    case 0x94: case 0x95: case 0x96: case 0x97: {
+        int rr = (o - 0x90) | (REX_B(in) << 3);
+        if (o == 0x90 && !REX_B(in)) break; /* plain nop (incl. pause) */
+        /* xchg rAX, r: 32-bit form zero-extends both operands */
+        a = read_reg(c, 0, os);
+        b = read_reg(c, rr, os);
+        write_reg(c, 0, os, b);
+        write_reg(c, rr, os, a);
+        break;
+    }
     case 0x98: /* cwde/cdqe */
         if (os == 8) c->r[0] = (uint64_t)(int64_t)(int32_t)c->r[0];
         else if (os == 4) c->r[0] = (uint32_t)(int32_t)(int16_t)c->r[0];
@@ -569,6 +575,30 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
                     write_regop(c, in, os, (uint64_t)bit);
                     c->rflags = f;
                 }
+            }
+        } else if (full == 0x1C0 || full == 0x1C1) { /* xadd r/m, r */
+            /* LOCK consumed by decoder; single-threaded interpreter
+             * guest: the RMW is atomic by construction. */
+            int bytes = full == 0x1C0 ? 1 : os;
+            a = read_rm(c, in, bytes);
+            b = read_regop(c, in, bytes);
+            do_add(c, a, b, bytes, 0, &r);
+            write_rm(c, in, bytes, r);
+            write_regop(c, in, bytes, a);
+        } else if (full == 0x1B0 || full == 0x1B1) { /* cmpxchg r/m, r */
+            /* LOCK prefix is consumed by the decoder; the interpreter
+             * guest is single-threaded, so the RMW is atomic by
+             * construction. Compare accumulator with r/m: equal ->
+             * ZF=1, r/m <- reg; else ZF=0, accumulator <- r/m. */
+            int bytes = full == 0x1B0 ? 1 : os;
+            a = bytes == 1 ? read_reg(c, 0, 1) : read_reg(c, 0, bytes);
+            b = read_rm(c, in, bytes);
+            do_sub(c, a, b, bytes, 0, &r);
+            if (a == b) {
+                write_rm(c, in, bytes, read_regop(c, in, bytes));
+            } else {
+                if (bytes == 1) write_reg(c, 0, 1, b);
+                else write_reg(c, 0, bytes, b);
             }
         } else if (full == 0x1BA) { /* bt/bts/btr/btc imm8 */
             int op = REG(in);

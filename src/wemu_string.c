@@ -9,7 +9,11 @@
 /* returns 1 handled, 0 not a string op, -1 fault */
 int wemu_exec_string(WemuCpu *c, const WemuInsn *in) {
     uint8_t o = in->op;
-    if (in->vex_len) return 0;
+    /* PRIMARY map only: vex[0] carries the map marker for legacy 0F
+     * too. Without this guard 0F AF (imul r,rm) executes as SCAS,
+     * 0F AB (bts) as STOS — silent state corruption (found by glibc
+     * strtol summing digits under the busybox gate). */
+    if (in->vex_len || in->vex[0]) return 0;
     if (o == 0xFC) { c->rflags &= ~WF_DF; return 1; } /* cld */
     if (o == 0xFD) { c->rflags |= WF_DF; return 1; }  /* std */
     int kind;

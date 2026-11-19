@@ -48,6 +48,9 @@ static int imm_len_for(uint32_t op, int opsize, uint8_t modrm_reg,
     if (op == 0xE4 || op == 0xE6) return 1;        /* in/out imm8 */
     if (op == 0xE5 || op == 0xE7) return opsize == 2 ? 2 : 4;
     switch (op) {
+    case 0x04: case 0x0C: case 0x14: case 0x1C:
+    case 0x24: case 0x2C: case 0x34: case 0x3C:
+        return 1;                             /* AL, imm8 (grp1 form 4) */
     case 0x05: case 0x0D: case 0x15: case 0x1D:
     case 0x25: case 0x2D: case 0x35: case 0x3D:
     case 0x68: case 0xA9: case 0xE8: case 0xE9:

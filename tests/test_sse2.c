@@ -186,6 +186,35 @@ int main(void) {
                 if ((uint32_t)rax != m) FAIL("vpmovmskb: %llx want %x\n",
                     (unsigned long long)rax, m);
             }
+            /* movmskps / movmskpd: sign-bit extraction */
+            {
+                int n = enc_legacy(insn, 0x50, 0, 1);
+                insn[0] = 0x66; /* pd: 2 qword sign bits */
+                uint64_t rax = 0;
+                run_vec(insn, n, 0, a, b, out, &rax);
+                uint32_t m = 0;
+                for (int i = 0; i < 2; i++) if (b[8*i+7] & 0x80) m |= 1u << i;
+                if ((uint32_t)rax != m) FAIL("movmskpd: %llx want %x\n",
+                    (unsigned long long)rax, m);
+                uint8_t raw[3] = { 0x0F, 0x50, 0xC1 }; /* ps: no prefix */
+                run_vec(raw, 3, 0, a, b, out, &rax);
+                m = 0;
+                for (int i = 0; i < 4; i++) if (b[4*i+3] & 0x80) m |= 1u << i;
+                if ((uint32_t)rax != m) FAIL("movmskps: %llx want %x\n",
+                    (unsigned long long)rax, m);
+                n = enc_vex(insn, 0x50, 0, 0, 1, L, 0, 1); /* vmovmskps */
+                run_vec(insn, n, L, a, b, out, &rax);
+                m = 0;
+                for (int i = 0; i < nb/4; i++) if (b[4*i+3] & 0x80) m |= 1u << i;
+                if ((uint32_t)rax != m) FAIL("vmovmskps: %llx want %x\n",
+                    (unsigned long long)rax, m);
+                n = enc_vex(insn, 0x50, 0, 0, 1, L, 1, 1); /* vmovmskpd */
+                run_vec(insn, n, L, a, b, out, &rax);
+                m = 0;
+                for (int i = 0; i < nb/8; i++) if (b[8*i+7] & 0x80) m |= 1u << i;
+                if ((uint32_t)rax != m) FAIL("vmovmskpd: %llx want %x\n",
+                    (unsigned long long)rax, m);
+            }
             /* palignr imm8 (0F 3A 0F) */
             {
                 int imms[] = { 0, 1, 7, 15, 16, 31 };
