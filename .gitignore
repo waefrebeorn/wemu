@@ -1,0 +1,7 @@
+*.o
+*.d
+*.a
+test_isa
+test_avx
+test_paging
+test_machine
