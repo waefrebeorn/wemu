@@ -257,26 +257,35 @@ int wemu_exec_sse(WemuCpu *c, const WemuInsn *in) {
         memcpy(c->xmm[dst], d, 16);
         return 1;
     }
-    if (!vex && sse66 && full == 0x173) { /* psllq/psrldq/pslldq imm8 */
+    if (!vex && sse66 && full == 0x173) { /* shift-count group 66 0F 73 */
         int reg = REG(in);
         /* the shift-count group selects the op via reg; the OPERAND is
-         * the r/m register, not the reg field */
+         * the r/m register, not the reg field. SDM group table:
+         * /2 psrlw, /3 psrldq, /4 psraw, /6 psllw, /7 pslldq.
+         * (The old code had /7 as per-qword psllq and /6 as pslldq —
+         * glibc __strcmp_sse2's pslldq $7/$15 alignment shifts executed
+         * as BIT shifts, miscomparing "false" vs "fdflush"/"fdformat".) */
         int xr = (in->modrm & 7) | (REX_B(in) << 3);
         memcpy(a, c->xmm[xr], 16);
         uint64_t cnt = in->imm & 0xff;
-        if (reg == 7) { /* psllq per qword */
-            for (int q = 0; q < 2; q++) {
-                uint64_t v;
-                memcpy(&v, a + 8 * q, 8);
-                v = cnt >= 64 ? 0 : v << cnt;
-                memcpy(d + 8 * q, &v, 8);
-            }
-        } else if (reg == 3) { /* psrldq whole lane bytes */
-            for (int i = 0; i < 16; i++)
-                d[i] = (cnt + (uint64_t)i < 16) ? a[cnt + i] : 0;
-        } else if (reg == 6) { /* pslldq */
+        if (reg == 7) { /* pslldq: whole-lane BYTE shift left */
             for (int i = 15; i >= 0; i--)
                 d[i] = ((uint64_t)i >= cnt) ? a[i - cnt] : 0;
+        } else if (reg == 3) { /* psrldq: whole-lane BYTE shift right */
+            for (int i = 0; i < 16; i++)
+                d[i] = (cnt + (uint64_t)i < 16) ? a[cnt + i] : 0;
+        } else if (reg == 6 || reg == 2 || reg == 4) { /* psllw/psrlw/psraw */
+            for (int w = 0; w < 8; w++) {
+                uint16_t v;
+                memcpy(&v, a + 2 * w, 2);
+                uint16_t r;
+                if (reg == 6) r = cnt >= 16 ? 0 : (uint16_t)(v << cnt);
+                else if (reg == 2) r = cnt >= 16 ? 0 : (uint16_t)(v >> cnt);
+                else { int16_t s = (int16_t)v;
+                       r = cnt >= 16 ? (uint16_t)(s >> 15)
+                                     : (uint16_t)(s >> cnt); }
+                memcpy(d + 2 * w, &r, 2);
+            }
         } else return 0;
         memcpy(c->xmm[xr], d, 16);
         return 1;
@@ -397,9 +406,9 @@ int wemu_exec_sse(WemuCpu *c, const WemuInsn *in) {
         else memset(c->ymm_hi[dst], 0, 16);
         return 1;
     }
-    if (vex && full == 0x173 && (REG(in) == 3 || REG(in) == 6)) {
-        /* vpsrldq / vpslldq: ModRM.reg is the op digit, rm is the source,
-         * and the DESTINATION lives in VEX.vvvv */
+    if (vex && full == 0x173 && (REG(in) == 3 || REG(in) == 7)) {
+        /* vpsrldq (/3) / vpslldq (/7): ModRM.reg is the op digit, rm is
+         * the source, and the DESTINATION lives in VEX.vvvv */
         int dstv = vex_vvvv(in);
         if (rm_vec(c, in, a, a + 16, nb) != 0) return -1;
         uint64_t cnt = in->imm & 0xff;

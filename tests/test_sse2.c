@@ -285,10 +285,10 @@ int main(void) {
                         memcpy(want+lane+4*i, b+lane+4*((imm>>(2*i))&3), 4);
                 check("vpshufd", out, want, nb);
             }
-            /* psrldq/pslldq imm8 (0F 73 /3 /6), legacy + VEX */
+            /* psrldq/pslldq imm8 (0F 73 /3 /7 per SDM), legacy + VEX */
             for (int which = 0; which < 2; which++) {
                 int imm = (int)(rnd() & 31);
-                int reg = which ? 6 : 3;
+                int reg = which ? 7 : 3;
                 insn[0]=0x66; insn[1]=0x0F; insn[2]=0x73;
                 insn[3]=(uint8_t)(0xC0|(reg<<3)|0); insn[4]=(uint8_t)imm;
                 run_vec(insn, 5, 0, a, b, out, NULL);
@@ -358,6 +358,58 @@ int main(void) {
             n = enc_vex(insn, 0xDF, 0, 0, 1, L, 1, 1);
             run_vec(insn, n, L, a, b, out, NULL);
             check("strcmp-pandn-vex", out, want, L ? 32 : 16);
+        }
+    }
+    /* Named regression: 66 0F 73 shift-count group. glibc __strcmp_sse2
+     * aligns with pslldq $7 / $15 (/7 = BYTE shift left). The old decode
+     * ran /7 as per-qword BIT shift (psllq) and /6 as pslldq — busybox
+     * applet search miscompared "false" vs "fdflush"/"fdformat". Gate
+     * every digit: /2 psrlw, /3 psrldq, /4 psraw, /6 psllw, /7 pslldq,
+     * legacy + VEX.128/256, edge counts 0/16/255. */
+    {
+        uint8_t a[32], out[32], want[32], insn[16];
+        for (int i = 0; i < 32; i++) a[i] = (uint8_t)(i * 7 + 3);
+        const int cnts[] = { 0, 1, 7, 15, 16, 255 };
+        for (int L = 0; L < 2; L++) {
+            int nb = L ? 32 : 16;
+            for (size_t ci = 0; ci < sizeof cnts / sizeof cnts[0]; ci++) {
+                int cnt = cnts[ci];
+                /* pslldq /7 and psrldq /3, byte-wise oracle */
+                for (int digit = 3; digit <= 7; digit += 4) {
+                    for (int i = 0; i < nb; i++) {
+                        int lane = i & ~15, j = i & 15;
+                        if (digit == 7)
+                            want[i] = j >= cnt ? a[lane + j - cnt] : 0;
+                        else
+                            want[i] = cnt + j < 16 ? a[lane + cnt + j] : 0;
+                    }
+                    insn[0]=0x66; insn[1]=0x0F; insn[2]=0x73;
+                    insn[3]=(uint8_t)(0xC0 | (digit << 3)); insn[4]=(uint8_t)cnt;
+                    run_vec(insn, 5, 0, a, a, out, NULL);
+                    check("shiftgrp-psdq-legacy", out, want, 16);
+                    /* VEX: C5 (F9|FD) 73 /digit, vvvv=0 (dest xmm0) */
+                    insn[0]=0xC5; insn[1]=L?0xFD:0xF9; insn[2]=0x73;
+                    insn[3]=(uint8_t)(0xC0 | (digit << 3)); insn[4]=(uint8_t)cnt;
+                    run_vec(insn, 5, L, a, a, out, NULL);
+                    check("shiftgrp-psdq-vex", out, want, nb);
+                }
+                /* psllw /6, psrlw /2, psraw /4: per-word bit oracle */
+                for (int digit = 2; digit <= 6; digit += 2) {
+                    for (int w = 0; w < nb / 2; w++) {
+                        uint16_t v = (uint16_t)(a[2*w] | (a[2*w+1] << 8));
+                        uint16_t r;
+                        if (digit == 6) r = cnt >= 16 ? 0 : (uint16_t)(v << cnt);
+                        else if (digit == 2) r = cnt >= 16 ? 0 : (uint16_t)(v >> cnt);
+                        else { int16_t s = (int16_t)v;
+                               r = cnt >= 16 ? (uint16_t)(s >> 15) : (uint16_t)(s >> cnt); }
+                        want[2*w] = (uint8_t)r; want[2*w+1] = (uint8_t)(r >> 8);
+                    }
+                    insn[0]=0x66; insn[1]=0x0F; insn[2]=0x73;
+                    insn[3]=(uint8_t)(0xC0 | (digit << 3)); insn[4]=(uint8_t)cnt;
+                    run_vec(insn, 5, 0, a, a, out, NULL);
+                    check("shiftgrp-psw-legacy", out, want, 16);
+                }
+            }
         }
     }
     printf("SSE2 GATE PASS (100 random rounds x 128/256 vs C oracle)\n");
