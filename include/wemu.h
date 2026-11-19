@@ -55,6 +55,9 @@ void wemu_cpu_set_syscall_hook(WemuCpu *cpu, WemuSyscallFn fn, void *ud);
 int64_t wemu_cpu_step(WemuCpu *cpu);
 int64_t wemu_cpu_run(WemuCpu *cpu, uint64_t max_insns);
 int wemu_cpu_halted(const WemuCpu *cpu);
+/* Halt from outside the guest (a syscall hook finishing exit/exit_group
+ * uses this; the guest itself halts via HLT or the default hook). */
+void wemu_cpu_halt(WemuCpu *cpu);
 int wemu_cpu_fault(const WemuCpu *cpu);      /* 0 = none, else x86 vector */
 uint64_t wemu_cpu_fault_addr(const WemuCpu *cpu); /* CR2 for #PF */
 

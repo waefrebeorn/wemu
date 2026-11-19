@@ -99,6 +99,7 @@ void wemu_cpu_set_syscall_hook(WemuCpu *cpu, WemuSyscallFn fn, void *ud) {
     cpu->sys_fn = fn; cpu->sys_ud = ud;
 }
 int wemu_cpu_halted(const WemuCpu *cpu) { return cpu->halted; }
+void wemu_cpu_halt(WemuCpu *cpu) { cpu->halted = 1; }
 int wemu_cpu_fault(const WemuCpu *cpu) { return cpu->fault; }
 uint64_t wemu_cpu_fault_addr(const WemuCpu *cpu) { return cpu->cr2; }
 void wemu_cpu_xmm(const WemuCpu *cpu, int idx, uint8_t out[16]) {
