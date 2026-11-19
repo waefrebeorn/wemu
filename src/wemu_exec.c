@@ -534,6 +534,45 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
         } else if (full == 0x1B6 || full == 0x1BE) { /* movzx/movsx r, rm8 */
             a = read_rm(c, in, 1);
             write_regop(c, in, os, full == 0x1B6 ? a : (uint64_t)(int64_t)(int8_t)a);
+        } else if (full == 0x1A4 || full == 0x1A5 ||
+                   full == 0x1AC || full == 0x1AD) {
+            /* shld/shrd r/m, r, imm8/CL — double-precision shifts.
+             * glibc memmove tails use shld; busybox seq faulted here
+             * (#UD) before this existed. dest = r/m, src = reg. */
+            int left = (full == 0x1A4 || full == 0x1A5);
+            uint64_t dest = read_rm(c, in, os);
+            uint64_t src = read_regop(c, in, os);
+            uint64_t cnt = (full == 0x1A4 || full == 0x1AC)
+                               ? (in->imm & 0xff) : (c->r[1] & 0xff);
+            int bits = os * 8;
+            cnt &= (bits == 64) ? 63 : 31;
+            uint64_t r = dest, cf = 0, of = 0;
+            uint64_t f = c->rflags & ~(WF_CF | WF_OF | WF_ZF | WF_SF | WF_PF);
+            if (cnt) {
+                if (cnt < (uint64_t)bits) {
+                    if (left) {
+                        cf = (dest >> (bits - cnt)) & 1;
+                        r = (dest << cnt) | (src >> (bits - cnt));
+                    } else {
+                        cf = (dest >> (cnt - 1)) & 1;
+                        r = (dest >> cnt) | (src << (bits - cnt));
+                    }
+                } else { /* count >= width: SDM undefined; QEMU semantics */
+                    cf = (src >> (cnt - bits)) & 1;
+                    r = left ? (src << (cnt - bits)) : (src >> (cnt - bits));
+                }
+                r = wemu_mask(r, os);
+                if (cnt == 1)
+                    of = left ? ((r >> (bits - 1)) ^ cf)
+                              : (((r ^ dest) >> (bits - 1)) & 1);
+                if (cf) f |= WF_CF;
+                if (of) f |= WF_OF;
+                if (!r) f |= WF_ZF;
+                if (r >> (bits - 1)) f |= WF_SF;
+                if (wemu_parity(r)) f |= WF_PF;
+            }
+            c->rflags = f;
+            write_rm(c, in, os, r);
         } else if (full == 0x1B7 || full == 0x1BF) { /* movzx/movsx r, rm16 */
             a = read_rm(c, in, 2);
             write_regop(c, in, os, full == 0x1B7 ? a : (uint64_t)(int64_t)(int16_t)a);
