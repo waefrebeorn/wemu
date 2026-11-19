@@ -454,6 +454,92 @@ int wemu_exec_sse(WemuCpu *c, const WemuInsn *in) {
         }
         return 1;
     }
+    /* Scalar SSE2 arithmetic + conversions (F2=sd, F3=ss; VEX pp=2/3).
+     * busybox seq formats with cvtsi2sd/mulsd/addsd — the FP printf
+     * surface. One block owns the scalar family. */
+    if ((full == 0x158 || full == 0x159 || full == 0x15C ||
+         full == 0x15E || full == 0x15D || full == 0x15F ||
+         full == 0x12A || full == 0x12C || full == 0x12D ||
+         full == 0x15A) &&
+        (vex ? ((in->vex_len == 3 ? in->vex[2] : in->vex[1]) & 3) >= 2
+             : (in->rep == 0xF2 || in->rep == 0xF3))) {
+        int pp = vex ? ((in->vex_len == 3 ? in->vex[2] : in->vex[1]) & 3)
+                     : (in->rep == 0xF2 ? 2 : 3);
+        int dbl = pp == 2;
+        if (vex && L) return 0;
+        if (full == 0x12A) { /* cvtsi2sd/ss: signed r/m32/64 -> scalar */
+            int ibytes = (in->rex & 8) ? 8 : in->opsize;
+            uint64_t iv = 0;
+            if ((in->modrm >> 6) == 3) {
+                int rm = (in->modrm & 7) | (REX_B(in) << 3);
+                iv = ibytes == 4 ? (uint32_t)c->r[rm] : c->r[rm];
+            } else if (wemu_mem_read(c, wemu_eff_addr(c, in), &iv, (size_t)ibytes) != 0)
+                return -1;
+            double d = (double)(int64_t)(ibytes == 4 ? (int32_t)iv : (int64_t)iv);
+            if (dbl) memcpy(c->xmm[dst], &d, 8);
+            else { float f = (float)d; memcpy(c->xmm[dst], &f, 4); }
+            if (vex) memset(c->xmm[dst] + (dbl ? 8 : 4), 0, (size_t)(16 - (dbl ? 8 : 4)));
+            return 1;
+        }
+        if (full == 0x12C || full == 0x12D) { /* cvt(t)sd2si: scalar -> r32/64 */
+            double d; float f;
+            if (dbl) memcpy(&d, c->xmm[dst], 8);
+            else { memcpy(&f, c->xmm[dst], 4); d = (double)f; }
+            d = full == 0x12D ? nearbyint(d) : trunc(d);
+            int obytes = (in->rex & 8) ? 8 : in->opsize;
+            uint64_t indef = obytes == 8 ? 0x8000000000000000ull : 0x80000000u;
+            uint64_t r;
+            if (isnan(d) || (obytes == 4 && (d < -2147483648.0 || d > 2147483647.0)) ||
+                (obytes == 8 && (d < -9223372036854775808.0 || d >= 9223372036854775808.0)))
+                r = indef;
+            else r = obytes == 4 ? (uint32_t)(int32_t)d : (uint64_t)(int64_t)d;
+            /* write the GPR reg field (not the vector dst) */
+            int gr = REG(in) | (REX_R(in) << 3);
+            if (obytes == 4) c->r[gr] = (uint32_t)r;
+            else c->r[gr] = r;
+            return 1;
+        }
+        if (full == 0x15A) { /* cvtss2sd (F3) / cvtsd2ss (F2) */
+            if (dbl) { double d; memcpy(&d, c->xmm[dst], 8);
+                       float f = (float)d; memcpy(c->xmm[dst], &f, 4);
+                       if (vex) memset(c->xmm[dst] + 4, 0, 12); }
+            else { float f; memcpy(&f, c->xmm[dst], 4);
+                   double d = (double)f; memcpy(c->xmm[dst], &d, 8);
+                   if (vex) memset(c->xmm[dst] + 8, 0, 8); }
+            return 1;
+        }
+        /* add/mul/sub/div/min/max: dest = xmm[dst] scalar, src = rm */
+        double a, b;
+        if (dbl) {
+            memcpy(&a, c->xmm[dst], 8);
+            if ((in->modrm >> 6) == 3) {
+                int rm = (in->modrm & 7) | (REX_B(in) << 3);
+                memcpy(&b, c->xmm[rm], 8);
+            } else if (wemu_mem_read(c, wemu_eff_addr(c, in), &b, 8) != 0) return -1;
+        } else {
+            float fa, fb;
+            memcpy(&fa, c->xmm[dst], 4);
+            if ((in->modrm >> 6) == 3) {
+                int rm = (in->modrm & 7) | (REX_B(in) << 3);
+                memcpy(&fb, c->xmm[rm], 4);
+            } else if (wemu_mem_read(c, wemu_eff_addr(c, in), &fb, 4) != 0) return -1;
+            a = (double)fa; b = (double)fb;
+        }
+        double r;
+        switch (o) {
+        case 0x58: r = a + b; break;
+        case 0x59: r = a * b; break;
+        case 0x5C: r = a - b; break;
+        case 0x5E: r = a / b; break;
+        case 0x5D: r = (isnan(a) || isnan(b)) ? b : (a < b ? a : (a == b ? b : a)); break;
+        case 0x5F: r = (isnan(a) || isnan(b)) ? b : (a > b ? a : (a == b ? b : a)); break;
+        default: return 0;
+        }
+        if (dbl) memcpy(c->xmm[dst], &r, 8);
+        else { float f = (float)r; memcpy(c->xmm[dst], &f, 4); }
+        if (vex) memset(c->xmm[dst] + (dbl ? 8 : 4), 0, (size_t)(16 - (dbl ? 8 : 4)));
+        return 1;
+    }
     if (full == 0x12E || full == 0x12F) {
         /* (v)ucomisd/(v)comisd (66) and (v)ucomiss/(v)comiss (none):
          * scalar compare -> EFLAGS (ZF/PF/CF; OF/SF/AF cleared).

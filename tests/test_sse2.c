@@ -483,6 +483,89 @@ int main(void) {
             wemu_cpu_destroy(c);
         }
     }
+    /* Named regression: scalar SSE2 arithmetic + conversions — the
+     * busybox seq FP-printf surface (cvtsi2sd/mulsd/addsd faulted #UD).
+     * Bit-exact vs C double; cvttsd2si truncation + overflow indefinite;
+     * minsd/maxsd NaN returns SRC per SDM. */
+    {
+        /* addsd/mulsd/subsd/divsd xmm0, xmm1 (F2 0F 58/59/5C/5E C1) */
+        const uint8_t ops[4] = { 0x58, 0x59, 0x5C, 0x5E };
+        for (int i = 0; i < 100; i++) {
+            double a = (double)(int64_t)(rnd() % 1000000) / 11.0;
+            double b = (double)(int64_t)(rnd() % 1000000) / 17.0;
+            if (b == 0.0) b = 1.0;
+            for (int op = 0; op < 4; op++) {
+                WemuCpu *c = wemu_cpu_create(0x10000);
+                uint8_t code[] = { 0xF2,0x0F,ops[op],0xC1, 0xF4 };
+                memcpy(c->xmm[0], &a, 8); memcpy(c->xmm[1], &b, 8);
+                wemu_mem_write(c, 0x1000, code, sizeof code);
+                wemu_cpu_set_rip(c, 0x1000);
+                wemu_cpu_run(c, 4);
+                if (wemu_cpu_fault(c)) FAIL("scalar op%d fault %d\n", op, wemu_cpu_fault(c));
+                double got; memcpy(&got, c->xmm[0], 8);
+                double want = op==0 ? a+b : op==1 ? a*b : op==2 ? a-b : a/b;
+                uint64_t gb, wb; memcpy(&gb,&got,8); memcpy(&wb,&want,8);
+                if (gb != wb) FAIL("scalar op%d a=%g b=%g got %g want %g\n", op, a, b, got, want);
+                wemu_cpu_destroy(c);
+            }
+        }
+        /* cvtsi2sd rax -> xmm0 (F2 REX.W 0F 2A C0) */
+        {
+            WemuCpu *c = wemu_cpu_create(0x10000);
+            uint8_t code[] = { 0xF2,0x48,0x0F,0x2A,0xC0, 0xF4 };
+            wemu_cpu_set_reg(c, 0, (uint64_t)(int64_t)-1234567);
+            wemu_mem_write(c, 0x1000, code, sizeof code);
+            wemu_cpu_set_rip(c, 0x1000);
+            wemu_cpu_run(c, 4);
+            double got; memcpy(&got, c->xmm[0], 8);
+            if (got != -1234567.0) FAIL("cvtsi2sd got %g\n", got);
+            wemu_cpu_destroy(c);
+        }
+        /* cvttsd2si xmm0 -> eax: truncation + overflow indefinite */
+        {
+            struct { double v; int32_t want; } T[] = {
+                { 2.9, 2 }, { -2.9, -2 }, { 1e18, (int32_t)0x80000000 },
+            };
+            for (int t = 0; t < 3; t++) {
+                WemuCpu *c = wemu_cpu_create(0x10000);
+                uint8_t code[] = { 0xF2,0x0F,0x2C,0xC0, 0xF4 };
+                memcpy(c->xmm[0], &T[t].v, 8);
+                wemu_mem_write(c, 0x1000, code, sizeof code);
+                wemu_cpu_set_rip(c, 0x1000);
+                wemu_cpu_run(c, 4);
+                if ((int32_t)wemu_cpu_reg(c,0) != T[t].want)
+                    FAIL("cvttsd2si %g got %d want %d\n", T[t].v,
+                         (int32_t)wemu_cpu_reg(c,0), T[t].want);
+                wemu_cpu_destroy(c);
+            }
+        }
+        /* cvtsd2ss (F2 0F 5A) + cvtss2sd (F3 0F 5A) round-trip */
+        {
+            WemuCpu *c = wemu_cpu_create(0x10000);
+            uint8_t code[] = { 0xF2,0x0F,0x5A,0xC0, 0xF3,0x0F,0x5A,0xC0, 0xF4 };
+            double v = 1.5; /* exactly representable in float */
+            memcpy(c->xmm[0], &v, 8);
+            wemu_mem_write(c, 0x1000, code, sizeof code);
+            wemu_cpu_set_rip(c, 0x1000);
+            wemu_cpu_run(c, 6);
+            double got; memcpy(&got, c->xmm[0], 8);
+            if (got != 1.5) FAIL("cvt sd<->ss roundtrip got %g\n", got);
+            wemu_cpu_destroy(c);
+        }
+        /* minsd/maxsd: NaN returns SRC (xmm1) per SDM */
+        {
+            WemuCpu *c = wemu_cpu_create(0x10000);
+            uint8_t code[] = { 0xF2,0x0F,0x5D,0xC1, 0xF4 };
+            double nan = NAN, two = 2.0;
+            memcpy(c->xmm[0], &nan, 8); memcpy(c->xmm[1], &two, 8);
+            wemu_mem_write(c, 0x1000, code, sizeof code);
+            wemu_cpu_set_rip(c, 0x1000);
+            wemu_cpu_run(c, 4);
+            double got; memcpy(&got, c->xmm[0], 8);
+            if (got != 2.0) FAIL("minsd NaN semantics got %g\n", got);
+            wemu_cpu_destroy(c);
+        }
+    }
     printf("SSE2 GATE PASS (100 random rounds x 128/256 vs C oracle)\n");
     return 0;
 }
