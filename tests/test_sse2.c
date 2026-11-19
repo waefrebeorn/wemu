@@ -85,6 +85,18 @@ static int enc_vex(uint8_t *p, uint8_t op, int dst, int src1, int src2,
 /* ---- C oracles (SDM semantics, independent of wemu_sse.c) ---- */
 static void o_binop(int op, int es, uint8_t *d, const uint8_t *a,
                     const uint8_t *b, int nb) {
+    if (es == 16) {
+        /* BYTE-wise logical oracle — deliberately NOT the emulator's
+         * element-accumulator shape: that shared abstraction hid the
+         * >=64-bit-shift fold bug in both (100 random rounds passed
+         * while glibc strcmp_avx2 miscompared "false" vs "fdisk"). */
+        for (int i = 0; i < nb; i++)
+            d[i] = op == 0 ? (uint8_t)(a[i] ^ b[i])
+                 : op == 1 ? (uint8_t)(a[i] & b[i])
+                 : op == 2 ? (uint8_t)((uint8_t)~a[i] & b[i])
+                 :           (uint8_t)(a[i] | b[i]);
+        return;
+    }
     for (int i = 0; i < nb; i += es) {
         uint64_t av = 0, bv = 0;
         for (int k = 0; k < es; k++) {
@@ -327,6 +339,26 @@ int main(void) {
         if (memcmp(hi,b,8)) FAIL("movlhps/movhps\n");
         if (memcmp(lo,b,8)) FAIL("movhlps/movlps\n");
         wemu_cpu_destroy(cpu);
+    }
+    /* Named regression: the glibc strcmp_avx2 vpandn zero-mask clear.
+     * "false" vs "fdisk": a = zero-byte mask (00x5, ff x27), b = equal
+     * mask (ff 00 00 ff 00, ff x27). ~a & b must keep ONLY byte 0.
+     * The es=16 accumulator fold bug zeroed everything -> busybox's
+     * binary applet search concluded "false" == "fdisk" -> applet not
+     * found. Both legacy SSE2 and VEX.128/256 forms are gated. */
+    {
+        uint8_t a[32], b[32], want[32], out[32], insn[16];
+        memset(a, 0xff, 32); memset(a, 0x00, 5);
+        memset(b, 0xff, 32); b[1] = b[2] = b[4] = 0;
+        memset(want, 0x00, 32); want[0] = 0xff; want[3] = 0xff;
+        int n = enc_legacy(insn, 0xDF, 0, 1);
+        run_vec(insn, n, 0, a, b, out, NULL);
+        check("strcmp-pandn-legacy", out, want, 16);
+        for (int L = 0; L < 2; L++) {
+            n = enc_vex(insn, 0xDF, 0, 0, 1, L, 1, 1);
+            run_vec(insn, n, L, a, b, out, NULL);
+            check("strcmp-pandn-vex", out, want, L ? 32 : 16);
+        }
     }
     printf("SSE2 GATE PASS (100 random rounds x 128/256 vs C oracle)\n");
     return 0;

@@ -49,6 +49,22 @@ static void store_vec(WemuCpu *c, const WemuInsn *in, const uint8_t *lo,
 /* element-wise binary op; es = element bytes (1/2/4/8) */
 static void binop(int op, uint8_t *d, const uint8_t *a, const uint8_t *b,
                   int nbytes, int es) {
+    if (es == 16) {
+        /* Logical ops (pxor/pand/pandn/por) are BYTE-wise. The element
+         * loop below accumulates into uint64_t with shifts 8*k — for
+         * es=16 those shifts are >=64 (UB; x86 masks to 63) and fold
+         * upper-lane bytes into lower ones. glibc strcmp_avx2's vpandn
+         * zero-mask clearing hit exactly this: "false" vs "fdisk"
+         * compared equal because the terminator bit was never cleared. */
+        for (int i = 0; i < nbytes; i++) {
+            uint8_t av = a[i], bv = b[i];
+            d[i] = op == 0 ? (uint8_t)(av ^ bv)
+                 : op == 1 ? (uint8_t)(av & bv)
+                 : op == 2 ? (uint8_t)(~av & bv)
+                 :           (uint8_t)(av | bv);
+        }
+        return;
+    }
     for (int i = 0; i < nbytes; i += es) {
         uint64_t av = 0, bv = 0;
         for (int k = 0; k < es; k++) {
