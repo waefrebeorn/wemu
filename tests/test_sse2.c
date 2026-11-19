@@ -607,6 +607,35 @@ int main(void) {
         if (wemu_cpu_reg(c, 0) != 0x11223344deadbeefull) FAIL("movd merge\n");
         wemu_cpu_destroy(c);
     }
+    /* Named regression: cvt operand ORDER. cvttsd2si r32, xmm:
+     * ModRM.reg = GPR dest (REX.R extends it), ModRM.rm = XMM source.
+     * Reading xmm[reg] read the wrong register — awk $N became $0.
+     * Gate the REX.R form (r9d <- xmm0) + cvtsd2ss with DISTINCT
+     * src/dest (the same-reg round-trip hid the bug). */
+    {
+        WemuCpu *c = wemu_cpu_create(0x10000);
+        uint8_t code[] = { 0xF2,0x44,0x0F,0x2C,0xC8, 0xF4 };
+        double one = 1.0;
+        memcpy(c->xmm[0], &one, 8);
+        wemu_mem_write(c, 0x1000, code, sizeof code);
+        wemu_cpu_set_rip(c, 0x1000);
+        wemu_cpu_run(c, 4);
+        if (wemu_cpu_fault(c)) FAIL("cvttsd2si r9d fault %d\n", wemu_cpu_fault(c));
+        if ((int32_t)wemu_cpu_reg(c, 9) != 1)
+            FAIL("cvttsd2si xmm0,r9d: got %d want 1\n", (int32_t)wemu_cpu_reg(c,9));
+        wemu_cpu_destroy(c);
+        /* cvtsd2ss xmm1, xmm0 (F2 0F 5A C8): dest xmm1, src xmm0 */
+        c = wemu_cpu_create(0x10000);
+        uint8_t code2[] = { 0xF2,0x0F,0x5A,0xC8, 0xF4 };
+        double v = 1.5;
+        memcpy(c->xmm[0], &v, 8);
+        wemu_mem_write(c, 0x1000, code2, sizeof code2);
+        wemu_cpu_set_rip(c, 0x1000);
+        wemu_cpu_run(c, 4);
+        float got; memcpy(&got, c->xmm[1], 4);
+        if (got != 1.5f) FAIL("cvtsd2ss distinct regs got %g\n", got);
+        wemu_cpu_destroy(c);
+    }
     printf("SSE2 GATE PASS (100 random rounds x 128/256 vs C oracle)\n");
     return 0;
 }

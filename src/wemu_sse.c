@@ -487,10 +487,14 @@ int wemu_exec_sse(WemuCpu *c, const WemuInsn *in) {
             if (vex) memset(c->xmm[dst] + (dbl ? 8 : 4), 0, (size_t)(16 - (dbl ? 8 : 4)));
             return 1;
         }
-        if (full == 0x12C || full == 0x12D) { /* cvt(t)sd2si: scalar -> r32/64 */
+        if (full == 0x12C || full == 0x12D) { /* cvt(t)sd2si: scalar -> r32/64.
+            * Operand order: ModRM.reg = GPR dest (REX.R), ModRM.rm =
+            * XMM SOURCE (REX.B) — reading xmm[dst] read the wrong reg
+            * (awk $N indexed field 0: every field printed the line). */
+            int xr = (in->modrm & 7) | (REX_B(in) << 3);
             double d; float f;
-            if (dbl) memcpy(&d, c->xmm[dst], 8);
-            else { memcpy(&f, c->xmm[dst], 4); d = (double)f; }
+            if (dbl) memcpy(&d, c->xmm[xr], 8);
+            else { memcpy(&f, c->xmm[xr], 4); d = (double)f; }
             d = full == 0x12D ? nearbyint(d) : trunc(d);
             int obytes = (in->rex & 8) ? 8 : in->opsize;
             uint64_t indef = obytes == 8 ? 0x8000000000000000ull : 0x80000000u;
@@ -505,13 +509,17 @@ int wemu_exec_sse(WemuCpu *c, const WemuInsn *in) {
             else c->r[gr] = r;
             return 1;
         }
-        if (full == 0x15A) { /* cvtss2sd (F3) / cvtsd2ss (F2) */
-            if (dbl) { double d; memcpy(&d, c->xmm[dst], 8);
+        if (full == 0x15A) { /* cvtss2sd (F3) / cvtsd2ss (F2):
+            * reg = dest xmm, rm = src xmm (distinct registers!) */
+            int xr = (in->modrm & 7) | (REX_B(in) << 3);
+            if (dbl) { double d; memcpy(&d, c->xmm[xr], 8);
                        float f = (float)d; memcpy(c->xmm[dst], &f, 4);
-                       if (vex) memset(c->xmm[dst] + 4, 0, 12); }
-            else { float f; memcpy(&f, c->xmm[dst], 4);
+                       if (vex) memset(c->xmm[dst] + 4, 0, 12);
+                       else memcpy(c->xmm[dst] + 4, c->xmm[xr] + 4, 12); }
+            else { float f; memcpy(&f, c->xmm[xr], 4);
                    double d = (double)f; memcpy(c->xmm[dst], &d, 8);
-                   if (vex) memset(c->xmm[dst] + 8, 0, 8); }
+                   if (vex) memset(c->xmm[dst] + 8, 0, 8);
+                   else memcpy(c->xmm[dst] + 8, c->xmm[xr] + 8, 8); }
             return 1;
         }
         /* add/mul/sub/div/min/max: dest = xmm[dst] scalar, src = rm */
