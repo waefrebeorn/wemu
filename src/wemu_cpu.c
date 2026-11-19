@@ -102,6 +102,17 @@ void wemu_cpu_xmm(const WemuCpu *cpu, int idx, uint8_t out[16]) {
     else memset(out, 0, 16);
 }
 
+void wemu_reg_write(WemuCpu *c, int i, int bytes, uint64_t v) {
+    if (i < 0 || i > 15) return;
+    if (bytes == 4) { c->r[i] = v & 0xffffffffull; return; }
+    if (bytes == 8) { c->r[i] = v; return; }
+    if (bytes == 2) {
+        c->r[i] = (c->r[i] & ~0xffffull) | (v & 0xffff);
+        return;
+    }
+    c->r[i] = (c->r[i] & ~0xffull) | (v & 0xff);
+}
+
 /* default syscall semantics: exit halts; write goes to serial if wired */
 static int64_t default_syscall(WemuCpu *cpu, uint64_t nr,
                                const uint64_t args[6]) {

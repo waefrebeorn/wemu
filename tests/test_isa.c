@@ -23,21 +23,6 @@ static void run(WemuCpu *c) {
     CHECK(n >= 0 && wemu_cpu_fault(c) == 0, "run faulted");
 }
 
-/* flags expected by independent C semantics */
-static uint64_t exp_flags_add(uint64_t a, uint64_t b, int bits) {
-    uint64_t mask = bits == 64 ? ~0ull : (1ull << bits) - 1;
-    uint64_t r = (a + b) & mask;
-    uint64_t f = 2;
-    if (!r) f |= 0x40;
-    if (r >> (bits - 1)) f |= 0x80;
-    if (bits < 64 ? (a + b) > mask : r < a) f |= 1;
-    uint64_t sa = a >> (bits - 1), sb = b >> (bits - 1), sr = r >> (bits - 1);
-    if (sa == sb && sr != sa) f |= 0x800;
-    int p = 1; for (int i = 0; i < 8; i++) p ^= (r >> i) & 1;
-    if (p) f |= 4;
-    return f;
-}
-
 int main(void) {
     /* mov rax, 0x1122334455667788; mov rbx, 0x10; add rax, rbx; hlt */
     {
@@ -114,51 +99,76 @@ int main(void) {
         CHECK(wemu_cpu_reg(c, 0) == 0x3FC0, "shr/shl");
         wemu_cpu_destroy(c);
     }
-    /* differential: add/sub/and/or/xor/cmp at 64 and 32 bits */
+    /* differential: 8 ops x 4 widths x carry-in, vs independent C model.
+     * The devil's-advocate expansion: the first gate only covered 6 ops
+     * at 2 widths — survivorship bias. Real code uses 8/16-bit + adc/sbb. */
     {
         srand(1234);
-        for (int t = 0; t < 400; t++) {
+        for (int t = 0; t < 800; t++) {
             uint64_t a = ((uint64_t)rand() << 32) | (unsigned)rand();
             uint64_t b = ((uint64_t)rand() << 32) | (unsigned)rand();
-            int bits = (t & 1) ? 64 : 32;
-            uint64_t mask = bits == 64 ? ~0ull : 0xffffffffull;
+            static const int bitsof[4] = { 64, 32, 16, 8 };
+            int bits = bitsof[t % 4];
+            uint64_t mask = bits == 64 ? ~0ull : (1ull << bits) - 1;
             a &= mask; b &= mask;
-            int op = t % 6; /* add or and sub xor cmp */
-            static const uint8_t ops[6] = { 0x01, 0x09, 0x21, 0x29, 0x31, 0x39 };
-            uint8_t rex = bits == 64 ? 0x48 : 0x40;
-            int immbytes = bits == 64 ? 8 : 4;
-            uint8_t code[24]; int n = 0;
-            code[n++] = rex; code[n++] = 0xB8;
-            for (int i = 0; i < immbytes; i++) code[n++] = (uint8_t)(a >> (8 * i));
-            code[n++] = rex; code[n++] = 0xBB;
-            for (int i = 0; i < immbytes; i++) code[n++] = (uint8_t)(b >> (8 * i));
-            code[n++] = rex; code[n++] = ops[op]; code[n++] = 0xD8; /* op rax,rbx */
+            int op = (t / 4) % 8; /* add or adc sbb and sub xor cmp */
+            static const uint8_t ops[8] = { 0x01,0x09,0x11,0x19,0x21,0x29,0x31,0x39 };
+            int cin = (t / 32) & 1;
+            uint8_t code[32]; int n = 0;
+            if (bits == 8) {
+                code[n++] = 0xB0; code[n++] = (uint8_t)a;
+                code[n++] = 0xB3; code[n++] = (uint8_t)b;
+                code[n++] = cin ? 0xF9 : 0xF8; /* stc/clc */
+                code[n++] = ops[op] & ~1; code[n++] = 0xD8;
+            } else {
+                uint8_t pfx = bits == 16 ? 0x66 : 0x48;
+                int immbytes = bits == 16 ? 2 : bits == 32 ? 4 : 8;
+                if (bits == 32) { code[n++] = 0xB8; }
+                else { code[n++] = pfx; code[n++] = 0xB8; }
+                for (int i = 0; i < immbytes; i++) code[n++] = (uint8_t)(a >> (8*i));
+                if (bits == 32) { code[n++] = 0xBB; }
+                else { code[n++] = pfx; code[n++] = 0xBB; }
+                for (int i = 0; i < immbytes; i++) code[n++] = (uint8_t)(b >> (8*i));
+                code[n++] = cin ? 0xF9 : 0xF8;
+                if (bits != 32) code[n++] = pfx;
+                code[n++] = ops[op]; code[n++] = 0xD8;
+            }
             code[n++] = 0xF4;
             WemuCpu *c = boot(code, (size_t)n); run(c);
             uint64_t exp;
             switch (op) {
             case 0: exp = (a + b) & mask; break;
             case 1: exp = a | b; break;
-            case 2: exp = a & b; break;
-            case 3: exp = (a - b) & mask; break;
-            case 4: exp = a ^ b; break;
-            default: exp = a; break; /* cmp leaves rax */
+            case 2: exp = (a + b + (uint64_t)cin) & mask; break;
+            case 3: exp = (a - b - (uint64_t)cin) & mask; break;
+            case 4: exp = a & b; break;
+            case 5: exp = (a - b) & mask; break;
+            case 6: exp = a ^ b; break;
+            default: exp = a; break;
             }
             CHECK(wemu_cpu_reg(c, 0) == exp, "differential value");
-            if (op == 0) {
-                uint64_t ef = exp_flags_add(a, b, bits);
-                uint64_t gf = wemu_cpu_rflags(c) & 0x8C5;
-                CHECK(gf == (ef & 0x8C5), "differential add flags");
-            }
-            if (op == 3) { /* sub: ZF/SF/CF check */
+            if (op == 0 || op == 2 || op == 3 || op == 5) {
+                int is_sub = op == 3 || op == 5;
+                int c_in = (op == 2 || op == 3) ? cin : 0;
+                __uint128_t ua = a, ub = b;
+                int cf = is_sub ? (ua < ub + (unsigned)c_in)
+                                : (((ua + ub + (unsigned)c_in) >> bits) & 1);
+                int64_t sa = (int64_t)(a << (64 - bits)) >> (64 - bits);
+                int64_t sb = (int64_t)(b << (64 - bits)) >> (64 - bits);
+                __int128 sr = is_sub ? (__int128)sa - sb - c_in
+                                     : (__int128)sa + sb + c_in;
+                __int128 lim = (__int128)1 << (bits - 1);
+                int of = sr >= lim || sr < -lim;
                 uint64_t f = wemu_cpu_rflags(c);
-                CHECK(((f & 0x40) != 0) == (exp == 0), "sub ZF");
-                CHECK(((f & 1) != 0) == (a < b), "sub CF");
+                CHECK(((f & 1) != 0) == cf, "differential CF");
+                CHECK(((f & 0x800) != 0) == of, "differential OF");
+                CHECK(((f & 0x40) != 0) == (exp == 0), "differential ZF");
+                CHECK(((f & 0x80) != 0) == ((exp >> (bits - 1)) & 1), "differential SF");
             }
             wemu_cpu_destroy(c);
         }
     }
     if (fails) { printf("test_isa: %d FAILURES\n", fails); return 1; }
-    printf("test_isa: PASS (sequences + 400 differential cases)\n");
+    printf("test_isa: PASS (sequences + 800 differential cases, 8 ops x 4 widths x CF)\n");
     return 0;
 }

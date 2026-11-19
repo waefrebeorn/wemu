@@ -88,6 +88,11 @@ int wemu_exec_sse(WemuCpu *c, const WemuInsn *in) {
     uint8_t a[32] = {0}, b[32] = {0}, d[32] = {0};
     int sse66 = !vex && in->opsize == 2;
 
+    if (full == 0x177) { /* (v)zeroupper / emms: clear upper YMM state.
+        * Neither form carries a ModRM byte (0x77 is the opcode). */
+        for (int i = 0; i < 16; i++) memset(c->ymm_hi[i], 0, 16);
+        return 1;
+    }
     if (full == 0x16E || (vex && full == 0x16E)) { /* (v)movd xmm, r/m32 */
         uint64_t v = 0;
         if ((in->modrm >> 6) == 3) {

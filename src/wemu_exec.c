@@ -204,7 +204,15 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
         if (in->vex_len) goto ud;
     }
 
-    if (o <= 0x3D && (o & 7) <= 5 && (o & 0xC0) == 0) {
+    /* string family (movs/stos/scas/cmps/lods + cld/std): real compiled
+     * memset/memcpy live here — delegate to the one owner */
+    {
+        int sh = wemu_exec_string(c, in);
+        if (sh == 1) { c->rip += in->len; return 0; }
+        if (sh < 0) return -1;
+    }
+
+    if (full < 0x100 && o <= 0x3D && (o & 7) <= 5 && (o & 0xC0) == 0) {
         int op = (o >> 3) & 7;
         int form = o & 7;
         if (form == 4) { a = read_reg(c, 0, 1); b = in->imm & 0xff;
@@ -343,6 +351,11 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
         c->rip += in->len + (uint64_t)(int64_t)(int8_t)in->imm;
         return 0;
     case 0xF4: c->halted = 1; break;
+    case 0xF5: c->rflags ^= WF_CF; break;            /* cmc */
+    case 0xF8: c->rflags &= ~WF_CF; break;           /* clc */
+    case 0xF9: c->rflags |= WF_CF; break;            /* stc */
+    case 0xFA: c->rflags &= ~0x200ull; break;        /* cli */
+    case 0xFB: c->rflags |= 0x200ull; break;         /* sti */
     case 0xE6: wemu_port_out(c, (uint16_t)(in->imm & 0xff), (uint32_t)c->r[0], 1); break;
     case 0xE7: wemu_port_out(c, (uint16_t)(in->imm & 0xff), (uint32_t)c->r[0], os); break;
     case 0xEE: wemu_port_out(c, (uint16_t)c->r[2], (uint32_t)c->r[0], 1); break;
@@ -549,14 +562,34 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
             if (full == 0x1AB) write_rm(c, in, os, a | (1ull << bit));
             else if (full == 0x1B3) write_rm(c, in, os, a & ~(1ull << bit));
             else if (full == 0x1BB) write_rm(c, in, os, a ^ (1ull << bit));
-        } else if (full == 0x1A2) { /* cpuid: honest identity */
+        } else if (full == 0x1A2) { /* cpuid: claim ONLY what we execute.
+            * CPUID outputs: EAX->r0 EBX->r3 ECX->r1 EDX->r2 */
             uint64_t leaf = c->r[0];
             if (leaf == 0) {
-                c->r[0] = 1;
-                c->r[1] = 0x75427557; /* "WuBu" */
-                c->r[2] = 0x6c756d45; /* "Emul" */
-                c->r[3] = 0x726f7461; /* "ator" */
+                c->r[0] = 7; /* max basic leaf */
+                c->r[3] = 0x75427557; /* EBX "WuBu" */
+                c->r[1] = 0x6c756d45; /* ECX "Emul" */
+                c->r[2] = 0x726f7461; /* EDX "ator" */
+            } else if (leaf == 1) {
+                c->r[0] = 0x000906E9; /* family/model/stepping (consistent) */
+                c->r[3] = 0;          /* EBX */
+                /* EDX: TSC MSR PAE CX8 CMOV FXSR MMX SSE SSE2 */
+                c->r[2] = (1ull<<4)|(1ull<<5)|(1ull<<6)|(1ull<<8)|(1ull<<15)|
+                          (1ull<<24)|(1ull<<23)|(1ull<<25)|(1ull<<26);
+                /* ECX: SSE3 SSSE3 XSAVE OSXSAVE POPCNT SSE4.1 SSE4.2 AVX */
+                c->r[1] = (1ull<<0)|(1ull<<9)|(1ull<<26)|(1ull<<27)|(1ull<<23)|
+                          (1ull<<19)|(1ull<<20)|(1ull<<28);
+            } else if (leaf == 7) {
+                c->r[0] = 0; /* max subleaf */
+                c->r[3] = (1ull<<5); /* EBX: AVX2 — the founding gap, owned */
+                c->r[1] = 0;
+                c->r[2] = 0;
             } else { c->r[0] = c->r[1] = c->r[2] = c->r[3] = 0; }
+        } else if (full == 0x101 && in->modrm == 0xD0) { /* xgetbv */
+            if ((c->r[1] & 0xffffffff) == 0) {
+                c->r[0] = 0x7; /* XCR0: x87+SSE+AVX state enabled */
+                c->r[2] = 0;
+            } else { c->r[0] = 0; c->r[2] = 0; }
         } else if (full == 0x131) { /* rdtsc */
             static uint64_t tsc;
             tsc += 100;

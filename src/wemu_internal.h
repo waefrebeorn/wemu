@@ -73,6 +73,12 @@ uint64_t wemu_eff_addr(WemuCpu *cpu, const WemuInsn *in);
 void wemu_port_out(WemuCpu *cpu, uint16_t port, uint32_t val, int bytes);
 uint32_t wemu_port_in(WemuCpu *cpu, uint16_t port, int bytes);
 
+/* register write with x86 width semantics (32-bit writes zero-extend) */
+void wemu_reg_write(WemuCpu *c, int i, int bytes, uint64_t v);
+
+/* string instructions (wemu_string.c): 1 handled, 0 not ours, -1 fault */
+int wemu_exec_string(WemuCpu *c, const WemuInsn *in);
+
 /* flags helpers (wemu_cpu.c) */
 void wemu_set_logic_flags(WemuCpu *cpu, uint64_t res, int bytes);
 void wemu_set_add_flags(WemuCpu *cpu, uint64_t a, uint64_t b, uint64_t res,

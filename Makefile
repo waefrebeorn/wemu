@@ -5,9 +5,9 @@ CFLAGS  += -Iinclude -Isrc
 AR      ?= ar
 
 SRC = src/wemu_cpu.c src/wemu_mem.c src/wemu_decode.c src/wemu_exec.c \
-      src/wemu_sse.c src/wemu_machine.c
+      src/wemu_sse.c src/wemu_string.c src/wemu_machine.c
 OBJ = $(SRC:.c=.o)
-TESTS = test_isa test_avx test_paging test_machine
+TESTS = test_isa test_avx test_paging test_machine test_string test_cpuid
 
 all: libwemu.a
 
