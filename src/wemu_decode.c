@@ -52,6 +52,7 @@ static int imm_len_for(uint32_t op, int opsize, uint8_t modrm_reg,
     case 0x25: case 0x2D: case 0x35: case 0x3D:
     case 0x68: case 0xA9: case 0xE8: case 0xE9:
         return opsize == 2 ? 2 : 4;
+    case 0x80: return 1;                     /* grp1 imm8 */
     case 0x81: return opsize == 2 ? 2 : 4;   /* grp1 imm */
     case 0x69: return opsize == 2 ? 2 : 4;   /* imul r,rm,imm */
     case 0x6B: return 1;                     /* imul r,rm,imm8 */
@@ -70,6 +71,7 @@ static int imm_len_for(uint32_t op, int opsize, uint8_t modrm_reg,
         if (op == 0x1BA) return 1;                   /* 0F BA grp8 imm8 */
         if (op == 0x1A4) return 1;                   /* shld imm8 */
         if (op >= 0x170 && op <= 0x173) return 1;    /* pshufd/psrlw/pslld/psllq imm8 */
+        if (op >= 0x300 && op <= 0x3FF) return 1;    /* 0F 3A map: all imm8 */
         if (op == 0x1C7) return 0;                   /* cmpxchg8b/16b: none */
         return 0;
     }
@@ -88,8 +90,9 @@ int wemu_decode(WemuCpu *cpu, WemuInsn *in) {
         if (b == 0x66) { in->opsize = 2; take(&f); }
         else if (b == 0x67) { in->addrsize = 4; take(&f); }
         else if (b == 0xF2 || b == 0xF3) { in->rep = b; take(&f); }
+        else if (b == 0x64 || b == 0x65) { in->seg = b; take(&f); }
         else if (b == 0xF0 || b == 0x2E || b == 0x36 || b == 0x3E ||
-                 b == 0x26 || b == 0x64 || b == 0x65) { take(&f); }
+                 b == 0x26) { take(&f); }
         else break;
         rex = 0; /* REX must be last prefix */
     }
@@ -162,8 +165,9 @@ modrm:;
         need_modrm = 1; /* two/three-byte opcodes in our subset all use it */
         if (full == 0x105 || full == 0x10B || full == 0x1A2 ||
             full == 0x131 || full == 0x177 || full == 0x10E ||
+            (full >= 0x180 && full <= 0x18F) ||
             (full >= 0x1C8 && full <= 0x1CF))
-            need_modrm = 0; /* syscall/sysret/cpuid/rdtsc/emms/bswap */
+            need_modrm = 0; /* syscall/sysret/cpuid/rdtsc/emms/bswap/jcc rel32 */
     }
     if (need_modrm) {
         in->has_modrm = 1;

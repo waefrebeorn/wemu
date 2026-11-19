@@ -63,6 +63,23 @@ static void binop(int op, uint8_t *d, const uint8_t *a, const uint8_t *b,
         case 3: r = av | bv; break;             /* por */
         case 4: r = av + bv; break;             /* padd */
         case 5: r = av - bv; break;             /* psub */
+        case 6: r = av == bv ? ~0ull : 0; break;   /* pcmpeq */
+        case 7: {                               /* pcmpgt (signed) */
+            int bits = es * 8;
+            int64_t sa = (int64_t)(av << (64 - bits)) >> (64 - bits);
+            int64_t sb = (int64_t)(bv << (64 - bits)) >> (64 - bits);
+            r = sa > sb ? ~0ull : 0;
+            break;
+        }
+        case 8: r = av < bv ? av : bv; break;   /* pminu */
+        case 9: r = av > bv ? av : bv; break;   /* pmaxu */
+        case 10: r = av > bv ? av - bv : 0; break; /* psubusb */
+        case 11: {                              /* paddusb */
+            uint64_t s = av + bv;
+            uint64_t max = es >= 8 ? ~0ull : ((1ull << (es * 8)) - 1);
+            r = s > max ? max : s;
+            break;
+        }
         }
         for (int k = 0; k < es; k++) d[i + k] = (uint8_t)(r >> (8 * k));
     }
@@ -74,6 +91,10 @@ static int es_for(uint8_t o) {
     case 0xFD: case 0xF9: return 2;
     case 0xFE: case 0xFA: return 4;
     case 0xD4: case 0xFB: return 8;
+    case 0x74: case 0x64: case 0xDA: case 0xDE:
+    case 0xD8: case 0xDC: return 1;
+    case 0x75: case 0x65: return 2;
+    case 0x76: case 0x66: return 4;
     }
     return 16; /* logical ops: whole lane */
 }
@@ -190,6 +211,12 @@ int wemu_exec_sse(WemuCpu *c, const WemuInsn *in) {
     else if (o == 0xEB) op = 3;
     else if (o == 0xFC || o == 0xFD || o == 0xFE || o == 0xD4) op = 4;
     else if (o == 0xF8 || o == 0xF9 || o == 0xFA || o == 0xFB) op = 5;
+    else if (o == 0x74 || o == 0x75 || o == 0x76) op = 6;  /* pcmpeq */
+    else if (o == 0x64 || o == 0x65 || o == 0x66) op = 7;  /* pcmpgt */
+    else if (o == 0xDA) op = 8;                            /* pminub */
+    else if (o == 0xDE) op = 9;                            /* pmaxub */
+    else if (o == 0xD8) op = 10;                           /* psubusb */
+    else if (o == 0xDC) op = 11;                           /* paddusb */
     if (op >= 0 && full >= 0x100 && full < 0x200 && (vex || sse66)) {
         int es = es_for(o);
         if (rm_vec(c, in, b, b + 16, nb) != 0) return -1;
@@ -216,7 +243,10 @@ int wemu_exec_sse(WemuCpu *c, const WemuInsn *in) {
     }
     if (!vex && sse66 && full == 0x173) { /* psllq/psrldq/pslldq imm8 */
         int reg = REG(in);
-        memcpy(a, c->xmm[dst], 16);
+        /* the shift-count group selects the op via reg; the OPERAND is
+         * the r/m register, not the reg field */
+        int xr = (in->modrm & 7) | (REX_B(in) << 3);
+        memcpy(a, c->xmm[xr], 16);
         uint64_t cnt = in->imm & 0xff;
         if (reg == 7) { /* psllq per qword */
             for (int q = 0; q < 2; q++) {
@@ -232,7 +262,206 @@ int wemu_exec_sse(WemuCpu *c, const WemuInsn *in) {
             for (int i = 15; i >= 0; i--)
                 d[i] = ((uint64_t)i >= cnt) ? a[i - cnt] : 0;
         } else return 0;
+        memcpy(c->xmm[xr], d, 16);
+        return 1;
+    }
+    /* ---- SSE2/SSSE3/AVX2 growth: the glibc-string-function surface ---- */
+    if (full >= 0x100 && full < 0x200 && (vex || sse66) &&
+        (o == 0x60 || o == 0x61 || o == 0x62 || o == 0x6C ||
+         o == 0x68 || o == 0x69 || o == 0x6A || o == 0x6D)) {
+        /* punpckl/h bw/wd/dq/qdq: interleave elements per 128-bit lane */
+        int es = (o == 0x60 || o == 0x68) ? 1 : (o == 0x61 || o == 0x69) ? 2
+               : (o == 0x62 || o == 0x6A) ? 4 : 8;
+        int hi = o == 0x68 || o == 0x69 || o == 0x6A || o == 0x6D;
+        if (rm_vec(c, in, b, b + 16, nb) != 0) return -1;
+        if (vex) {
+            int src = vex_vvvv(in);
+            memcpy(a, c->xmm[src], 16);
+            memcpy(a + 16, c->ymm_hi[src], 16);
+        } else {
+            memcpy(a, c->xmm[dst], 16);
+            memcpy(a + 16, c->ymm_hi[dst], 16);
+        }
+        int per_lane = 8 / es;             /* elements interleaved per lane */
+        for (int lane = 0; lane < nb; lane += 16) {
+            for (int i = 0; i < per_lane; i++) {
+                int so = hi ? 8 : 0;
+                memcpy(d + lane + 2 * i * es, a + lane + so + i * es, (size_t)es);
+                memcpy(d + lane + (2 * i + 1) * es, b + lane + so + i * es, (size_t)es);
+            }
+        }
         memcpy(c->xmm[dst], d, 16);
+        if (L) memcpy(c->ymm_hi[dst], d + 16, 16);
+        else if (vex) memset(c->ymm_hi[dst], 0, 16);
+        return 1;
+    }
+    if (full == 0x1D7 && (vex || sse66)) { /* (v)pmovmskb r32, xmm/ymm */
+        if ((in->modrm >> 6) != 3) return 0;
+        int rm = (in->modrm & 7) | (REX_B(in) << 3);
+        uint8_t src[32];
+        memcpy(src, c->xmm[rm], 16);
+        memcpy(src + 16, c->ymm_hi[rm], 16);
+        uint32_t mask = 0;
+        for (int i = 0; i < nb; i++)
+            if (src[i] & 0x80) mask |= 1u << i;
+        int gr = REG(in) | (REX_R(in) << 3);
+        c->r[gr] = mask;                   /* 32-bit write zero-extends */
+        return 1;
+    }
+    if (full == 0x30F && (vex || sse66)) { /* (v)palignr xmm, xmm/m, imm8 */
+        if (rm_vec(c, in, b, b + 16, nb) != 0) return -1;
+        if (vex) {
+            int src = vex_vvvv(in);
+            memcpy(a, c->xmm[src], 16);
+            memcpy(a + 16, c->ymm_hi[src], 16);
+        } else {
+            memcpy(a, c->xmm[dst], 16);
+            memcpy(a + 16, c->ymm_hi[dst], 16);
+        }
+        uint64_t cnt = in->imm & 0xff;
+        for (int lane = 0; lane < nb; lane += 16) {
+            uint8_t cat[32];
+            memcpy(cat, a + lane, 16);
+            memcpy(cat + 16, b + lane, 16);
+            for (int i = 0; i < 16; i++)
+                d[lane + i] = cnt + (uint64_t)i < 32 ? cat[cnt + i] : 0;
+        }
+        memcpy(c->xmm[dst], d, 16);
+        if (L) memcpy(c->ymm_hi[dst], d + 16, 16);
+        else if (vex) memset(c->ymm_hi[dst], 0, 16);
+        return 1;
+    }
+    if (full == 0x200 && (vex || sse66)) { /* (v)pshufb (SSSE3) */
+        if (rm_vec(c, in, b, b + 16, nb) != 0) return -1;
+        if (vex) {
+            int src = vex_vvvv(in);
+            memcpy(a, c->xmm[src], 16);
+            memcpy(a + 16, c->ymm_hi[src], 16);
+        } else {
+            memcpy(a, c->xmm[dst], 16);
+            memcpy(a + 16, c->ymm_hi[dst], 16);
+        }
+        for (int lane = 0; lane < nb; lane += 16)
+            for (int i = 0; i < 16; i++)
+                d[lane + i] = (b[lane + i] & 0x80) ? 0
+                              : a[lane + (b[lane + i] & 15)];
+        memcpy(c->xmm[dst], d, 16);
+        if (L) memcpy(c->ymm_hi[dst], d + 16, 16);
+        else if (vex) memset(c->ymm_hi[dst], 0, 16);
+        return 1;
+    }
+    if (vex && full == 0x170) { /* vpshufd ymm/xmm, xmm/m, imm8 */
+        if (rm_vec(c, in, b, b + 16, nb) != 0) return -1;
+        for (int lane = 0; lane < nb; lane += 16)
+            for (int i = 0; i < 4; i++)
+                memcpy(d + lane + 4 * i,
+                       b + lane + 4 * ((in->imm >> (2 * i)) & 3), 4);
+        memcpy(c->xmm[dst], d, 16);
+        if (L) memcpy(c->ymm_hi[dst], d + 16, 16);
+        else memset(c->ymm_hi[dst], 0, 16);
+        return 1;
+    }
+    if (vex && full == 0x173 && (REG(in) == 3 || REG(in) == 6)) {
+        /* vpsrldq / vpslldq: ModRM.reg is the op digit, rm is the source,
+         * and the DESTINATION lives in VEX.vvvv */
+        int dstv = vex_vvvv(in);
+        if (rm_vec(c, in, a, a + 16, nb) != 0) return -1;
+        uint64_t cnt = in->imm & 0xff;
+        for (int lane = 0; lane < nb; lane += 16) {
+            if (REG(in) == 3)
+                for (int i = 0; i < 16; i++)
+                    d[lane + i] = cnt + (uint64_t)i < 16 ? a[lane + cnt + i] : 0;
+            else
+                for (int i = 15; i >= 0; i--)
+                    d[lane + i] = (uint64_t)i >= cnt ? a[lane + i - cnt] : 0;
+        }
+        memcpy(c->xmm[dstv], d, 16);
+        if (L) memcpy(c->ymm_hi[dstv], d + 16, 16);
+        else memset(c->ymm_hi[dstv], 0, 16);
+        return 1;
+    }
+    if ((full == 0x110 || full == 0x111) && !vex &&
+        (in->rep == 0xF3 || in->rep == 0xF2)) {
+        /* movss (F3) / movsd (F2): scalar 4/8-byte move */
+        int bytes = in->rep == 0xF3 ? 4 : 8;
+        if (full == 0x110) {
+            uint8_t v[8] = {0};
+            if ((in->modrm >> 6) == 3) {
+                int rm = (in->modrm & 7) | (REX_B(in) << 3);
+                memcpy(v, c->xmm[rm], (size_t)bytes);
+                /* reg<-reg keeps dst upper bytes (legacy merge) */
+                memcpy(c->xmm[dst], v, (size_t)bytes);
+            } else {
+                if (wemu_mem_read(c, wemu_eff_addr(c, in), v, (size_t)bytes) != 0)
+                    return -1;
+                memset(c->xmm[dst], 0, 16);
+                memcpy(c->xmm[dst], v, (size_t)bytes);
+            }
+        } else {
+            uint8_t v[8];
+            memcpy(v, c->xmm[dst], (size_t)bytes);
+            if ((in->modrm >> 6) == 3) {
+                int rm = (in->modrm & 7) | (REX_B(in) << 3);
+                memcpy(c->xmm[rm], v, (size_t)bytes);
+            } else if (wemu_mem_write(c, wemu_eff_addr(c, in), v, (size_t)bytes) != 0)
+                return -1;
+        }
+        return 1;
+    }
+    if ((full == 0x128 || full == 0x129 || full == 0x110 || full == 0x111) &&
+        (vex || in->rep == 0)) {
+        /* (v)movaps/movups (no prefix) and (v)movapd/movupd (66):
+         * whole-lane moves, byte-identical to movdqa(u) */
+        if (full == 0x128 || full == 0x110) {
+            if (rm_vec(c, in, c->xmm[dst], c->ymm_hi[dst], nb) != 0) return -1;
+            if (vex && !L) memset(c->ymm_hi[dst], 0, 16);
+        } else {
+            store_vec(c, in, c->xmm[dst], c->ymm_hi[dst], nb);
+        }
+        return 1;
+    }
+    if ((full == 0x112 || full == 0x113 || full == 0x116 || full == 0x117) &&
+        !vex && in->rep == 0) {
+        /* movlps/movhps (and 66 pd forms): 8-byte half-lane moves.
+         * reg<-reg forms are movhlps (0F12) / movlhps (0F16). */
+        int hi = full == 0x116 || full == 0x117;
+        int load = full == 0x112 || full == 0x116;
+        uint8_t v[8];
+        if (load) {
+            if ((in->modrm >> 6) == 3) {
+                int rm = (in->modrm & 7) | (REX_B(in) << 3);
+                /* movhlps: dst.low <- src.high ; movlhps: dst.high <- src.low */
+                memcpy(v, c->xmm[rm] + (hi ? 0 : 8), 8);
+            } else if (wemu_mem_read(c, wemu_eff_addr(c, in), v, 8) != 0)
+                return -1;
+            memcpy(c->xmm[dst] + (hi ? 8 : 0), v, 8);
+        } else {
+            memcpy(v, c->xmm[dst] + (hi ? 8 : 0), 8);
+            if ((in->modrm >> 6) == 3) {
+                int rm = (in->modrm & 7) | (REX_B(in) << 3);
+                memcpy(c->xmm[rm], v, 8);
+            } else if (wemu_mem_write(c, wemu_eff_addr(c, in), v, 8) != 0)
+                return -1;
+        }
+        return 1;
+    }
+    if (full >= 0x154 && full <= 0x157) {
+        /* and/andn/or/xor ps (no prefix) / pd (66): lane-wise logic */
+        int lop = full == 0x154 ? 1 : full == 0x155 ? 2
+                : full == 0x156 ? 3 : 0;
+        if (rm_vec(c, in, b, b + 16, nb) != 0) return -1;
+        if (vex) {
+            int src = vex_vvvv(in);
+            memcpy(a, c->xmm[src], 16);
+            memcpy(a + 16, c->ymm_hi[src], 16);
+        } else {
+            memcpy(a, c->xmm[dst], 16);
+            memcpy(a + 16, c->ymm_hi[dst], 16);
+        }
+        binop(lop, d, a, b, nb, 16);
+        memcpy(c->xmm[dst], d, 16);
+        if (L) memcpy(c->ymm_hi[dst], d + 16, 16);
+        else if (vex) memset(c->ymm_hi[dst], 0, 16);
         return 1;
     }
     return 0; /* not ours */

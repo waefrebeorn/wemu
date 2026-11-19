@@ -14,6 +14,8 @@ struct WemuCpu {
     uint8_t  xmm[16][16];
     uint8_t  ymm_hi[16][16];   /* upper 128 bits of YMM (VEX.256) */
     uint64_t cr0, cr2, cr3, cr4, efer;
+    uint64_t fs_base, gs_base; /* user-mode TLS segment bases */
+    uint64_t elf_brk;          /* page-aligned end of loaded ELF image */
     uint8_t *ram;
     uint64_t ram_size;
     int halted;
@@ -46,6 +48,7 @@ typedef struct {
     uint8_t vex_len;         /* 0 = legacy, 2/3 = VEX prefix bytes */
     uint8_t vex[3];
     uint8_t rep;             /* 0, 0xF2, 0xF3 */
+    uint8_t seg;             /* segment override: 0 none, 0x64 FS, 0x65 GS */
     int64_t disp;
     uint64_t imm;
     uint8_t imm_len;

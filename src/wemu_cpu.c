@@ -91,6 +91,10 @@ void wemu_cpu_enable_paging(WemuCpu *cpu, int on) {
     if (on) cpu->cr0 |= 0x80000000ull;
     else cpu->cr0 &= ~0x80000000ull;
 }
+void wemu_cpu_set_fs_base(WemuCpu *cpu, uint64_t base) { cpu->fs_base = base; }
+void wemu_cpu_set_gs_base(WemuCpu *cpu, uint64_t base) { cpu->gs_base = base; }
+uint64_t wemu_cpu_fs_base(const WemuCpu *cpu) { return cpu->fs_base; }
+uint64_t wemu_cpu_gs_base(const WemuCpu *cpu) { return cpu->gs_base; }
 void wemu_cpu_set_syscall_hook(WemuCpu *cpu, WemuSyscallFn fn, void *ud) {
     cpu->sys_fn = fn; cpu->sys_ud = ud;
 }

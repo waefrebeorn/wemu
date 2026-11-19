@@ -104,5 +104,10 @@ uint64_t wemu_eff_addr(WemuCpu *c, const WemuInsn *in) {
         addr = c->r[rm];
     }
     if (in->addrsize == 4) addr &= 0xffffffffull;
-    return addr + (uint64_t)in->disp;
+    addr += (uint64_t)in->disp;
+    /* user-mode TLS: FS/GS overrides add the segment base (flat DS/ES/
+     * SS/CS contribute 0). LEA excludes the base at its call site. */
+    if (in->seg == 0x64) addr += c->fs_base;
+    else if (in->seg == 0x65) addr += c->gs_base;
+    return addr;
 }

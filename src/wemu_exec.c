@@ -290,7 +290,12 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
     case 0x89: write_rm(c, in, os, read_regop(c, in, os)); break;
     case 0x8A: write_regop(c, in, 1, read_rm(c, in, 1)); break;
     case 0x8B: write_regop(c, in, os, read_rm(c, in, os)); break;
-    case 0x8D: write_regop(c, in, os, eff_addr(c, in)); break; /* lea */
+    case 0x8D: { /* lea: address arithmetic, NO segment base applied */
+        WemuInsn noseg = *in;
+        noseg.seg = 0;
+        write_regop(c, in, os, eff_addr(c, &noseg));
+        break;
+    }
     case 0x90:
         if (REX_B(in)) { /* xchg r8, rax */
             a = c->r[0]; c->r[0] = c->r[8]; c->r[8] = a;
@@ -532,16 +537,38 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
             for (int i = 0; i < os; i++)
                 out |= ((v >> (8 * i)) & 0xff) << (8 * (os - 1 - i));
             write_reg(c, rr, os, out);
-        } else if (full == 0x1BC || full == 0x1BD) { /* bsf/bsr */
+        } else if (full == 0x11E || full == 0x11F) {
+            /* endbr64/endbr32 (F3 0F 1E FA/FB) and multi-byte NOP
+             * (0F 1F /0): architectural NOPs; ModRM/disp already consumed
+             * by the decoder. CET landing pads must not fault guests. */
+        } else if (full == 0x1BC || full == 0x1BD) { /* bsf/bsr, tzcnt/lzcnt */
             a = read_rm(c, in, os);
-            uint64_t f = c->rflags & ~WF_ZF;
-            if (!a) { f |= WF_ZF; c->rflags = f; }
-            else {
-                int bit = full == 0x1BC ? 0 : os * 8 - 1;
-                if (full == 0x1BC) while (!((a >> bit) & 1)) bit++;
-                else while (!((a >> bit) & 1)) bit--;
-                write_regop(c, in, os, (uint64_t)bit);
+            int bits = os * 8;
+            if (in->rep == 0xF3) { /* tzcnt/lzcnt: defined for src==0 */
+                uint64_t f = c->rflags & ~(WF_ZF | WF_CF);
+                if (!a) {
+                    r = (uint64_t)bits;
+                    f |= WF_CF;             /* CF=1: source was zero */
+                } else {
+                    int bit = full == 0x1BC ? 0 : bits - 1;
+                    if (full == 0x1BC) while (!((a >> bit) & 1)) bit++;
+                    else while (!((a >> bit) & 1)) bit--;
+                    r = full == 0x1BC ? (uint64_t)bit
+                                      : (uint64_t)(bits - 1 - bit);
+                }
+                if (!r) f |= WF_ZF;         /* ZF per the result */
                 c->rflags = f;
+                write_regop(c, in, os, r);
+            } else {
+                uint64_t f = c->rflags & ~WF_ZF;
+                if (!a) { f |= WF_ZF; c->rflags = f; }
+                else {
+                    int bit = full == 0x1BC ? 0 : bits - 1;
+                    if (full == 0x1BC) while (!((a >> bit) & 1)) bit++;
+                    else while (!((a >> bit) & 1)) bit--;
+                    write_regop(c, in, os, (uint64_t)bit);
+                    c->rflags = f;
+                }
             }
         } else if (full == 0x1BA) { /* bt/bts/btr/btc imm8 */
             int op = REG(in);

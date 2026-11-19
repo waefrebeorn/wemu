@@ -61,6 +61,26 @@ uint64_t wemu_cpu_fault_addr(const WemuCpu *cpu); /* CR2 for #PF */
 /* XMM register read (16 bytes). */
 void wemu_cpu_xmm(const WemuCpu *cpu, int idx, uint8_t out[16]);
 
+/* User-mode ELF execution (wemu_elf.c): load a static ET_EXEC x86-64
+ * ELF into guest RAM at its p_vaddr, zero .bss, build the SysV initial
+ * stack (argc/argv/envp/auxv) at RAM top, set RIP=e_entry. Exactly one
+ * of path / bytes is used: path!=NULL reads the file, else bytes[0..len).
+ * argv is NULL-terminated (may be NULL for argc=0). Paging stays OFF:
+ * flat identity memory is user mode. Returns 0 or -1. */
+int wemu_cpu_load_elf(WemuCpu *cpu, const char *path,
+                      const uint8_t *bytes, size_t len,
+                      char *const argv[]);
+/* Page-aligned end of the loaded ELF image (initial program break). */
+uint64_t wemu_cpu_elf_brk(const WemuCpu *cpu);
+
+/* Segment bases for user-mode TLS (%fs / %gs overrides). The CPU adds
+ * these to effective addresses; arch_prctl-style guests set them via
+ * the syscall hook. Default 0 (flat). */
+void wemu_cpu_set_fs_base(WemuCpu *cpu, uint64_t base);
+void wemu_cpu_set_gs_base(WemuCpu *cpu, uint64_t base);
+uint64_t wemu_cpu_fs_base(const WemuCpu *cpu);
+uint64_t wemu_cpu_gs_base(const WemuCpu *cpu);
+
 /* Machine: CPU + COM1 serial. Output bytes go to the callback. */
 typedef void (*WemuSerialFn)(uint8_t byte, void *ud);
 WemuMachine *wemu_machine_create(uint64_t ram_size, WemuSerialFn out, void *ud);
