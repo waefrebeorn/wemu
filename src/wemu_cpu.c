@@ -144,10 +144,22 @@ static int64_t default_syscall(WemuCpu *cpu, uint64_t nr,
 }
 
 int64_t wemu_cpu_step(WemuCpu *cpu) {
-    if (cpu->halted || cpu->fault) return -1;
+    if (cpu->halted) return -1;
+    /* A fault already latched (host raise, or a previous hook) is delivered
+     * here at the instruction boundary.  No handler -> legacy -1. */
+    if (cpu->fault) {
+        int v = cpu->fault;
+        if (wemu_cpu_deliver_exception(cpu, (unsigned)v) == 0) return 1;
+        return -1;
+    }
     WemuInsn in;
     memset(&in, 0, sizeof in);
-    if (wemu_decode(cpu, &in) != 0) return -1;
+    if (wemu_decode(cpu, &in) != 0) {
+        int v = in.fault ? in.fault : cpu->fault;
+        if (v) cpu->fault = v;            /* latch decode faults too */
+        if (v && wemu_cpu_deliver_exception(cpu, (unsigned)v) == 0) return 1;
+        return -1;
+    }
     /* syscall is handled here so the hook sees architectural state */
     uint32_t full = in.op | ((uint32_t)(in.vex[0] >> 4) << 8);
     if (full == 0x105 && !in.vex_len) {
@@ -159,13 +171,20 @@ int64_t wemu_cpu_step(WemuCpu *cpu) {
         cpu->rip += in.len;
         return 1;
     }
-    if (wemu_exec(cpu, &in) != 0) return -1;
+    if (wemu_exec(cpu, &in) != 0) {
+        if (cpu->fault &&
+            wemu_cpu_deliver_exception(cpu, (unsigned)cpu->fault) == 0) return 1;
+        return -1;
+    }
     return 1;
 }
 
 int64_t wemu_cpu_run(WemuCpu *cpu, uint64_t max_insns) {
     int64_t n = 0;
-    while ((uint64_t)n < max_insns && !cpu->halted && !cpu->fault) {
+    /* Don't pre-gate on cpu->fault: a host-raised fault must reach step()
+     * so it can be delivered to a registered handler.  With no handler
+     * step() returns -1 and the loop breaks — the old stopping behaviour. */
+    while ((uint64_t)n < max_insns && !cpu->halted) {
         if (wemu_cpu_step(cpu) < 0) break;
         n++;
     }

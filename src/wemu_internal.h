@@ -24,6 +24,13 @@ struct WemuCpu {
     uint64_t ram_size;
     int halted;
     int fault;               /* x86 exception vector, 0 = none */
+    uint64_t fault_error;    /* error code accompanying a pending fault */
+    /* exception delivery (wemu_exception.c owns these): a minimal IDT of
+     * vector -> guest handler RIP, plus metadata of the last delivery. */
+    struct { uint64_t rip; uint8_t present; } idt[256];
+    unsigned exc_vector;     /* last delivered vector (0 = none yet) */
+    uint64_t exc_error;      /* last delivered error code */
+    uint64_t exc_cr2;        /* CR2 captured at last #PF delivery */
     WemuSyscallFn sys_fn;
     void *sys_ud;
     /* optional observer modelling a competing hardware agent (LOCK atomics) */

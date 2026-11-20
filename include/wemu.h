@@ -111,6 +111,37 @@ typedef void (*WemuAtomicObserver)(WemuCpu *cpu, uint64_t va, int bytes,
                                   WemuAtomicPhase phase, void *ud);
 void wemu_cpu_set_atomic_observer(WemuCpu *cpu, WemuAtomicObserver fn, void *ud);
 
+/* ---- Guest exception delivery (minimal IDT) --------------------------
+ * Before this, a fault (wemu_cpu_fault) only stopped the run loop: WEMU
+ * latched the vector but never DELIVERED it to the guest.  A guest IDT now
+ * maps vector -> registered guest handler RIP.  On a fault,
+ * wemu_cpu_deliver_exception pushes a real x86-64 interrupt frame on the
+ * guest stack and transfers RIP to that handler (fault cleared so the run
+ * resumes there).  Vectors with no registered handler keep the legacy
+ * behaviour: the fault stays latched and wemu_cpu_step returns -1.
+ * Decoder (fault origin), executor and memory (frame push) stay separate
+ * owners; wemu_exception.c owns delivery. */
+#define WEMU_HAS_EXCEPTION_DELIVERY 1
+
+/* Install a guest handler RIP for a vector (0..255). 0 = ok, -1 = bad vector. */
+int  wemu_cpu_register_exception_handler(WemuCpu *cpu, unsigned vector,
+                                         uint64_t guest_rip);
+/* Query a registration: 0 = present (writes *out_rip), -1 = none/bad vector. */
+int  wemu_cpu_exception_handler(const WemuCpu *cpu, unsigned vector,
+                                uint64_t *out_rip);
+/* Deliver a vector now: push error frame + transfer to handler.
+ * Returns 0 when delivered, -1 when no handler is registered (the fault
+ * remains latched — the pre-change semantics). */
+int  wemu_cpu_deliver_exception(WemuCpu *cpu, unsigned vector);
+/* Host-side raise, e.g. the VSL mprotect write hook: latch vector, error
+ * code and CR2; delivered at the next step boundary. cr2=0 leaves CR2 as-is. */
+void wemu_cpu_raise_exception(WemuCpu *cpu, unsigned vector,
+                              uint64_t error, uint64_t cr2);
+/* Metadata of the last DELIVERED exception (0/0/0 before any delivery). */
+unsigned wemu_cpu_exception_vector(const WemuCpu *cpu);
+uint64_t wemu_cpu_exception_error(const WemuCpu *cpu);
+uint64_t wemu_cpu_exception_cr2(const WemuCpu *cpu);
+
 /* Machine: CPU + COM1 serial. Output bytes go to the callback. */
 typedef void (*WemuSerialFn)(uint8_t byte, void *ud);
 WemuMachine *wemu_machine_create(uint64_t ram_size, WemuSerialFn out, void *ud);
