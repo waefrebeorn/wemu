@@ -99,6 +99,10 @@ uint64_t wemu_cpu_gs_base(const WemuCpu *cpu) { return cpu->gs_base; }
 void wemu_cpu_set_syscall_hook(WemuCpu *cpu, WemuSyscallFn fn, void *ud) {
     cpu->sys_fn = fn; cpu->sys_ud = ud;
 }
+void wemu_cpu_set_atomic_observer(WemuCpu *cpu, WemuAtomicObserver fn,
+                                  void *ud) {
+    cpu->atomic_observer = fn; cpu->atomic_observer_ud = ud;
+}
 int wemu_cpu_halted(const WemuCpu *cpu) { return cpu->halted; }
 void wemu_cpu_halt(WemuCpu *cpu) { cpu->halted = 1; }
 int wemu_cpu_fault(const WemuCpu *cpu) { return cpu->fault; }

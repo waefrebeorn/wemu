@@ -75,6 +75,61 @@ static void write_regop(WemuCpu *c, const WemuInsn *in, int bytes, uint64_t v) {
     else write_reg(c, r, bytes, v);
 }
 
+/* ---- LOCK-prefix atomic RMW support --------------------------------
+ * Intel SDM: LOCK is legal ONLY on the listed read-modify-write forms
+ * with a MEMORY destination; every other use is #UD.  The same predicate
+ * tells us which instructions are interruptible RMWs in our step model. */
+static int rmw_classify(const WemuInsn *in, int *implicit_lock) {
+    *implicit_lock = 0;
+    if ((in->modrm >> 6) == 3) return 0;      /* register destination */
+    uint32_t full = in->op | ((uint32_t)(in->vex[0] >> 4) << 8);
+    int reg = REG(in);
+    if (full < 0x100) {
+        uint8_t o = in->op;
+        if (o <= 0x3D && (o & 7) <= 5 && (o & 0xC0) == 0) {
+            int form = o & 7, grp = (o >> 3) & 7;
+            if ((form == 0 || form == 1) && grp != 7) return 1; /* not CMP */
+        }
+        if (o >= 0x80 && o <= 0x83) return reg != 7;  /* grp1, not CMP */
+        if (o == 0x86 || o == 0x87) {                 /* XCHG: implicit lock */
+            *implicit_lock = 1; return 1;
+        }
+        if ((o == 0xF6 || o == 0xF7) && (reg == 2 || reg == 3)) return 1;
+        if (o == 0xFE && (reg == 0 || reg == 1)) return 1; /* inc/dec */
+        if (o == 0xFF && (reg == 0 || reg == 1)) return 1; /* inc/dec */
+        return 0;
+    }
+    if (full == 0x1B0 || full == 0x1B1) return 1;     /* cmpxchg */
+    if (full == 0x1C0 || full == 0x1C1) return 1;     /* xadd */
+    if (full == 0x1BA) return reg == 5 || reg == 6 || reg == 7; /* bts/btr/btc */
+    if (full == 0x1AB || full == 0x1B3 || full == 0x1BB) return 1;
+    return 0;
+}
+
+/* Interleaving point for a tracked memory RMW.  A competing hardware
+ * agent (the observer hook) may interleave between our read and write
+ * ONLY when the RMW is not bus-locked: its write is then clobbered by our
+ * stale writeback = lost update.  Under LOCK the agent is serialized
+ * after our indivisible writeback = both updates survive. */
+static void rmw_interleave(WemuCpu *c, const WemuInsn *in, int locked,
+                           int bytes, int after_write) {
+    if (!c->atomic_observer || (in->modrm >> 6) == 3) return;
+    if (locked != after_write) return;
+    c->atomic_observer(c, eff_addr(c, in), bytes,
+                       locked ? WEMU_ATOMIC_POST_WRITE : WEMU_ATOMIC_PRE_WRITE,
+                       c->atomic_observer_ud);
+}
+static uint64_t rmw_read(WemuCpu *c, const WemuInsn *in, int bytes, int locked) {
+    uint64_t v = read_rm(c, in, bytes);
+    rmw_interleave(c, in, locked, bytes, 0);
+    return v;
+}
+static void rmw_write(WemuCpu *c, const WemuInsn *in, int bytes, int locked,
+                      uint64_t v) {
+    write_rm(c, in, bytes, v);
+    rmw_interleave(c, in, locked, bytes, 1);
+}
+
 static int cc_true(WemuCpu *c, int cc) {
     uint64_t f = c->rflags;
     switch (cc >> 1) {
@@ -194,6 +249,14 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
     uint64_t r = 0, a, b;
     int wb;
 
+    /* LOCK prefix validation: legal only on a tracked memory RMW.
+     * LOCK on a register destination, on CMP, on a non-RMW opcode, or
+     * on a VEX instruction (rejected in decode) is #UD. */
+    int implicit_lk = 0;
+    int is_rmw = rmw_classify(in, &implicit_lk);
+    int eff_locked = implicit_lk || in->lock;
+    if (in->lock && !is_rmw) { c->fault = 6; return -1; }
+
     /* SSE/AVX maps and legacy SSE opcodes go to the vector leaf;
      * unhandled two-byte ops fall through to the integer switch below
      * (cmovcc/setcc/movzx/imul/bswap live there). VEX must be handled. */
@@ -231,9 +294,12 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
             grp1(c, op, a, b, os, &r, &wb);
             if (wb) write_reg(c, 0, os, r);
         } else if (form <= 1) { int bytes = form == 0 ? 1 : os;
-            a = read_rm(c, in, bytes); b = read_regop(c, in, bytes);
+            a = is_rmw ? rmw_read(c, in, bytes, eff_locked)
+                       : read_rm(c, in, bytes);
+            b = read_regop(c, in, bytes);
             grp1(c, op, a, b, bytes, &r, &wb);
-            if (wb) write_rm(c, in, bytes, r);
+            if (wb) { if (is_rmw) rmw_write(c, in, bytes, eff_locked, r);
+                      else write_rm(c, in, bytes, r); }
         } else { int bytes = form == 2 ? 1 : os;
             a = read_regop(c, in, bytes); b = read_rm(c, in, bytes);
             grp1(c, op, a, b, bytes, &r, &wb);
@@ -274,12 +340,13 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
     }
     case 0x80: case 0x81: case 0x83: {
         int bytes = full == 0x80 ? 1 : os;
-        a = read_rm(c, in, bytes);
+        a = is_rmw ? rmw_read(c, in, bytes, eff_locked) : read_rm(c, in, bytes);
         b = full == 0x83 ? (uint64_t)(int64_t)(int8_t)in->imm
             : bytes == 2 ? (uint64_t)(uint16_t)in->imm
             : bytes == 1 ? in->imm & 0xff : (uint64_t)(int64_t)(int32_t)in->imm;
         grp1(c, REG(in), a, b, bytes, &r, &wb);
-        if (wb) write_rm(c, in, bytes, r);
+        if (wb) { if (is_rmw) rmw_write(c, in, bytes, eff_locked, r);
+                  else write_rm(c, in, bytes, r); }
         break;
     }
     case 0x84: case 0x85: {
@@ -290,8 +357,12 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
     }
     case 0x86: case 0x87: {
         int bytes = full == 0x86 ? 1 : os;
-        a = read_rm(c, in, bytes); b = read_regop(c, in, bytes);
-        write_rm(c, in, bytes, b); write_regop(c, in, bytes, a);
+        /* memory XCHG is implicitly atomic even without the LOCK prefix */
+        a = is_rmw ? rmw_read(c, in, bytes, eff_locked) : read_rm(c, in, bytes);
+        b = read_regop(c, in, bytes);
+        if (is_rmw) rmw_write(c, in, bytes, eff_locked, b);
+        else write_rm(c, in, bytes, b);
+        write_regop(c, in, bytes, a);
         break;
     }
     case 0x88: write_rm(c, in, 1, read_regop(c, in, 1)); break;
@@ -386,7 +457,7 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
     case 0xF6: case 0xF7: {
         int bytes = full == 0xF6 ? 1 : os;
         int op = REG(in);
-        a = read_rm(c, in, bytes);
+        a = is_rmw ? rmw_read(c, in, bytes, eff_locked) : read_rm(c, in, bytes);
         if (op <= 1) { /* test */
             b = bytes == 1 ? in->imm & 0xff
                 : bytes == 2 ? (uint64_t)(uint16_t)in->imm
@@ -394,11 +465,14 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
             r = wemu_mask(a & b, bytes);
             wemu_set_logic_flags(c, r, bytes);
         } else if (op == 2) { /* not */
-            write_rm(c, in, bytes, wemu_mask(~a, bytes));
+            uint64_t v = wemu_mask(~a, bytes);
+            if (is_rmw) rmw_write(c, in, bytes, eff_locked, v);
+            else write_rm(c, in, bytes, v);
         } else if (op == 3) { /* neg */
             r = wemu_mask(0 - a, bytes);
             wemu_set_add_flags(c, 0, a, r, bytes, 0, 1);
-            write_rm(c, in, bytes, r);
+            if (is_rmw) rmw_write(c, in, bytes, eff_locked, r);
+            else write_rm(c, in, bytes, r);
         } else if (op == 4) { /* mul */
             uint64_t hi, lo;
             if (bytes == 8) {
@@ -470,23 +544,25 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
         break;
     }
     case 0xFE: {
-        a = read_rm(c, in, 1);
+        a = is_rmw ? rmw_read(c, in, 1, eff_locked) : read_rm(c, in, 1);
         r = wemu_mask(a + (REG(in) == 0 ? 1 : -1), 1);
         uint64_t cf = c->rflags & WF_CF;
         wemu_set_add_flags(c, a, 1, r, 1, 0, REG(in) != 0);
         c->rflags = (c->rflags & ~WF_CF) | cf;
-        write_rm(c, in, 1, r);
+        if (is_rmw) rmw_write(c, in, 1, eff_locked, r);
+        else write_rm(c, in, 1, r);
         break;
     }
     case 0xFF: {
         int op = REG(in);
         if (op == 0 || op == 1) { /* inc/dec rm */
-            a = read_rm(c, in, os);
+            a = is_rmw ? rmw_read(c, in, os, eff_locked) : read_rm(c, in, os);
             r = wemu_mask(a + (op == 0 ? 1 : -1), os);
             uint64_t cf = c->rflags & WF_CF;
             wemu_set_add_flags(c, a, 1, r, os, 0, op != 0);
             c->rflags = (c->rflags & ~WF_CF) | cf;
-            write_rm(c, in, os, r);
+            if (is_rmw) rmw_write(c, in, os, eff_locked, r);
+            else write_rm(c, in, os, r);
         } else if (op == 2) { /* call rm */
             a = read_rm(c, in, 8);
             push64(c, c->rip + in->len);
@@ -624,48 +700,51 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
                 }
             }
         } else if (full == 0x1C0 || full == 0x1C1) { /* xadd r/m, r */
-            /* LOCK consumed by decoder; single-threaded interpreter
-             * guest: the RMW is atomic by construction. */
+            /* xadd is an atomic RMW: r/m <- r/m + r; r <- old r/m */
             int bytes = full == 0x1C0 ? 1 : os;
-            a = read_rm(c, in, bytes);
+            a = rmw_read(c, in, bytes, eff_locked);
             b = read_regop(c, in, bytes);
             do_add(c, a, b, bytes, 0, &r);
-            write_rm(c, in, bytes, r);
+            rmw_write(c, in, bytes, eff_locked, r);
             write_regop(c, in, bytes, a);
         } else if (full == 0x1B0 || full == 0x1B1) { /* cmpxchg r/m, r */
-            /* LOCK prefix is consumed by the decoder; the interpreter
-             * guest is single-threaded, so the RMW is atomic by
-             * construction. Compare accumulator with r/m: equal ->
+            /* compare accumulator (AL/EAX/RAX) with r/m.  Equal:
              * ZF=1, r/m <- reg; else ZF=0, accumulator <- r/m. */
             int bytes = full == 0x1B0 ? 1 : os;
             a = bytes == 1 ? read_reg(c, 0, 1) : read_reg(c, 0, bytes);
-            b = read_rm(c, in, bytes);
+            b = rmw_read(c, in, bytes, eff_locked);
             do_sub(c, a, b, bytes, 0, &r);
             if (a == b) {
-                write_rm(c, in, bytes, read_regop(c, in, bytes));
+                rmw_write(c, in, bytes, eff_locked, read_regop(c, in, bytes));
             } else {
                 if (bytes == 1) write_reg(c, 0, 1, b);
                 else write_reg(c, 0, bytes, b);
             }
         } else if (full == 0x1BA) { /* bt/bts/btr/btc imm8 */
             int op = REG(in);
-            a = read_rm(c, in, os);
+            a = is_rmw ? rmw_read(c, in, os, eff_locked) : read_rm(c, in, os);
             uint64_t bit = in->imm & (os * 8 - 1);
             uint64_t f = c->rflags & ~WF_CF;
             if ((a >> bit) & 1) f |= WF_CF;
             c->rflags = f;
-            if (op == 5) write_rm(c, in, os, a | (1ull << bit));
-            else if (op == 6) write_rm(c, in, os, a & ~(1ull << bit));
-            else if (op == 7) write_rm(c, in, os, a ^ (1ull << bit));
+            if (op == 5) { if (is_rmw) rmw_write(c, in, os, eff_locked, a | (1ull << bit));
+                           else write_rm(c, in, os, a | (1ull << bit)); }
+            else if (op == 6) { if (is_rmw) rmw_write(c, in, os, eff_locked, a & ~(1ull << bit));
+                                else write_rm(c, in, os, a & ~(1ull << bit)); }
+            else if (op == 7) { if (is_rmw) rmw_write(c, in, os, eff_locked, a ^ (1ull << bit));
+                                else write_rm(c, in, os, a ^ (1ull << bit)); }
         } else if (full == 0x1A3 || full == 0x1AB || full == 0x1B3 || full == 0x1BB) {
-            a = read_rm(c, in, os);
+            a = is_rmw ? rmw_read(c, in, os, eff_locked) : read_rm(c, in, os);
             uint64_t bit = read_regop(c, in, os) & (os * 8 - 1);
             uint64_t f = c->rflags & ~WF_CF;
             if ((a >> bit) & 1) f |= WF_CF;
             c->rflags = f;
-            if (full == 0x1AB) write_rm(c, in, os, a | (1ull << bit));
-            else if (full == 0x1B3) write_rm(c, in, os, a & ~(1ull << bit));
-            else if (full == 0x1BB) write_rm(c, in, os, a ^ (1ull << bit));
+            if (full == 0x1AB) { if (is_rmw) rmw_write(c, in, os, eff_locked, a | (1ull << bit));
+                                 else write_rm(c, in, os, a | (1ull << bit)); }
+            else if (full == 0x1B3) { if (is_rmw) rmw_write(c, in, os, eff_locked, a & ~(1ull << bit));
+                                      else write_rm(c, in, os, a & ~(1ull << bit)); }
+            else if (full == 0x1BB) { if (is_rmw) rmw_write(c, in, os, eff_locked, a ^ (1ull << bit));
+                                      else write_rm(c, in, os, a ^ (1ull << bit)); }
         } else if (full == 0x1A2) { /* cpuid: claim ONLY what we execute.
             * CPUID outputs: EAX->r0 EBX->r3 ECX->r1 EDX->r2 */
             uint64_t leaf = c->r[0];

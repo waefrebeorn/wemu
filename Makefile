@@ -7,7 +7,7 @@ AR      ?= ar
 SRC = src/wemu_cpu.c src/wemu_mem.c src/wemu_decode.c src/wemu_exec.c \
       src/wemu_sse.c src/wemu_string.c src/wemu_machine.c src/wemu_elf.c src/wemu_x87.c
 OBJ = $(SRC:.c=.o)
-TESTS = test_isa test_avx test_paging test_machine test_string test_cpuid test_sse2 test_usermode test_shld test_x87
+TESTS = test_isa test_avx test_paging test_machine test_string test_cpuid test_sse2 test_usermode test_shld test_x87 test_lock_atomics
 
 all: libwemu.a
 

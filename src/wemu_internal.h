@@ -26,6 +26,9 @@ struct WemuCpu {
     int fault;               /* x86 exception vector, 0 = none */
     WemuSyscallFn sys_fn;
     void *sys_ud;
+    /* optional observer modelling a competing hardware agent (LOCK atomics) */
+    WemuAtomicObserver atomic_observer;
+    void *atomic_observer_ud;
     /* serial (machine layer installs these) */
     WemuSerialFn serial_out;
     void *serial_ud;
@@ -52,6 +55,7 @@ typedef struct {
     uint8_t vex_len;         /* 0 = legacy, 2/3 = VEX prefix bytes */
     uint8_t vex[3];
     uint8_t rep;             /* 0, 0xF2, 0xF3 */
+    uint8_t lock;            /* 0xF0 LOCK prefix present */
     uint8_t seg;             /* segment override: 0 none, 0x64 FS, 0x65 GS */
     int64_t disp;
     uint64_t imm;

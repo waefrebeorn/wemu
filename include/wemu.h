@@ -88,6 +88,29 @@ void wemu_cpu_set_gs_base(WemuCpu *cpu, uint64_t base);
 uint64_t wemu_cpu_fs_base(const WemuCpu *cpu);
 uint64_t wemu_cpu_gs_base(const WemuCpu *cpu);
 
+/* ---- LOCK-prefix atomics -------------------------------------------
+ * WEMU executes one instruction at a time, so a plain read-modify-write
+ * (RMW) never interleaves with another guest agent in the step model.
+ * Real x86 LOCK makes an RMW one indivisible bus transaction; without
+ * LOCK the read and the write are separate bus cycles and a competing
+ * agent can land between them (the classic lost update).  To make that
+ * distinction observable and testable, an optional observer hook models
+ * a second hardware agent competing for the same address.  The emulator
+ * calls it at the read->write boundary of a NON-LOCK memory RMW (PRE:
+ * its write is clobbered by our stale writeback), and only AFTER a LOCK
+ * RMW completes (POST: serialized after the indivisible RMW, so both
+ * updates survive).  With no hook installed execution is unchanged. */
+#define WEMU_HAS_LOCK_ATOMICS 1
+
+typedef enum {
+    WEMU_ATOMIC_PRE_WRITE = 0,  /* non-LOCK RMW: between its read and write */
+    WEMU_ATOMIC_POST_WRITE = 1  /* LOCK RMW: after its indivisible writeback */
+} WemuAtomicPhase;
+
+typedef void (*WemuAtomicObserver)(WemuCpu *cpu, uint64_t va, int bytes,
+                                  WemuAtomicPhase phase, void *ud);
+void wemu_cpu_set_atomic_observer(WemuCpu *cpu, WemuAtomicObserver fn, void *ud);
+
 /* Machine: CPU + COM1 serial. Output bytes go to the callback. */
 typedef void (*WemuSerialFn)(uint8_t byte, void *ud);
 WemuMachine *wemu_machine_create(uint64_t ram_size, WemuSerialFn out, void *ud);

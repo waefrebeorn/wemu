@@ -94,7 +94,8 @@ int wemu_decode(WemuCpu *cpu, WemuInsn *in) {
         else if (b == 0x67) { in->addrsize = 4; take(&f); }
         else if (b == 0xF2 || b == 0xF3) { in->rep = b; take(&f); }
         else if (b == 0x64 || b == 0x65) { in->seg = b; take(&f); }
-        else if (b == 0xF0 || b == 0x2E || b == 0x36 || b == 0x3E ||
+        else if (b == 0xF0) { in->lock = 1; take(&f); }
+        else if (b == 0x2E || b == 0x36 || b == 0x3E ||
                  b == 0x26 || b == 0x9B) { take(&f); } /* 9B = fwait: x87
                  sync prefix, no-op for the interpreter (no async FP) */
         else break;
@@ -107,6 +108,7 @@ int wemu_decode(WemuCpu *cpu, WemuInsn *in) {
 
     /* VEX prefixes */
     if (b == 0xC4 || b == 0xC5) {
+        if (in->lock) { in->fault = 6; return -1; } /* LOCK + VEX: #UD */
         uint8_t p0 = take(&f);
         uint8_t p1 = take(&f);
         if (p0 == 0xC4) {
