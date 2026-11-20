@@ -56,10 +56,21 @@ static int exc_idt_gate_read(const WemuCpu *cpu, unsigned vector,
     return 0;
 }
 
+/* Delivery target parsed from a gate (or synthesized for the legacy path).
+ * Kept small so the legacy registered-RIP path need not fake a descriptor. */
+typedef struct {
+    uint64_t rip;             /* handler offset */
+    uint8_t  ist;             /* IST index from gate byte 4 (0 = none) */
+    uint8_t  type;            /* 0xE interrupt (clears IF), 0xF trap */
+} ExcTarget;
+
 /* SDM interrupt-delivery checks, in pseudocode order.  On rejection the
  * original vector is REPLACED by #GP/#NP with the IDT error code latched.
- * 'software' gates the CPL<=DPL rule: exceptions ignore gate DPL. */
-static int exc_idt_check(WemuCpu *cpu, unsigned vector, uint64_t *rip,
+ * 'software' gates the CPL/RPL/DPL rule: exceptions ignore gate DPL.
+ * For a software INT the gate is accessible only when the requesting
+ * privilege max(CPL, CS.RPL) does not exceed the gate DPL -- the canonical
+ * x86 protection rule.  RPL is modelled on the current CS selector. */
+static int exc_idt_check(WemuCpu *cpu, unsigned vector, ExcTarget *t,
                          int software) {
     WemuIdtGate g;
     if (exc_idt_gate_read(cpu, vector, &g) != 0) {
@@ -72,17 +83,22 @@ static int exc_idt_check(WemuCpu *cpu, unsigned vector, uint64_t *rip,
         cpu->fault_error = exc_idt_code(vector);
         return -1;
     }
-    if (software && (int)g.dpl < cpu->cpl) {
-        cpu->fault = 13; /* software INT through a more-privileged gate */
-        cpu->fault_error = exc_idt_code(vector);
-        return -1;
+    if (software) {
+        int req = cpu->cpl > cpu->cs_rpl ? cpu->cpl : cpu->cs_rpl;
+        if ((int)g.dpl < req) {
+            cpu->fault = 13; /* max(CPL,RPL) > DPL: software INT rejected */
+            cpu->fault_error = exc_idt_code(vector);
+            return -1;
+        }
     }
     if (!g.present) {
         cpu->fault = 11; /* #NP, not #GP: SDM "gate not present" */
         cpu->fault_error = exc_idt_code(vector);
         return -1;
     }
-    *rip = g.offset;
+    t->rip  = g.offset;
+    t->ist  = g.ist;
+    t->type = g.type;
     return 0;
 }
 
@@ -133,38 +149,45 @@ int wemu_cpu_exception_handler(const WemuCpu *cpu, unsigned vector,
  * (in which case #GP/#NP is latched for the caller). */
 static int exc_deliver(WemuCpu *cpu, unsigned vector, int software) {
     if (!cpu || vector == 0 || vector >= 256) return -1;
-    uint64_t handler;
+    ExcTarget t;
     if (cpu->idtr.configured) {
         /* Architectural path: parse and validate the gate from guest RAM. */
-        if (exc_idt_check(cpu, vector, &handler, software) != 0) return -1;
+        if (exc_idt_check(cpu, vector, &t, software) != 0) return -1;
     } else {
-        /* Legacy registered-RIP path (WEMU_HAS_EXCEPTION_DELIVERY). */
+        /* Legacy registered-RIP path (WEMU_HAS_EXCEPTION_DELIVERY).
+         * No descriptor: no IST, trap-gate semantics (IF preserved). */
         if (!cpu->idt[vector].present) return -1;
-        handler = cpu->idt[vector].rip;
+        t.rip  = cpu->idt[vector].rip;
+        t.ist  = 0;
+        t.type = 0xF;
     }
 
     uint64_t fault_rip = cpu->rip;      /* saved RIP = faulting instruction */
     uint64_t old_rsp  = cpu->r[4];
-    uint64_t sp       = old_rsp;
+    /* IST switch: a nonzero gate IST index selects TSS.IST[n] as the new
+     * stack base.  WEMU models those bases directly (no TSS descriptor);
+     * index 0 means "use the current RSP". */
+    uint64_t sp = t.ist ? cpu->ist[t.ist & 7] : old_rsp;
     uint64_t error    = cpu->fault_error;
+    uint64_t saved_fl = cpu->rflags;    /* flags as seen before delivery */
 
-    /* Long-mode interrupt frame (ring0 -> ring0, no IST): SS, old RSP,
-     * RFLAGS, CS, RIP, then the error code last for vectors that push one
-     * (so RSP points at the error code on entry, per the SDM). */
-    exc_push(cpu, &sp, 0x00ull);          /* SS */
-    exc_push(cpu, &sp, old_rsp);          /* old RSP */
-    exc_push(cpu, &sp, cpu->rflags);      /* RFLAGS */
-    exc_push(cpu, &sp, 0x28ull);          /* CS: 64-bit code selector */
-    exc_push(cpu, &sp, fault_rip);        /* RIP */
+    /* Push the saved RFLAGS BEFORE clearing IF: an interrupt gate clears
+     * IF for the handler, but the flag saved on the stack retains it. */
+    exc_push(cpu, &sp, 0x00ull);        /* SS */
+    exc_push(cpu, &sp, old_rsp);        /* old RSP (pre-switch) */
+    exc_push(cpu, &sp, saved_fl);       /* RFLAGS */
+    exc_push(cpu, &sp, 0x28ull);        /* CS: 64-bit code selector */
+    exc_push(cpu, &sp, fault_rip);      /* RIP */
     if (exc_has_error_code(vector))
-        exc_push(cpu, &sp, error);        /* error code (#PF etc.) */
+        exc_push(cpu, &sp, error);      /* error code (#PF etc.) */
 
     cpu->r[4] = sp;
-    cpu->rip  = handler;
+    cpu->rip  = t.rip;
+    if (t.type == 0xE) cpu->rflags &= ~(uint64_t)WF_IF; /* interrupt gate */
     cpu->exc_vector = vector;
     cpu->exc_error  = error;
-    cpu->exc_cr2    = cpu->cr2;           /* CR2 is architecturally held */
-    cpu->fault      = 0;                  /* delivered: resume at handler */
+    cpu->exc_cr2    = cpu->cr2;         /* CR2 is architecturally held */
+    cpu->fault      = 0;                /* delivered: resume at handler */
     cpu->fault_error = 0;
     return 0;
 }

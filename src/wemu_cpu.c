@@ -118,6 +118,16 @@ void wemu_cpu_set_cpl(WemuCpu *cpu, int cpl) {
     if (cpu) cpu->cpl = cpl < 0 ? 0 : (cpl > 3 ? 3 : cpl);
 }
 int wemu_cpu_cpl(const WemuCpu *cpu) { return cpu ? cpu->cpl : 0; }
+void wemu_cpu_set_cs_rpl(WemuCpu *cpu, int rpl) {
+    if (cpu) cpu->cs_rpl = rpl < 0 ? 0 : (rpl > 3 ? 3 : rpl);
+}
+int wemu_cpu_cs_rpl(const WemuCpu *cpu) { return cpu ? cpu->cs_rpl : 0; }
+void wemu_cpu_set_ist(WemuCpu *cpu, unsigned index, uint64_t base) {
+    if (cpu && index < 8) cpu->ist[index] = base;
+}
+uint64_t wemu_cpu_ist(const WemuCpu *cpu, unsigned index) {
+    return (cpu && index < 8) ? cpu->ist[index] : 0;
+}
 void wemu_cpu_xmm(const WemuCpu *cpu, int idx, uint8_t out[16]) {
     if (idx >= 0 && idx < 16) memcpy(out, cpu->xmm[idx], 16);
     else memset(out, 0, 16);

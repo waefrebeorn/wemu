@@ -21,11 +21,26 @@ int wemu_gpa_write(WemuCpu *cpu, uint64_t gpa, const void *src, size_t len) {
     return 0;
 }
 
-/* x86 #PF error code: P (0/1), W/R (1/2), U/S (2/4).  RSVD (3), I/D (4)
- * and PK (5) are not modelled and stay clear. */
-static uint64_t pf_code(int present, int write, int user) {
-    return (uint64_t)(present ? 1 : 0) | (uint64_t)(write ? 2 : 0) |
-           (uint64_t)(user ? 4 : 0);
+/* x86 #PF error code bits (SDM 4.7): P(0), W/R(1), U/S(2), RSVD(3),
+ * I/D(4), PK(5).  WEMU models P, W/R, U/S, RSVD and I/D.  PK (protection
+ * key) and SGX (bit 6) stay clear: CR4.PKE / ENCLS are not implemented, so
+ * there is no protection-key or enclave access to attribute a fault to. */
+#define PF_P     0x01ull
+#define PF_WR    0x02ull
+#define PF_US    0x04ull
+#define PF_RSVD  0x08ull
+#define PF_ID    0x10ull
+
+/* 4-level paging, MAXPHYADDR=52, CR4.PKE=0 (WEMU does not implement PKE):
+ * bits 62:52 of a paging-structure entry are reserved; bit 63 is NX and is
+ * allowed (EFER.NXE=1).  A set reserved bit faults with P=1 (the entry is
+ * present) and the RSVD error bit set. */
+#define PT_RESERVED_MASK 0x7FF0000000000000ull
+
+static uint64_t pf_code(int present, int write, int user, int fetch,
+                        int reserved) {
+    return (present ? PF_P : 0) | (write ? PF_WR : 0) | (user ? PF_US : 0) |
+           (fetch ? PF_ID : 0) | (reserved ? PF_RSVD : 0);
 }
 
 /* Leaf permission check.  U/S: a user access needs U=1 on the leaf.
@@ -40,10 +55,11 @@ static int leaf_prot_fault(const WemuCpu *cpu, uint64_t ent,
 }
 
 /* 4-level walk (4KiB pages; 2MiB/1GiB leaves honored via PS bit).
- * Returns translated GPA, sets *fault (#PF=14, #GP=13) and the architectural
- * error code in cpu->fault_error on failure. */
-uint64_t wemu_translate(WemuCpu *cpu, uint64_t va, int is_write, int is_user,
-                        int *fault) {
+ * is_fetch marks instruction fetches for the #PF I/D bit.  Sets *fault
+ * (#PF=14, #GP=13) and the architectural error code in cpu->fault_error
+ * on failure. */
+uint64_t wemu_translate_ex(WemuCpu *cpu, uint64_t va, int is_write,
+                           int is_user, int is_fetch, int *fault) {
     *fault = 0;
     if (!(cpu->cr0 & 0x80000000ull)) /* PG clear: identity */
         return va;
@@ -60,20 +76,26 @@ uint64_t wemu_translate(WemuCpu *cpu, uint64_t va, int is_write, int is_user,
         if (wemu_gpa_read(cpu, table + idx * 8, &ent, 8) != 0) {
             *fault = 14;
             cpu->cr2 = va;
-            cpu->fault_error = pf_code(0, is_write, is_user);
+            cpu->fault_error = pf_code(0, is_write, is_user, is_fetch, 0);
             return 0;
         }
         if (!(ent & 1)) { /* not present */
             *fault = 14;
             cpu->cr2 = va;
-            cpu->fault_error = pf_code(0, is_write, is_user);
+            cpu->fault_error = pf_code(0, is_write, is_user, is_fetch, 0);
+            return 0;
+        }
+        if (ent & PT_RESERVED_MASK) { /* reserved bit set in a present entry */
+            *fault = 14;
+            cpu->cr2 = va;
+            cpu->fault_error = pf_code(1, is_write, is_user, is_fetch, 1);
             return 0;
         }
         if ((ent & 0x80) && level < 3) { /* large page (2MiB/1GiB) */
             if (leaf_prot_fault(cpu, ent, is_write, is_user)) {
                 *fault = 14;
                 cpu->cr2 = va;
-                cpu->fault_error = pf_code(1, is_write, is_user);
+                cpu->fault_error = pf_code(1, is_write, is_user, is_fetch, 0);
                 return 0;
             }
             uint64_t mask = (1ull << shift) - 1;
@@ -83,7 +105,7 @@ uint64_t wemu_translate(WemuCpu *cpu, uint64_t va, int is_write, int is_user,
             if (leaf_prot_fault(cpu, ent, is_write, is_user)) {
                 *fault = 14;
                 cpu->cr2 = va;
-                cpu->fault_error = pf_code(1, is_write, is_user);
+                cpu->fault_error = pf_code(1, is_write, is_user, is_fetch, 0);
                 return 0;
             }
             return (ent & 0x000ffffffffff000ull) | (va & 0xfff);
@@ -93,8 +115,14 @@ uint64_t wemu_translate(WemuCpu *cpu, uint64_t va, int is_write, int is_user,
     }
     *fault = 14;
     cpu->cr2 = va;
-    cpu->fault_error = pf_code(0, is_write, is_user);
+    cpu->fault_error = pf_code(0, is_write, is_user, is_fetch, 0);
     return 0;
+}
+
+/* Data access: I/D clear. */
+uint64_t wemu_translate(WemuCpu *cpu, uint64_t va, int is_write, int is_user,
+                        int *fault) {
+    return wemu_translate_ex(cpu, va, is_write, is_user, 0, fault);
 }
 
 int wemu_mem_read(WemuCpu *cpu, uint64_t va, void *dst, size_t len) {
@@ -102,6 +130,21 @@ int wemu_mem_read(WemuCpu *cpu, uint64_t va, void *dst, size_t len) {
     while (len) {
         int f;
         uint64_t gpa = wemu_translate(cpu, va, 0, cpu->cpl == 3, &f);
+        if (f) { cpu->fault = f; return -1; }
+        uint64_t chunk = 0x1000 - (va & 0xfff);
+        if (chunk > len) chunk = len;
+        if (wemu_gpa_read(cpu, gpa, d, (size_t)chunk) != 0) return -1;
+        va += chunk; d += chunk; len -= (size_t)chunk;
+    }
+    return 0;
+}
+
+/* Instruction fetch: the only reader that sets the #PF I/D error bit. */
+int wemu_mem_fetch(WemuCpu *cpu, uint64_t va, void *dst, size_t len) {
+    uint8_t *d = dst;
+    while (len) {
+        int f;
+        uint64_t gpa = wemu_translate_ex(cpu, va, 0, cpu->cpl == 3, 1, &f);
         if (f) { cpu->fault = f; return -1; }
         uint64_t chunk = 0x1000 - (va & 0xfff);
         if (chunk > len) chunk = len;

@@ -10,7 +10,7 @@ SRC = src/wemu_cpu.c src/wemu_mem.c src/wemu_decode.c src/wemu_exec.c \
 OBJ = $(SRC:.c=.o)
 TESTS = test_isa test_avx test_paging test_machine test_string test_cpuid \
         test_sse2 test_usermode test_shld test_x87 test_lock_atomics \
-        test_exceptions test_isa_atomic_fence test_idt
+        test_exceptions test_isa_atomic_fence test_idt test_priv
 
 all: libwemu.a
 

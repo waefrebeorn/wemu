@@ -9,14 +9,22 @@ typedef struct {
     uint8_t buf[16];
     int n;                   /* bytes fetched */
     int pos;
+    int faulted;             /* first fetch fault: stop further translation */
 } Fetch;
 
 static int fetch(Fetch *f, int need) {
+    if (f->faulted) return -1;
     if (f->n - f->pos >= need) return 0;
     int have = f->n - f->pos;
-    if (wemu_mem_read(f->cpu, f->va + f->pos, f->buf + f->pos,
-                      (size_t)(need - have)) != 0)
+    /* Instruction fetch owns the #PF I/D bit: route through the fetch
+     * reader (is_fetch=1), not the generic data reader.  Once a fetch
+     * faults, keep CR2 at the FIRST faulting address (the SDM reports the
+     * faulting instruction, not a later speculative decode byte). */
+    if (wemu_mem_fetch(f->cpu, f->va + f->pos, f->buf + f->pos,
+                       (size_t)(need - have)) != 0) {
+        f->faulted = 1;
         return -1;
+    }
     f->n = f->pos + need;
     return 0;
 }
@@ -83,7 +91,7 @@ static int imm_len_for(uint32_t op, int opsize, uint8_t modrm_reg,
 }
 
 int wemu_decode(WemuCpu *cpu, WemuInsn *in) {
-    Fetch f = { cpu, cpu->rip, {0}, 0, 0 };
+    Fetch f = { cpu, cpu->rip, {0}, 0, 0, 0 };
     in->opsize = 4;
     in->addrsize = 8;
     uint8_t rex = 0;
@@ -201,5 +209,8 @@ modrm:;
     if (in->imm_len) in->imm = take_imm(&f, in->imm_len);
     in->len = (uint8_t)f.pos;
     if (f.pos > 15) { in->fault = 6; return -1; } /* x86 max insn length */
+    /* An instruction-fetch fault is a decode fault: report it to the step
+     * boundary instead of executing the zero-filled bytes peek returned. */
+    if (cpu->fault) { in->fault = (uint8_t)cpu->fault; return -1; }
     return 0;
 }

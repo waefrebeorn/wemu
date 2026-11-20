@@ -174,8 +174,9 @@ uint64_t wemu_cpu_exception_cr2(const WemuCpu *cpu);
  * the CPU at it with wemu_cpu_idt_load(base, limit).  When an IDTR is
  * loaded, exception delivery READS the 16-byte gate from guest physical
  * memory and validates it (limit, gate type, present, DPL) before using
- * its 64-bit offset as the handler RIP.  Frame pushing stays in the
- * exception owner; no CS/RPL/IST stack switch is performed.
+ * its 64-bit offset as the handler RIP. Frame pushing stays in the
+ * exception owner. See the privilege/IST section below for gate-privilege
+ * checks, IF clearing, IST stack selection and the extra #PF error bits.
  *
  * Gate validation follows the SDM interrupt-delivery pseudocode:
  *   index outside IDT limit, or not an interrupt/trap gate  -> #GP(code)
@@ -183,10 +184,10 @@ uint64_t wemu_cpu_exception_cr2(const WemuCpu *cpu);
  *   gate not present                                        -> #NP(code)
  * code = (vector << 3) | 2  (IDT bit set, EXT=0, TI=0).
  *
- * #PF error codes are now computed by the page-walk owner: bit0 P
- * (0=not-present, 1=protection), bit1 W/R, bit2 U/S.  RSVD, I/D and PK
- * remain 0 (those checks are not modelled).  U/S is driven by the
- * modelled CPL: a data access with CPL=3 is a user access. */
+ * #PF error codes: bit0 P (0=not-present, 1=protection), bit1 W/R, bit2
+ * U/S. I/D (bit4) and RSVD (bit3) are now modelled — see below. PK bit5
+ * and SGX bit6 stay 0 (PKE / enclaves not implemented). U/S is driven by
+ * the modelled CPL: a data access with CPL=3 is a user access. */
 #define WEMU_HAS_ARCH_IDT 1
 
 typedef struct {
@@ -215,6 +216,26 @@ uint64_t wemu_cpu_fault_error(const WemuCpu *cpu);
  * exception, plus the CPL<=DPL check. Returns 0 delivered, -1 rejected
  * (the resulting #GP/#NP is latched — see wemu_cpu_fault/_fault_error). */
 int  wemu_cpu_deliver_int(WemuCpu *cpu, unsigned vector);
+
+/* ---- Privilege checks, IF clearing, IST stacks, extra #PF bits --------
+ * Small architectural increments on top of the descriptor path above:
+ *  - software INT gate access requires max(CPL, CS.RPL) <= gate.DPL;
+ *    exceptions still ignore the gate privilege fields.
+ *  - an interrupt gate (type 0xE) clears EFLAGS.IF on delivery; a trap
+ *    gate (0xF) preserves it. The flag saved in the interrupt frame is the
+ *    pre-clear value, as on real hardware.
+ *  - a nonzero IST index in the gate selects a modelled TSS.IST[n] stack
+ *    base for the frame; index 0 keeps the current RSP.
+ *  - #PF error codes now include I/D (bit 4, set by instruction fetch) and
+ *    RSVD (bit 3, set when a paging entry has a reserved bit). PK (bit 5)
+ *    and SGX (bit 6) stay clear: CR4.PKE and enclave execution are not
+ *    implemented, so there is no protection key / enclave to attribute. */
+#define WEMU_HAS_PRIV_IST_PF 1
+
+void wemu_cpu_set_cs_rpl(WemuCpu *cpu, int rpl);
+int  wemu_cpu_cs_rpl(const WemuCpu *cpu);
+void wemu_cpu_set_ist(WemuCpu *cpu, unsigned index, uint64_t base);
+uint64_t wemu_cpu_ist(const WemuCpu *cpu, unsigned index);
 
 /* Machine: CPU + COM1 serial. Output bytes go to the callback. */
 typedef void (*WemuSerialFn)(uint8_t byte, void *ud);

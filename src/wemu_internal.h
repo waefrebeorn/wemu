@@ -32,6 +32,8 @@ struct WemuCpu {
      * delivery reads/validates the 16-byte gate from guest RAM. */
     struct { uint64_t base; uint16_t limit; uint8_t configured; } idtr;
     int cpl;                 /* modelled CPL 0..3 (reset 0) */
+    int cs_rpl;              /* RPL of the modelled current CS selector */
+    uint64_t ist[8];         /* IST stack bases (1..7; 0 reserved) */
     unsigned exc_vector;     /* last delivered vector (0 = none yet) */
     uint64_t exc_error;      /* last delivered error code */
     uint64_t exc_cr2;        /* CR2 captured at last #PF delivery */
@@ -54,6 +56,7 @@ struct WemuCpu {
 #define WF_ZF 0x040
 #define WF_SF 0x080
 #define WF_OF 0x800
+#define WF_IF 0x200 /* EFLAGS.IF: interrupt gate clears this on delivery */
 
 /* decoded instruction (wemu_decode.c fills, wemu_exec.c consumes) */
 typedef struct {
@@ -88,10 +91,15 @@ int wemu_exec_sse(WemuCpu *cpu, const WemuInsn *in);
 /* memory helpers (wemu_mem.c) */
 int wemu_gpa_read(WemuCpu *cpu, uint64_t gpa, void *dst, size_t len);
 int wemu_gpa_write(WemuCpu *cpu, uint64_t gpa, const void *src, size_t len);
-/* 4-level walk; is_write/is_user drive the #PF W/R and U/S error bits.
- * Sets *fault (#PF=14, #GP=13) and cpu->fault_error on failure. */
+/* 4-level walk; is_write/is_user drive the #PF W/R and U/S error bits,
+ * is_fetch drives I/D. Sets *fault (#PF=14, #GP=13) and cpu->fault_error
+ * on failure. RSVD is set when a paging entry has a reserved bit set. */
+uint64_t wemu_translate_ex(WemuCpu *cpu, uint64_t va, int is_write,
+                           int is_user, int is_fetch, int *fault);
 uint64_t wemu_translate(WemuCpu *cpu, uint64_t va, int is_write, int is_user,
                         int *fault);
+/* Instruction-fetch read (wemu_decode.c): same walk with is_fetch=1. */
+int wemu_mem_fetch(WemuCpu *cpu, uint64_t va, void *dst, size_t len);
 
 /* effective address for a ModRM memory operand (one owner: exec + sse) */
 uint64_t wemu_eff_addr(WemuCpu *cpu, const WemuInsn *in);
