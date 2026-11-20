@@ -103,6 +103,9 @@ void wemu_cpu_set_atomic_observer(WemuCpu *cpu, WemuAtomicObserver fn,
                                   void *ud) {
     cpu->atomic_observer = fn; cpu->atomic_observer_ud = ud;
 }
+uint64_t wemu_cpu_hint_count(const WemuCpu *cpu, WemuHintKind kind) {
+    return ((unsigned)kind < (unsigned)WEMU_HINT_KINDS) ? cpu->hint_count[kind] : 0;
+}
 int wemu_cpu_halted(const WemuCpu *cpu) { return cpu->halted; }
 void wemu_cpu_halt(WemuCpu *cpu) { cpu->halted = 1; }
 int wemu_cpu_fault(const WemuCpu *cpu) { return cpu->fault; }

@@ -111,6 +111,32 @@ typedef void (*WemuAtomicObserver)(WemuCpu *cpu, uint64_t va, int bytes,
                                   WemuAtomicPhase phase, void *ud);
 void wemu_cpu_set_atomic_observer(WemuCpu *cpu, WemuAtomicObserver fn, void *ud);
 
+/* ---- CMPXCHG8B/16B + memory-ordering / PAUSE hints --------------------
+ * 0F C7 /1 (REX.W selects CMPXCHG16B) is a real atomic compare-and-swap:
+ * EDX:EAX / RDX:RAX is compared with an 8/16-byte memory operand. On
+ * equal the memory receives ECX:EBX / RCX:RBX; on mismatch the accumulator
+ * receives memory. ZF is the only architecturally defined flag (WEMU
+ * preserves the others). Like XCHG, both forms are implicitly bus-locked.
+ *
+ * LFENCE (0F AE /5), MFENCE (0F AE /6), SFENCE (0F AE /7) and PAUSE
+ * (F3 90) are fetched, decoded and EXECUTED as no-op hints. WEMU is a
+ * single-threaded interpreter with no speculative/reordering engine, no
+ * store buffer and no other hardware agent by default, so there is
+ * nothing for a fence to drain and nothing for PAUSE to yield to. They
+ * are therefore honest no-ops and NEVER #UD. Execution counts are exposed
+ * so a host or gate can observe that a hint actually executed rather
+ * than being skipped or discarded as an unknown prefix/opcode. */
+#define WEMU_HAS_CX8_FENCE_PAUSE 1
+
+typedef enum {
+    WEMU_HINT_LFENCE = 0,
+    WEMU_HINT_MFENCE = 1,
+    WEMU_HINT_SFENCE = 2,
+    WEMU_HINT_PAUSE  = 3,
+    WEMU_HINT_KINDS  = 4
+} WemuHintKind;
+uint64_t wemu_cpu_hint_count(const WemuCpu *cpu, WemuHintKind kind);
+
 /* ---- Guest exception delivery (minimal IDT) --------------------------
  * Before this, a fault (wemu_cpu_fault) only stopped the run loop: WEMU
  * latched the vector but never DELIVERED it to the guest.  A guest IDT now

@@ -101,6 +101,7 @@ static int rmw_classify(const WemuInsn *in, int *implicit_lock) {
     }
     if (full == 0x1B0 || full == 0x1B1) return 1;     /* cmpxchg */
     if (full == 0x1C0 || full == 0x1C1) return 1;     /* xadd */
+    if (full == 0x1C7) { *implicit_lock = 1; return reg == 1; } /* cmpxchg8b/16b */
     if (full == 0x1BA) return reg == 5 || reg == 6 || reg == 7; /* bts/btr/btc */
     if (full == 0x1AB || full == 0x1B3 || full == 0x1BB) return 1;
     return 0;
@@ -128,6 +129,60 @@ static void rmw_write(WemuCpu *c, const WemuInsn *in, int bytes, int locked,
                       uint64_t v) {
     write_rm(c, in, bytes, v);
     rmw_interleave(c, in, locked, bytes, 1);
+}
+
+/* ---- CMPXCHG8B / CMPXCHG16B (0F C7 /1) -------------------------------
+ * SDM: 0F C7 /1 compares EDX:EAX with an m64; REX.W 0F C7 /1 compares
+ * RDX:RAX with an m128 (CMPXCHG16B). Equal -> memory <- ECX:EBX
+ * (RCX:RBX) and ZF=1; unequal -> accumulator <- memory and ZF=0.
+ * ZF is the ONLY defined flag here, so the others are preserved. Both
+ * forms use an implicitly locked bus cycle (no LOCK prefix required),
+ * so the competing-agent observer fires POST only. */
+static int exec_cmpxchg8b_16b(WemuCpu *c, const WemuInsn *in) {
+    if ((in->modrm >> 6) == 3 || REG(in) != 1) { c->fault = 6; return -1; }
+    int wide = (in->rex & 8) != 0;
+    int bytes = wide ? 16 : 8;
+    uint64_t addr = eff_addr(c, in);
+    uint8_t mem[16] = {0}, out[16] = {0};
+    if (wemu_mem_read(c, addr, mem, (size_t)bytes) != 0) {
+        c->fault = 14; return -1;
+    }
+    uint64_t mlo, mhi;
+    if (wide) {
+        memcpy(&mlo, mem, 8);
+        memcpy(&mhi, mem + 8, 8);
+    } else {
+        /* m64: EAX compares bytes 0..3, EDX compares bytes 4..7. */
+        uint32_t l32, h32;
+        memcpy(&l32, mem, 4); memcpy(&h32, mem + 4, 4);
+        mlo = l32; mhi = h32;
+    }
+    uint64_t expected_lo = c->r[0], expected_hi = c->r[2];
+    if (!wide) {
+        expected_lo = (uint32_t)expected_lo; expected_hi = (uint32_t)expected_hi;
+    }
+    uint64_t flags = c->rflags & ~WF_ZF;
+    if (expected_lo == mlo && expected_hi == mhi) {
+        uint64_t b = c->r[3], cc = c->r[1];
+        if (wide) {
+            memcpy(out, &b, 8); memcpy(out + 8, &cc, 8);
+        } else {
+            uint32_t b32 = (uint32_t)b, c32 = (uint32_t)cc;
+            memcpy(out, &b32, 4); memcpy(out + 4, &c32, 4);
+        }
+        if (wemu_mem_write(c, addr, out, (size_t)bytes) != 0) {
+            c->fault = 14; return -1;
+        }
+        flags |= WF_ZF;
+    } else {
+        c->r[0] = mlo;   /* 32-bit value written to RAX zero-extends */
+        c->r[2] = mhi;
+    }
+    c->rflags = flags;
+    if (c->atomic_observer)
+        c->atomic_observer(c, addr, bytes, WEMU_ATOMIC_POST_WRITE,
+                           c->atomic_observer_ud);
+    return 0;
 }
 
 static int cc_true(WemuCpu *c, int cc) {
@@ -265,6 +320,28 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
         if (h == 1) { c->rip += in->len; return 0; }
         if (h < 0) return -1;
         if (in->vex_len) goto ud;
+    }
+
+    /* CMPXCHG8B/16B and the no-op hints: before this change every one of
+     * these opcodes reached the honest #UD tail at the bottom of exec. */
+    if (full == 0x1C7) {
+        if (exec_cmpxchg8b_16b(c, in) != 0) return -1;
+        c->rip += in->len;
+        return 0;
+    }
+    if (full == 0x1AE && (in->modrm >> 6) == 3) {
+        int freg = REG(in);
+        if (freg == 5) c->hint_count[WEMU_HINT_LFENCE]++;
+        else if (freg == 6) c->hint_count[WEMU_HINT_MFENCE]++;
+        else if (freg == 7) c->hint_count[WEMU_HINT_SFENCE]++;
+        else goto ud; /* other 0F AE /digits are not implemented */
+        c->rip += in->len;
+        return 0;
+    }
+    if (!in->vex_len && o == 0x90 && in->rep == 0xF3 && !REX_B(in)) {
+        c->hint_count[WEMU_HINT_PAUSE]++; /* F3 90 PAUSE: no-op hint */
+        c->rip += in->len;
+        return 0;
     }
 
     /* string family (movs/stos/scas/cmps/lods + cld/std): real compiled

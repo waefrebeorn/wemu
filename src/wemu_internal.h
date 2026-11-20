@@ -36,6 +36,8 @@ struct WemuCpu {
     /* optional observer modelling a competing hardware agent (LOCK atomics) */
     WemuAtomicObserver atomic_observer;
     void *atomic_observer_ud;
+    /* no-op hint execution counts (wemu_exec owns the increments) */
+    uint64_t hint_count[WEMU_HINT_KINDS];
     /* serial (machine layer installs these) */
     WemuSerialFn serial_out;
     void *serial_ud;

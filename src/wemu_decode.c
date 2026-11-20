@@ -75,7 +75,9 @@ static int imm_len_for(uint32_t op, int opsize, uint8_t modrm_reg,
         if (op == 0x1A4 || op == 0x1AC) return 1;    /* shld/shrd imm8 */
         if (op >= 0x170 && op <= 0x173) return 1;    /* pshufd/psrlw/pslld/psllq imm8 */
         if (op >= 0x300 && op <= 0x3FF) return 1;    /* 0F 3A map: all imm8 */
-        if (op == 0x1C7) return 0;                   /* cmpxchg8b/16b: none */
+        if (op == 0x1C7) return 0;   /* 0F C7 /1 cmpxchg8b/16b: no immediate */
+        /* 0F AE /5,/6,/7 fences need ModRM but no immediate; F3 90 PAUSE
+         * is a plain 0x90 with a REP prefix. Neither needs decode work. */
         return 0;
     }
 }
