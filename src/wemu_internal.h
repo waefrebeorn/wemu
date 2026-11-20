@@ -59,6 +59,11 @@ struct WemuCpu {
         uint8_t  loaded;
         uint8_t  busy;
     } tr;
+    /* hardware task switching (wemu_exception.c): nested-task back-link.
+     * The per-task saved execution state lives in the TSS image in guest
+     * RAM; only the NT bit and observability counters live here. */
+    int task_nested;         /* NT: current task entered via a task CALL */
+    unsigned task_switches;  /* count of successful switches + returns */
     int int_target_cpl;      /* software-INT stack-switch target (0 = no switch) */
     WemuSyscallFn sys_fn;
     void *sys_ud;

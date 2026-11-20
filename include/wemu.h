@@ -401,6 +401,46 @@ uint16_t wemu_cpu_tr(const WemuCpu *cpu);
 uint64_t wemu_cpu_tr_base(const WemuCpu *cpu);
 uint32_t wemu_cpu_tr_limit(const WemuCpu *cpu);
 
+/* ---- Hardware task switching: far JMP/CALL through a TSS selector ------
+ * A far JMP/CALL m16:64 (0xFF /5 or /3, memory operand) whose selector names
+ * a 64-bit TSS descriptor in the bounded GDT performs a REAL task switch:
+ * the suspended task's CS/SS/RIP/RSP/RFLAGS are saved into its TSS image,
+ * the new task's back-link is set to the old task's TR selector (SDM), and
+ * the new CS/SS/RIP/RSP/RFLAGS/CPL are loaded from the new TSS image.  The
+ * new TSS descriptor is marked busy; a task entered by CALL sets NT so that
+ * IRET (0xCF) returns through the back-link to the suspended task.
+ *
+ * Backed by the SAME bounded GDT/TSS owner as LTR — no second table.  Fault
+ * origin is the descriptor, with a selector error code (sel & 0xfffc):
+ *   #GP(0)   GDT not configured, null selector, or LDT selector;
+ *   #GP(sel) outside GDT, non-TSS / busy TSS, nonzero reserved dwords,
+ *            or CPL/RPL > TSS DPL;
+ *   #NP(sel) TSS descriptor not present;
+ *   #TS(sel) TSS limit too small for the switch state, TSS outside RAM,
+ *            no current task to save into, or bad new CS/SS selectors.
+ * A far pointer with a register operand is #UD (far pointers are memory).
+ *
+ * WEMU TSS image extension for task switching (within the descriptor limit):
+ *   +0x00 backlink (u16, architectural)
+ *   +0x28 task CS (u16)   +0x2a task SS (u16)
+ *   +0x30 task RIP (u64)  +0x38 task RSP (u64)  +0x40 RFLAGS (u64)
+ * The suspended task's state is written to these same offsets in its OWN
+ * TSS; the entering task's initial state is read from them in its TSS.
+ *
+ * NOT modelled: call-gate / task-gate descriptors, general register state
+ * save/restore, LDT, and non-canonical checks (RAM is bounded by ram_size). */
+#define WEMU_HAS_TASK_SWITCH 1
+
+/* Guest-executed far JMP/CALL entry point.  'return_rip' is the address of
+ * the instruction following the far transfer (saved in the old task's TSS);
+ * 'nested' is 1 for CALL (NT set), 0 for JMP.  Returns 0 on success. */
+int      wemu_cpu_task_switch(WemuCpu *cpu, uint16_t selector,
+                              uint64_t return_rip, int nested);
+/* IRET with NT set: follow the current TSS back-link to the suspended task. */
+int      wemu_cpu_task_return(WemuCpu *cpu);
+int      wemu_cpu_task_nested(const WemuCpu *cpu);
+unsigned wemu_cpu_task_switches(const WemuCpu *cpu);
+
 /* Machine: CPU + COM1 serial. Output bytes go to the callback. */
 typedef void (*WemuSerialFn)(uint8_t byte, void *ud);
 WemuMachine *wemu_machine_create(uint64_t ram_size, WemuSerialFn out, void *ud);

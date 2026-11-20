@@ -339,6 +339,188 @@ uint32_t wemu_cpu_tr_limit(const WemuCpu *cpu) {
     return (cpu && cpu->tr.loaded) ? cpu->tr.limit : 0;
 }
 
+/* ---- Hardware task switching: far JMP/CALL through a TSS selector ------
+ * The suspended task's execution state is saved into ITS TSS image and the
+ * entering task's back-link (SDM: selector of the previous task) is written
+ * into ITS TSS image.  Both images live in guest RAM; only the NT bit and
+ * observability counters are CPU-side.  The owner is the bounded GDT/TSS
+ * model above — no second descriptor table is introduced. */
+#define TSS_BACKLINK_OFF   0x00u
+#define TSS_TASK_CS_OFF    0x28u
+#define TSS_TASK_SS_OFF    0x2au
+#define TSS_TASK_RIP_OFF   0x30u
+#define TSS_TASK_RSP_OFF   0x38u
+#define TSS_TASK_FL_OFF    0x40u
+#define TSS_TASK_MIN_LIMIT (TSS_TASK_FL_OFF + 8u) /* 0x48 */
+
+/* Parse base/limit/access from an already-bounded 16-byte TSS descriptor. */
+static void exc_tss_parse(const uint8_t d[16], uint64_t *base,
+                          uint32_t *limit, uint8_t *access) {
+    *access = d[5];
+    *base = (uint64_t)d[2]  | ((uint64_t)d[3]  << 8) |
+            ((uint64_t)d[4] << 16) | ((uint64_t)d[7] << 24) |
+            ((uint64_t)d[8] << 32) | ((uint64_t)d[9] << 40) |
+            ((uint64_t)d[10] << 48) | ((uint64_t)d[11] << 56);
+    *limit = (uint32_t)d[0] | ((uint32_t)d[1] << 8) |
+             ((uint32_t)(d[6] & 0x0fu) << 16);
+}
+
+/* The TSS image must cover every field we touch and fit in guest RAM. */
+static int exc_tss_bounded(const WemuCpu *cpu, uint64_t base, uint32_t limit) {
+    return limit >= TSS_TASK_MIN_LIMIT && base <= cpu->ram_size &&
+           (uint64_t)limit <= cpu->ram_size - base;
+}
+
+int wemu_cpu_task_switch(WemuCpu *cpu, uint16_t selector, uint64_t return_rip,
+                         int nested) {
+    if (!cpu) return -1;
+    uint64_t sel_err = (uint64_t)(selector & 0xFFFCu);
+
+    /* Null / LDT / no GDT: #GP with a selector error code. */
+    if (!cpu->gdt.configured || sel_err == 0 || (selector & 0x4u)) {
+        cpu->fault = 13; cpu->fault_error = sel_err; return -1;
+    }
+    uint8_t d[16];
+    if (exc_gdt_tss_desc(cpu, selector, d) != 0) {
+        cpu->fault = 13; cpu->fault_error = sel_err; return -1;
+    }
+    uint64_t base; uint32_t limit; uint8_t access;
+    exc_tss_parse(d, &base, &limit, &access);
+    uint8_t type = (uint8_t)(access & 0x0fu);
+    int dpl = (int)((access >> 5) & 3);
+    int present = (access >> 7) & 1;
+
+    /* A task switch requires an AVAILABLE 64-bit TSS (S=0, type 9).  A code
+     * or data descriptor, a busy TSS (type B), or nonzero reserved dwords
+     * in the upper descriptor half is #GP(selector). */
+    if ((access & 0x10u) || type != 0x9u ||
+        (d[12] | d[13] | d[14] | d[15]) != 0) {
+        cpu->fault = 13; cpu->fault_error = sel_err; return -1;
+    }
+    /* For JMP/CALL the selector's CPL and RPL may not exceed the TSS DPL. */
+    if (cpu->cpl > dpl || (int)(selector & 3u) > dpl) {
+        cpu->fault = 13; cpu->fault_error = sel_err; return -1;
+    }
+    if (!present) {
+        cpu->fault = 11; cpu->fault_error = sel_err; return -1; /* #NP */
+    }
+    if (!exc_tss_bounded(cpu, base, limit)) {
+        cpu->fault = 10; cpu->fault_error = sel_err; return -1; /* #TS */
+    }
+    /* There must be a current task whose state can be saved. */
+    if (!cpu->tr.loaded || !exc_tss_bounded(cpu, cpu->tr.base, cpu->tr.limit)) {
+        cpu->fault = 10;
+        cpu->fault_error = (uint64_t)(cpu->tr.selector & 0xFFFCu);
+        return -1;
+    }
+
+    /* Validate the entering task's CS/SS selectors from its TSS image.
+     * CS must be a present code segment, SS a present writable data one. */
+    uint16_t new_cs, new_ss;
+    memcpy(&new_cs, cpu->ram + base + TSS_TASK_CS_OFF, 2);
+    memcpy(&new_ss, cpu->ram + base + TSS_TASK_SS_OFF, 2);
+    uint8_t cs_acc = 0, ss_acc = 0;
+    if ((new_cs & 0xFFFCu) == 0 || (new_ss & 0xFFFCu) == 0 ||
+        exc_gdt_access(cpu, new_cs, &cs_acc) != 0 ||
+        exc_gdt_access(cpu, new_ss, &ss_acc) != 0 ||
+        !(cs_acc & 0x80u) || !(cs_acc & 0x10u) || !(cs_acc & 0x08u) ||
+        !(ss_acc & 0x80u) || !(ss_acc & 0x10u) || !(ss_acc & 0x02u)) {
+        cpu->fault = 10; cpu->fault_error = sel_err; return -1; /* #TS */
+    }
+    int new_cpl = (int)(new_cs & 3u);
+
+    /* Save the suspended task into its OWN TSS image.  The saved RIP is the
+     * instruction after the far transfer, so a back-link IRET resumes there. */
+    uint64_t ob = cpu->tr.base;
+    uint16_t old_sel = cpu->tr.selector, old_cs = cpu->cs_selector;
+    uint16_t old_ss = cpu->ss_selector;
+    uint64_t old_rsp = cpu->r[4], old_fl = cpu->rflags;
+    memcpy(cpu->ram + ob + TSS_TASK_CS_OFF,  &old_cs,    2);
+    memcpy(cpu->ram + ob + TSS_TASK_SS_OFF,  &old_ss,    2);
+    memcpy(cpu->ram + ob + TSS_TASK_RIP_OFF, &return_rip, 8);
+    memcpy(cpu->ram + ob + TSS_TASK_RSP_OFF, &old_rsp,   8);
+    memcpy(cpu->ram + ob + TSS_TASK_FL_OFF,  &old_fl,    8);
+
+    /* Back-link of the NEW task = selector of the OLD task (SDM). */
+    memcpy(cpu->ram + base + TSS_BACKLINK_OFF, &old_sel, 2);
+
+    /* Mark the new descriptor busy in guest GDT memory (locked RMW on HW). */
+    cpu->ram[cpu->gdt.base + (uint64_t)(selector >> 3) * 8 + 5] =
+        (uint8_t)((access & ~0x0fu) | 0x0bu);
+
+    /* Load the entering task's state from its TSS image. */
+    uint64_t n_rip, n_rsp, n_fl;
+    memcpy(&n_rip, cpu->ram + base + TSS_TASK_RIP_OFF, 8);
+    memcpy(&n_rsp, cpu->ram + base + TSS_TASK_RSP_OFF, 8);
+    memcpy(&n_fl,  cpu->ram + base + TSS_TASK_FL_OFF,  8);
+    cpu->rip = n_rip;
+    cpu->r[4] = n_rsp;
+    if (n_fl) cpu->rflags = n_fl | 2ull; /* bit 1 reserved, always set */
+    cpu->cs_selector = new_cs; cpu->cs_rpl = new_cpl;
+    cpu->ss_selector = new_ss; cpu->cpl = new_cpl;
+    cpu->tr.selector = selector; cpu->tr.base = base; cpu->tr.limit = limit;
+    cpu->tr.busy = 1;
+    cpu->task_nested = nested ? 1 : 0;
+    cpu->task_switches++;
+    cpu->fault = 0; cpu->fault_error = 0;
+    return 0;
+}
+
+int wemu_cpu_task_return(WemuCpu *cpu) {
+    if (!cpu || !cpu->task_nested || !cpu->tr.loaded) return -1;
+    uint16_t back;
+    memcpy(&back, cpu->ram + cpu->tr.base + TSS_BACKLINK_OFF, 2);
+    uint64_t back_err = (uint64_t)(back & 0xFFFCu);
+    if (!cpu->gdt.configured || back_err == 0 || (back & 0x4u)) {
+        cpu->fault = 10; cpu->fault_error = back_err; return -1; /* #TS */
+    }
+    uint8_t d[16];
+    if (exc_gdt_tss_desc(cpu, back, d) != 0) {
+        cpu->fault = 10; cpu->fault_error = back_err; return -1;
+    }
+    uint64_t base; uint32_t limit; uint8_t access;
+    exc_tss_parse(d, &base, &limit, &access);
+    /* The suspended task is BUSY (it was active when we left it). */
+    if ((access & 0x10u) || (access & 0x0fu) != 0x0bu ||
+        !exc_tss_bounded(cpu, base, limit)) {
+        cpu->fault = 10; cpu->fault_error = back_err; return -1;
+    }
+
+    uint16_t cs, ss; uint64_t rip, rsp, fl;
+    memcpy(&cs,  cpu->ram + base + TSS_TASK_CS_OFF,  2);
+    memcpy(&ss,  cpu->ram + base + TSS_TASK_SS_OFF,  2);
+    memcpy(&rip, cpu->ram + base + TSS_TASK_RIP_OFF, 8);
+    memcpy(&rsp, cpu->ram + base + TSS_TASK_RSP_OFF, 8);
+    memcpy(&fl,  cpu->ram + base + TSS_TASK_FL_OFF,  8);
+    cpu->rip = rip;
+    cpu->r[4] = rsp;
+    cpu->rflags = fl | 2ull;
+    cpu->cs_selector = cs; cpu->cs_rpl = (int)(cs & 3u);
+    cpu->ss_selector = ss; cpu->cpl = (int)(cs & 3u);
+
+    /* The task we are leaving is no longer active: mark its TSS available. */
+    uint16_t cur = cpu->tr.selector;
+    uint64_t coff = cpu->gdt.base + (uint64_t)(cur >> 3) * 8 + 5;
+    if ((cur & 0xFFFCu) && !(cur & 0x4u) &&
+        (uint64_t)((cur >> 3) * 8 + 5) <= cpu->gdt.limit &&
+        coff < cpu->ram_size) {
+        uint8_t a = cpu->ram[coff];
+        if ((a & 0x0fu) == 0x0bu)
+            cpu->ram[coff] = (uint8_t)((a & ~0x0fu) | 0x09u);
+    }
+    cpu->tr.selector = back; cpu->tr.base = base; cpu->tr.limit = limit;
+    cpu->tr.busy = 1;
+    cpu->task_nested = 0;
+    cpu->task_switches++;
+    cpu->fault = 0; cpu->fault_error = 0;
+    return 0;
+}
+
+int wemu_cpu_task_nested(const WemuCpu *cpu) { return cpu && cpu->task_nested; }
+unsigned wemu_cpu_task_switches(const WemuCpu *cpu) {
+    return cpu ? cpu->task_switches : 0;
+}
+
 void wemu_cpu_set_int_target_cpl(WemuCpu *cpu, int cpl) {
     if (cpu) cpu->int_target_cpl = cpl < 0 ? 0 : (cpl > 3 ? 3 : cpl);
 }
@@ -557,6 +739,9 @@ int wemu_cpu_deliver_int(WemuCpu *cpu, unsigned vector) {
  * handler is responsible for adjusting RSP before IRET (as on hardware). */
 int wemu_iret(WemuCpu *cpu) {
     if (!cpu) return -1;
+    /* NT set: this task was entered by a far CALL/task switch, so IRET is
+     * a task return through the TSS back-link, not an interrupt-frame pop. */
+    if (cpu->task_nested) return wemu_cpu_task_return(cpu);
     uint64_t sp = cpu->r[4];
     uint64_t rip = 0, cs = 0, fl = 0, rsp = 0, ss = 0;
     if (wemu_gpa_read(cpu, sp, &rip, 8) != 0 ||

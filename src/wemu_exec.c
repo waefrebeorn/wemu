@@ -64,6 +64,18 @@ static void write_rm(WemuCpu *c, const WemuInsn *in, int bytes, uint64_t v) {
     wemu_mem_write(c, eff_addr(c, in), &m, (size_t)bytes);
 }
 
+/* Far JMP/CALL m16:64 reads a 10-byte far pointer: 64-bit offset followed
+ * by a 16-bit selector.  For a TSS selector the offset is ignored (the SDM
+ * task-switch gate takes its target from the TSS, not the pointer offset).
+ * A register operand is #UD: a far pointer is always a memory operand. */
+static int far_ptr_selector(WemuCpu *c, const WemuInsn *in, uint16_t *sel) {
+    if ((in->modrm >> 6) == 3) { c->fault = 6; return -1; }
+    uint8_t fp[10];
+    if (wemu_mem_read(c, eff_addr(c, in), fp, sizeof fp) != 0) return -1;
+    *sel = (uint16_t)fp[8] | ((uint16_t)fp[9] << 8);
+    return 0;
+}
+
 static uint64_t read_regop(WemuCpu *c, const WemuInsn *in, int bytes) {
     int r = REG(in) | (REX_R(in) << 3);
     return bytes == 1 ? read_reg8(c, r, in->rex) : read_reg(c, r, bytes);
@@ -668,9 +680,17 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
             push64(c, c->rip + in->len);
             c->rip = a;
             return 0;
+        } else if (op == 3) { /* far CALL: task switch through TSS selector */
+            uint16_t sel;
+            if (far_ptr_selector(c, in, &sel) != 0) return -1;
+            return wemu_cpu_task_switch(c, sel, c->rip + in->len, 1);
         } else if (op == 4) { /* jmp rm */
             c->rip = read_rm(c, in, 8);
             return 0;
+        } else if (op == 5) { /* far JMP: task switch through TSS selector */
+            uint16_t sel;
+            if (far_ptr_selector(c, in, &sel) != 0) return -1;
+            return wemu_cpu_task_switch(c, sel, c->rip + in->len, 0);
         } else if (op == 6) { /* push rm */
             push64(c, read_rm(c, in, 8));
         } else goto ud;
