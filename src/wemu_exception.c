@@ -225,6 +225,120 @@ void wemu_cpu_tss_set_rsp(WemuCpu *cpu, int cpl, uint64_t rsp) {
 uint64_t wemu_cpu_tss_rsp(const WemuCpu *cpu, int cpl) {
     return (cpu && cpl >= 0 && cpl <= 3) ? cpu->tss_rsp[cpl] : 0;
 }
+
+/* ---- LTR: bounded 64-bit TSS descriptor parse + stack load ------------
+ * The descriptor is a 16-byte system segment in the bounded GDT (two GDT
+ * slots).  TI=1 selects an LDT (not modelled).  A 64-bit TSS descriptor
+ * must have S=0 and type 0x9 (available); LTR rejects a busy (0xB) TSS and
+ * a nonzero reserved dword in the upper half, then marks the descriptor
+ * busy with a locked write to the GDT (SDM LTR pseudocode). */
+static int exc_gdt_tss_desc(const WemuCpu *cpu, uint16_t sel, uint8_t d[16]) {
+    if (!cpu || !cpu->gdt.configured || !d) return -1;
+    if (sel & 0x4u) return -1;                 /* LDT not modelled */
+    unsigned index = (unsigned)sel >> 3;
+    if (index == 0) return -1;                 /* null selector */
+    uint64_t off = (uint64_t)index * 8;
+    if (off + 15 > cpu->gdt.limit) return -1;  /* full 16-byte descriptor */
+    memcpy(d, cpu->ram + cpu->gdt.base + off, 16);
+    return 0;
+}
+
+/* Offsets in the 64-bit TSS image. RSP0/1/2 are the architectural offsets;
+ * the SS slots are the documented WEMU extension (a real 64-bit TSS has no
+ * SS fields). */
+#define TSS_RSP0_OFF  0x04u
+#define TSS_RSP1_OFF  0x0cu
+#define TSS_RSP2_OFF  0x14u
+#define TSS_SS0_OFF   0x1cu
+#define TSS_SS1_OFF   0x1eu
+#define TSS_SS2_OFF   0x20u
+#define TSS_MIN_LIMIT (TSS_SS2_OFF + 2u)
+
+int wemu_cpu_ltr(WemuCpu *cpu, uint16_t selector, WemuTssDescriptor *out) {
+    if (!cpu) return -1;
+    uint64_t sel_err = (uint64_t)(selector & 0xFFFCu);
+
+    /* LTR is ring-0 only; a null selector is #GP(0). */
+    if (cpu->cpl != 0 || sel_err == 0) {
+        cpu->fault = 13; cpu->fault_error = 0; return -1;
+    }
+
+    uint8_t d[16];
+    if (exc_gdt_tss_desc(cpu, selector, d) != 0) {
+        cpu->fault = 13; cpu->fault_error = sel_err; return -1;
+    }
+
+    uint8_t access = d[5];
+    uint8_t type = (uint8_t)(access & 0x0fu);
+    int present = (access >> 7) & 1;
+    /* S=1 (code/data) or any type other than an AVAILABLE TSS is #GP —
+     * this also rejects a busy TSS (type 0xB) as the SDM requires. */
+    if ((access & 0x10u) || type != 0x9u) {
+        cpu->fault = 13; cpu->fault_error = sel_err; return -1;
+    }
+    /* In 64-bit mode the upper descriptor half holds base[63:32] in its
+     * first dword and three reserved dwords that must be zero. */
+    if (d[12] || d[13] || d[14] || d[15]) {
+        cpu->fault = 13; cpu->fault_error = sel_err; return -1;
+    }
+    if (!present) {
+        cpu->fault = 11; cpu->fault_error = sel_err; return -1; /* #NP */
+    }
+
+    uint64_t base = (uint64_t)d[2]  | ((uint64_t)d[3]  << 8) |
+                    ((uint64_t)d[4] << 16) | ((uint64_t)d[7] << 24) |
+                    ((uint64_t)d[8] << 32) | ((uint64_t)d[9] << 40) |
+                    ((uint64_t)d[10] << 48) | ((uint64_t)d[11] << 56);
+    uint32_t limit = (uint32_t)d[0] | ((uint32_t)d[1] << 8) |
+                     ((uint32_t)(d[6] & 0x0fu) << 16);
+
+    /* Bounded TSS: the limit must cover the fields loaded below and the
+     * whole image must fit in guest RAM.  A bad TSS limit is #TS(selector). */
+    if (limit < TSS_MIN_LIMIT || base > cpu->ram_size ||
+        (uint64_t)limit > cpu->ram_size - base) {
+        cpu->fault = 10; cpu->fault_error = sel_err; return -1;
+    }
+
+    uint64_t rsp0, rsp1, rsp2;
+    uint16_t ss0, ss1, ss2;
+    memcpy(&rsp0, cpu->ram + base + TSS_RSP0_OFF, 8);
+    memcpy(&rsp1, cpu->ram + base + TSS_RSP1_OFF, 8);
+    memcpy(&rsp2, cpu->ram + base + TSS_RSP2_OFF, 8);
+    memcpy(&ss0,  cpu->ram + base + TSS_SS0_OFF, 2);
+    memcpy(&ss1,  cpu->ram + base + TSS_SS1_OFF, 2);
+    memcpy(&ss2,  cpu->ram + base + TSS_SS2_OFF, 2);
+    cpu->tss_rsp[0] = rsp0; cpu->tss_rsp[1] = rsp1; cpu->tss_rsp[2] = rsp2;
+    cpu->tss_ss[0]  = ss0;  cpu->tss_ss[1]  = ss1;  cpu->tss_ss[2]  = ss2;
+
+    /* Mark the descriptor busy in guest GDT memory (locked RMW on hardware). */
+    cpu->ram[cpu->gdt.base + (uint64_t)(selector >> 3) * 8 + 5] =
+        (uint8_t)((access & ~0x0fu) | 0x0bu);
+
+    cpu->tr.selector = selector;
+    cpu->tr.base = base;
+    cpu->tr.limit = limit;
+    cpu->tr.loaded = 1;
+    cpu->tr.busy = 1;
+
+    if (out) {
+        out->base = base; out->limit = limit; out->selector = selector;
+        out->type = type; out->dpl = (uint8_t)((access >> 5) & 3);
+        out->present = (uint8_t)present; out->busy = 1;
+    }
+    return 0;
+}
+
+int wemu_cpu_tr_loaded(const WemuCpu *cpu) { return cpu && cpu->tr.loaded; }
+uint16_t wemu_cpu_tr(const WemuCpu *cpu) {
+    return (cpu && cpu->tr.loaded) ? cpu->tr.selector : 0;
+}
+uint64_t wemu_cpu_tr_base(const WemuCpu *cpu) {
+    return (cpu && cpu->tr.loaded) ? cpu->tr.base : 0;
+}
+uint32_t wemu_cpu_tr_limit(const WemuCpu *cpu) {
+    return (cpu && cpu->tr.loaded) ? cpu->tr.limit : 0;
+}
+
 void wemu_cpu_set_int_target_cpl(WemuCpu *cpu, int cpl) {
     if (cpu) cpu->int_target_cpl = cpl < 0 ? 0 : (cpl > 3 ? 3 : cpl);
 }
@@ -346,7 +460,11 @@ static int exc_deliver(WemuCpu *cpu, unsigned vector, int software) {
     uint64_t sp;
     if (priv_switch) {
         uint64_t tss_rsp = cpu->tss_rsp[target];
-        sp = t.ist ? cpu->ist[t.ist & 7] : (tss_rsp ? tss_rsp : old_rsp);
+        /* An LTR-loaded TSS supplies the base even when RSP is 0; the
+         * legacy host-setter convention treats 0 as "not configured". */
+        int from_tss = cpu->tr.loaded && target >= 0 && target <= 2;
+        uint64_t base = (from_tss || tss_rsp) ? tss_rsp : old_rsp;
+        sp = t.ist ? cpu->ist[t.ist & 7] : base;
     } else {
         sp = t.ist ? cpu->ist[t.ist & 7] : old_rsp;
     }

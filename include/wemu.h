@@ -276,12 +276,11 @@ uint64_t wemu_cpu_double_fault_source_error(const WemuCpu *cpu);
  *      index + TI with IDT/EXT/RPL clear.  A passing check leaves the
  *      existing INT delivery unchanged.
  *
- * NOT modelled (an explicit, honest boundary): there is no actual CPL
- * change, no RSP0/1/2 load from the TSS, no CS/SS register reload and no
- * pushing of the old SS/RSP for a stack switch.  There are no conforming-
- * code checks, no segment limit / expand-down / DPL checks, no LDT, no
- * 16-bit or VM86 stack switch, and no task-gate or #DF delivery on a bad
- * stack.  This increment generates the FAULTS only. */
+ * This increment generates FAULTS only; the CPL switch, RSP0/SS0 load and
+ * CS/SS reload were added by WEMU_HAS_INT_CPL_SWITCH and WEMU_HAS_LTR_TSS
+ * below.  Still not modelled: conforming-code checks, segment limit /
+ * expand-down / DPL checks, LDT, 16-bit or VM86 stack switches, task gates
+ * and #DF delivery on a bad stack. */
 #define WEMU_HAS_SEGMENTS 1
 
 /* Load a bounded GDT (guest-physical base, byte limit). base+limit must
@@ -354,6 +353,53 @@ uint64_t wemu_cpu_tss_rsp(const WemuCpu *cpu, int cpl);
 
 /* Host-callable form of the same primitive the 0xCF opcode executes. */
 int wemu_cpu_iret(WemuCpu *cpu);
+
+/* ---- LTR: bounded 64-bit TSS descriptor parse + RSP0/SS0 load ---------
+ * A guest TSS descriptor is a 16-byte system descriptor in the bounded
+ * GDT (S=0, type 0x9 available / 0xB busy, P, 20-bit limit, 64-bit base).
+ * wemu_cpu_ltr is the host side of LTR: it reads the descriptor from guest
+ * RAM, validates it, bounds base+limit to guest RAM, then loads the stack
+ * state from the TSS image and marks the descriptor busy (the SDM's locked
+ * read-modify-write).  It does not itself change CPL or RSP.
+ *
+ * Faults are latched with a selector error code (selector & 0xfffc):
+ *   #GP(0)   null selector, or CPL != 0 (LTR is ring-0 only);
+ *   #GP(sel) TI=1 (LDT not modelled), outside GDT, non-TSS type, busy TSS,
+ *            or nonzero reserved dwords in the upper 8 descriptor bytes;
+ *   #NP(sel) descriptor not present;
+ *   #TS(sel) TSS limit too small for RSP0/SS0, or TSS outside guest RAM.
+ *
+ * WEMU TSS image at the descriptor base (guest physical):
+ *   +0x04 RSP0 (u64)   +0x0c RSP1   +0x14 RSP2
+ *   +0x1c SS0 (u16)    +0x1e SS1    +0x20 SS2
+ * RSP0/1/2 are the architectural 64-bit TSS offsets.  A real 64-bit TSS
+ * has NO SS fields, so WEMU keeps the SS selectors in the architecturally
+ * reserved +0x1c..+0x21 bytes as an explicit documented extension: the
+ * bounded GDT model needs an SS selector for a CPL switch and this makes it
+ * guest-supplied rather than host-only.
+ *
+ * NOT modelled: hardware task switching (far JMP/CALL or a task gate to a
+ * TSS selector), the back-link field, I/O-permission bitmap checks, and
+ * non-canonical-address checks (guest RAM bounded by ram_size instead). */
+#define WEMU_HAS_LTR_TSS 1
+
+typedef struct {
+    uint64_t base;      /* base from both halves of the 16-byte descriptor */
+    uint32_t limit;     /* 20-bit limit */
+    uint16_t selector;  /* selector used to load TR */
+    uint8_t  type;      /* type as read (0x9 available) */
+    uint8_t  dpl;
+    uint8_t  present;
+    uint8_t  busy;      /* 1 after a successful load (type became 0xB) */
+} WemuTssDescriptor;
+
+/* LTR-like load. Returns 0 on success (out may be NULL), -1 on a rejected
+ * descriptor (fault vector/error readable via wemu_cpu_fault/_fault_error). */
+int      wemu_cpu_ltr(WemuCpu *cpu, uint16_t selector, WemuTssDescriptor *out);
+int      wemu_cpu_tr_loaded(const WemuCpu *cpu);
+uint16_t wemu_cpu_tr(const WemuCpu *cpu);
+uint64_t wemu_cpu_tr_base(const WemuCpu *cpu);
+uint32_t wemu_cpu_tr_limit(const WemuCpu *cpu);
 
 /* Machine: CPU + COM1 serial. Output bytes go to the callback. */
 typedef void (*WemuSerialFn)(uint8_t byte, void *ud);

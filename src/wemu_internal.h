@@ -51,6 +51,14 @@ struct WemuCpu {
     struct { uint64_t base; uint16_t limit; uint8_t configured; } gdt;
     uint16_t tss_ss[4];      /* TSS-supplied SS selector per target CPL */
     uint64_t tss_rsp[4];     /* TSS-supplied RSP per target CPL (RSP0..RSP2) */
+    /* task register, cached by wemu_cpu_ltr (wemu_exception.c) */
+    struct {
+        uint64_t base;
+        uint32_t limit;
+        uint16_t selector;
+        uint8_t  loaded;
+        uint8_t  busy;
+    } tr;
     int int_target_cpl;      /* software-INT stack-switch target (0 = no switch) */
     WemuSyscallFn sys_fn;
     void *sys_ud;
