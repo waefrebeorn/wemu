@@ -7,6 +7,9 @@
  * bodies in headers. */
 #include "wemu_internal.h"
 
+/* Forward decl: task-gate delivery rejection recurses into #DF delivery. */
+static int exc_deliver(WemuCpu *cpu, unsigned vector, int software);
+
 /* x86-64 vectors that push an error code with the interrupt frame.
  * #UD (6) is deliberately absent: no error code for an invalid opcode. */
 static int exc_has_error_code(unsigned v) {
@@ -371,6 +374,16 @@ static int exc_tss_bounded(const WemuCpu *cpu, uint64_t base, uint32_t limit) {
            (uint64_t)limit <= cpu->ram_size - base;
 }
 
+/* Peek just the system-descriptor type (access low nibble) of a GDT selector
+ * using the SAME bounded GDT owner.  0 with *type on a readable descriptor,
+ * -1 when null / LDT / outside the table. */
+static int exc_gdt_type(const WemuCpu *cpu, uint16_t sel, uint8_t *type) {
+    uint8_t access;
+    if (exc_gdt_access(cpu, sel, &access) != 0) return -1;
+    *type = access & 0x0fu;
+    return 0;
+}
+
 int wemu_cpu_task_switch(WemuCpu *cpu, uint16_t selector, uint64_t return_rip,
                          int nested) {
     if (!cpu) return -1;
@@ -390,22 +403,46 @@ int wemu_cpu_task_switch(WemuCpu *cpu, uint16_t selector, uint64_t return_rip,
     int dpl = (int)((access >> 5) & 3);
     int present = (access >> 7) & 1;
 
+    /* GDT TASK GATE (S=0, type 5): bytes 2-3 name the TSS descriptor to
+     * switch to.  Gate-level faults report the GATE selector; once resolved
+     * the TSS is validated exactly like a direct far CALL through a TSS. */
+    uint16_t tss_sel = selector;
+    uint64_t tss_err = sel_err;
+    if (!(access & 0x10u) && type == 0x5u) {
+        if (cpu->cpl > dpl || (int)(selector & 3u) > dpl) {
+            cpu->fault = 13; cpu->fault_error = sel_err; return -1;
+        }
+        if (!present) {
+            cpu->fault = 11; cpu->fault_error = sel_err; return -1;
+        }
+        tss_sel = (uint16_t)d[2] | ((uint16_t)d[3] << 8);
+        tss_err = (uint64_t)(tss_sel & 0xFFFCu);
+        if (tss_err == 0 || (tss_sel & 0x4u) ||
+            exc_gdt_tss_desc(cpu, tss_sel, d) != 0) {
+            cpu->fault = 13; cpu->fault_error = tss_err; return -1;
+        }
+        exc_tss_parse(d, &base, &limit, &access);
+        type = (uint8_t)(access & 0x0fu);
+        dpl = (int)((access >> 5) & 3);
+        present = (access >> 7) & 1;
+    }
+
     /* A task switch requires an AVAILABLE 64-bit TSS (S=0, type 9).  A code
      * or data descriptor, a busy TSS (type B), or nonzero reserved dwords
      * in the upper descriptor half is #GP(selector). */
     if ((access & 0x10u) || type != 0x9u ||
         (d[12] | d[13] | d[14] | d[15]) != 0) {
-        cpu->fault = 13; cpu->fault_error = sel_err; return -1;
+        cpu->fault = 13; cpu->fault_error = tss_err; return -1;
     }
     /* For JMP/CALL the selector's CPL and RPL may not exceed the TSS DPL. */
-    if (cpu->cpl > dpl || (int)(selector & 3u) > dpl) {
-        cpu->fault = 13; cpu->fault_error = sel_err; return -1;
+    if (cpu->cpl > dpl || (int)(tss_sel & 3u) > dpl) {
+        cpu->fault = 13; cpu->fault_error = tss_err; return -1;
     }
     if (!present) {
-        cpu->fault = 11; cpu->fault_error = sel_err; return -1; /* #NP */
+        cpu->fault = 11; cpu->fault_error = tss_err; return -1; /* #NP */
     }
     if (!exc_tss_bounded(cpu, base, limit)) {
-        cpu->fault = 10; cpu->fault_error = sel_err; return -1; /* #TS */
+        cpu->fault = 10; cpu->fault_error = tss_err; return -1; /* #TS */
     }
     /* There must be a current task whose state can be saved. */
     if (!cpu->tr.loaded || !exc_tss_bounded(cpu, cpu->tr.base, cpu->tr.limit)) {
@@ -425,7 +462,7 @@ int wemu_cpu_task_switch(WemuCpu *cpu, uint16_t selector, uint64_t return_rip,
         exc_gdt_access(cpu, new_ss, &ss_acc) != 0 ||
         !(cs_acc & 0x80u) || !(cs_acc & 0x10u) || !(cs_acc & 0x08u) ||
         !(ss_acc & 0x80u) || !(ss_acc & 0x10u) || !(ss_acc & 0x02u)) {
-        cpu->fault = 10; cpu->fault_error = sel_err; return -1; /* #TS */
+        cpu->fault = 10; cpu->fault_error = tss_err; return -1; /* #TS */
     }
     int new_cpl = (int)(new_cs & 3u);
 
@@ -445,7 +482,7 @@ int wemu_cpu_task_switch(WemuCpu *cpu, uint16_t selector, uint64_t return_rip,
     memcpy(cpu->ram + base + TSS_BACKLINK_OFF, &old_sel, 2);
 
     /* Mark the new descriptor busy in guest GDT memory (locked RMW on HW). */
-    cpu->ram[cpu->gdt.base + (uint64_t)(selector >> 3) * 8 + 5] =
+    cpu->ram[cpu->gdt.base + (uint64_t)(tss_sel >> 3) * 8 + 5] =
         (uint8_t)((access & ~0x0fu) | 0x0bu);
 
     /* Load the entering task's state from its TSS image. */
@@ -455,12 +492,16 @@ int wemu_cpu_task_switch(WemuCpu *cpu, uint16_t selector, uint64_t return_rip,
     memcpy(&n_fl,  cpu->ram + base + TSS_TASK_FL_OFF,  8);
     cpu->rip = n_rip;
     cpu->r[4] = n_rsp;
-    if (n_fl) cpu->rflags = n_fl | 2ull; /* bit 1 reserved, always set */
+    if (n_fl) cpu->rflags = n_fl | 2ull;
+    /* NT is an entrance property: CALL / interrupt / task gate set it, JMP
+     * clears it.  Keep the CPU-side nested bit and EFLAGS.NT in sync so a
+     * saved task's NT survives into a back-link return. */
+    if (nested) { cpu->rflags |= WF_NT; cpu->task_nested = 1; }
+    else        { cpu->rflags &= ~(uint64_t)WF_NT; cpu->task_nested = 0; }
     cpu->cs_selector = new_cs; cpu->cs_rpl = new_cpl;
     cpu->ss_selector = new_ss; cpu->cpl = new_cpl;
-    cpu->tr.selector = selector; cpu->tr.base = base; cpu->tr.limit = limit;
+    cpu->tr.selector = tss_sel; cpu->tr.base = base; cpu->tr.limit = limit;
     cpu->tr.busy = 1;
-    cpu->task_nested = nested ? 1 : 0;
     cpu->task_switches++;
     cpu->fault = 0; cpu->fault_error = 0;
     return 0;
@@ -498,6 +539,11 @@ int wemu_cpu_task_return(WemuCpu *cpu) {
     cpu->cs_selector = cs; cpu->cs_rpl = (int)(cs & 3u);
     cpu->ss_selector = ss; cpu->cpl = (int)(cs & 3u);
 
+    /* NT is restored from the suspended task's saved RFLAGS, not cleared:
+     * in a chain A->B->C, returning C->B reloads B's NT=1 so its own IRET
+     * follows B's back-link to A.  rflags was just reloaded from fl above. */
+    cpu->task_nested = (fl & WF_NT) ? 1 : 0;
+
     /* The task we are leaving is no longer active: mark its TSS available. */
     uint16_t cur = cpu->tr.selector;
     uint64_t coff = cpu->gdt.base + (uint64_t)(cur >> 3) * 8 + 5;
@@ -510,7 +556,6 @@ int wemu_cpu_task_return(WemuCpu *cpu) {
     }
     cpu->tr.selector = back; cpu->tr.base = base; cpu->tr.limit = limit;
     cpu->tr.busy = 1;
-    cpu->task_nested = 0;
     cpu->task_switches++;
     cpu->fault = 0; cpu->fault_error = 0;
     return 0;
@@ -519,6 +564,77 @@ int wemu_cpu_task_return(WemuCpu *cpu) {
 int wemu_cpu_task_nested(const WemuCpu *cpu) { return cpu && cpu->task_nested; }
 unsigned wemu_cpu_task_switches(const WemuCpu *cpu) {
     return cpu ? cpu->task_switches : 0;
+}
+
+/* ---- Bounded 64-bit GDT call gate (S=0, type 0xC) ----------------------
+ * A far CALL through a call-gate selector reads target code:offset from the
+ * 16-byte gate and performs a SAME-LEVEL far call: push the return far
+ * pointer (CS at the higher address, RIP at the top) on the guest stack and
+ * transfer to code:offset.  Bounded by the GDT limit and guest RAM.  A
+ * privilege-changing call gate would need a TSS stack switch and is not
+ * modelled here. */
+int wemu_cpu_call_gate(WemuCpu *cpu, uint16_t selector, uint64_t return_rip) {
+    if (!cpu) return -1;
+    uint64_t err = (uint64_t)(selector & 0xFFFCu);
+    if (!cpu->gdt.configured || err == 0 || (selector & 0x4u)) {
+        cpu->fault = 13; cpu->fault_error = err; return -1;
+    }
+    uint8_t d[16];
+    if (exc_gdt_tss_desc(cpu, selector, d) != 0) {
+        cpu->fault = 13; cpu->fault_error = err; return -1;
+    }
+    uint8_t access = d[5];
+    uint8_t type = (uint8_t)(access & 0x0fu);
+    int dpl = (int)((access >> 5) & 3);
+    int present = (access >> 7) & 1;
+    /* 64-bit call gate: S=0, type 0xC, upper reserved dwords zero. */
+    if ((access & 0x10u) || type != 0xCu ||
+        (d[12] | d[13] | d[14] | d[15]) != 0) {
+        cpu->fault = 13; cpu->fault_error = err; return -1;
+    }
+    /* max(CPL, RPL) <= DPL to use a call gate. */
+    if (cpu->cpl > dpl || (int)(selector & 3u) > dpl) {
+        cpu->fault = 13; cpu->fault_error = err; return -1;
+    }
+    if (!present) {
+        cpu->fault = 11; cpu->fault_error = err; return -1; /* #NP */
+    }
+    uint16_t cs = (uint16_t)d[2] | ((uint16_t)d[3] << 8);
+    uint64_t off = (uint64_t)d[0] | ((uint64_t)d[1] << 8) |
+                   ((uint64_t)d[6] << 16) | ((uint64_t)d[7] << 24) |
+                   ((uint64_t)d[8] << 32) | ((uint64_t)d[9] << 40) |
+                   ((uint64_t)d[10] << 48) | ((uint64_t)d[11] << 56);
+    /* Target code segment must be a present code descriptor in the GDT. */
+    uint8_t cs_acc;
+    if ((cs & 0xFFFCu) == 0 || exc_gdt_access(cpu, cs, &cs_acc) != 0 ||
+        !(cs_acc & 0x80u) || !(cs_acc & 0x10u) || !(cs_acc & 0x08u)) {
+        cpu->fault = 13; cpu->fault_error = err; return -1; /* #GP(gate) */
+    }
+    int target = (int)(cs & 3u);
+    if (target != cpu->cpl) {
+        /* Privilege-changing call gate: beyond this bounded model. */
+        cpu->fault = 13; cpu->fault_error = err; return -1; /* #GP(gate) */
+    }
+    uint64_t sp = cpu->r[4], ret_cs = cpu->cs_selector;
+    if (wemu_gpa_write(cpu, sp - 8, &ret_cs, 8) != 0 ||
+        wemu_gpa_write(cpu, sp - 16, &return_rip, 8) != 0) {
+        cpu->fault = 12; cpu->fault_error = 0; return -1; /* #SS */
+    }
+    cpu->r[4] = sp - 16;
+    cpu->rip = off;
+    cpu->cs_selector = cs; cpu->cs_rpl = target;
+    cpu->fault = 0; cpu->fault_error = 0;
+    return 0;
+}
+
+/* Far CALL dispatch: a 0xC descriptor is a call gate; 0x5/0x9 are task gate
+ * / TSS (handled by wemu_cpu_task_switch); anything else is #GP. */
+int wemu_cpu_far_call(WemuCpu *cpu, uint16_t selector, uint64_t return_rip) {
+    if (!cpu) return -1;
+    uint8_t type;
+    if (exc_gdt_type(cpu, selector, &type) == 0 && type == 0xCu)
+        return wemu_cpu_call_gate(cpu, selector, return_rip);
+    return wemu_cpu_task_switch(cpu, selector, return_rip, 1);
 }
 
 void wemu_cpu_set_int_target_cpl(WemuCpu *cpu, int cpl) {
@@ -572,6 +688,20 @@ static void exc_latch_df(WemuCpu *cpu, unsigned src, uint64_t src_error) {
     cpu->df_src_error = src_error;
 }
 
+/* Reject an IDT task gate during delivery.  For an exception (software==0)
+ * the secondary fault is a #DF contributor; mirror the interrupt/trap gate
+ * rejection path so double-fault latches identically. */
+static int exc_task_gate_reject(WemuCpu *cpu, unsigned vector, int software) {
+    if (!software) {
+        exc_latch_df(cpu, (unsigned)cpu->fault, cpu->fault_error);
+        if (vector != 8 && exc_has_df_handler(cpu)) {
+            cpu->fault = 8; cpu->fault_error = 0;
+            return exc_deliver(cpu, 8, 0);
+        }
+    }
+    return -1;
+}
+
 /* Real delivery.  Called from wemu_cpu_step at the fault boundary (and
  * available to a host bridge).  Returns 0 when the guest was transferred
  * to a handler, -1 when no handler is registered / the gate was rejected
@@ -582,6 +712,27 @@ static int exc_deliver(WemuCpu *cpu, unsigned vector, int software) {
     int target = cpu->cpl;     /* derived target CPL (software INT only) */
     int priv_switch = 0;       /* 1 when the INT changes privilege */
     if (cpu->idtr.configured) {
+        /* IDT TASK GATE (type 5): bytes 2-3 name a TSS selector.  Perform a
+         * nested back-link task switch (an interrupt/task gate sets NT)
+         * instead of an interrupt-frame push.  Gate faults use the IDT code. */
+        WemuIdtGate tg;
+        if (exc_idt_gate_read(cpu, vector, &tg) == 0 && tg.type == 0x5u) {
+            uint64_t code = exc_idt_code(vector);
+            if (software) {
+                int req = cpu->cpl > cpu->cs_rpl ? cpu->cpl : cpu->cs_rpl;
+                if ((int)tg.dpl < req) {
+                    cpu->fault = 13; cpu->fault_error = code;
+                    return exc_task_gate_reject(cpu, vector, software);
+                }
+            }
+            if (!tg.present) {
+                cpu->fault = 11; cpu->fault_error = code;
+                return exc_task_gate_reject(cpu, vector, software);
+            }
+            /* For a guest INT n the exec path already advanced RIP past the
+             * instruction, so cpu->rip is the task's saved return address. */
+            return wemu_cpu_task_switch(cpu, tg.selector, cpu->rip, 1);
+        }
         /* Architectural path: parse and validate the gate from guest RAM. */
         if (exc_idt_check(cpu, vector, &t, software) != 0) {
             if (!software) {

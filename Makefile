@@ -11,7 +11,8 @@ OBJ = $(SRC:.c=.o)
 TESTS = test_isa test_avx test_paging test_machine test_string test_cpuid \
         test_sse2 test_usermode test_shld test_x87 test_lock_atomics \
         test_exceptions test_isa_atomic_fence test_idt test_priv test_faults \
-        test_segments test_cpl test_iret test_tss test_task_switch
+        test_segments test_cpl test_iret test_tss test_task_switch \
+        test_task_gates
 
 all: libwemu.a
 

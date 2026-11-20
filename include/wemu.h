@@ -427,13 +427,51 @@ uint32_t wemu_cpu_tr_limit(const WemuCpu *cpu);
  * The suspended task's state is written to these same offsets in its OWN
  * TSS; the entering task's initial state is read from them in its TSS.
  *
- * NOT modelled: call-gate / task-gate descriptors, general register state
- * save/restore, LDT, and non-canonical checks (RAM is bounded by ram_size). */
+ * NOT modelled: general register state save/restore, LDT, and non-canonical
+ * checks (RAM is bounded by ram_size). */
 #define WEMU_HAS_TASK_SWITCH 1
+
+/* ---- Bounded call/task gates + nested task returns --------------------
+ * On top of far JMP/CALL through a TSS selector, WEMU now decodes the two
+ * remaining descriptor forms used for controlled transfer, always bounded
+ * by the latched GDT/IDT limits and guest RAM:
+ *
+ *   GDT 64-bit CALL GATE (S=0, type 0xC): a far CALL through its selector
+ *     reads the target code selector (bytes 2-3) and 64-bit offset (bytes
+ *     0-1,6-11) and performs a far call: return CS:RIP is pushed on the
+ *     guest stack and control transfers to the gate's code:offset.  Bad
+ *     gates latch #GP(selector); a not-present gate is #NP(selector).
+ *
+ *   TASK GATE (S=0, type 0x5) in the GDT or IDT: bytes 2-3 hold the selector
+ *     of a 64-bit TSS.  Using the gate performs the same back-link task
+ *     switch as a far CALL through the TSS directly.  For a software INT
+ *     the gate's DPL is checked (max(CPL,CS.RPL) <= DPL) and gate faults use
+ *     the IDT error code (vector<<3)|2; for a GDT far transfer they use the
+ *     gate selector.
+ *
+ *   NESTED TASK RETURN: EFLAGS.NT (bit 14) is set on a task switch entered
+ *     by CALL or an interrupt/task gate and cleared by JMP.  IRET with NT
+ *     set follows the current TSS back-link and RESTORES NT from the
+ *     suspended task's saved RFLAGS, so a chain A->B->C IRETs back through
+ *     B to A (one back-link level per task, as the SDM defines).
+ *
+ * A far CALL/JMP dispatches by descriptor type: 0xC -> call gate, 0x5/0x9
+ * -> task gate / TSS, anything else -> #GP(selector).  A register far
+ * pointer is #UD.  Privilege-changing call gates (TSS stack switch) are not
+ * modelled; same-level call gates and all task-gate forms are.
+ */
+#define WEMU_HAS_TASK_GATES 1
+
+/* Far CALL dispatch: decode descriptor type and route to call gate or task
+ * gate/TSS.  'return_rip' is the address after the far CALL. */
+int      wemu_cpu_far_call(WemuCpu *cpu, uint16_t selector, uint64_t return_rip);
+/* Decode a 64-bit GDT call gate and perform a same-level far call. */
+int      wemu_cpu_call_gate(WemuCpu *cpu, uint16_t selector, uint64_t return_rip);
 
 /* Guest-executed far JMP/CALL entry point.  'return_rip' is the address of
  * the instruction following the far transfer (saved in the old task's TSS);
- * 'nested' is 1 for CALL (NT set), 0 for JMP.  Returns 0 on success. */
+ * 'nested' is 1 for CALL (NT set), 0 for JMP.  Accepts a TSS selector OR a
+ * GDT task gate selector.  Returns 0 on success. */
 int      wemu_cpu_task_switch(WemuCpu *cpu, uint16_t selector,
                               uint64_t return_rip, int nested);
 /* IRET with NT set: follow the current TSS back-link to the suspended task. */

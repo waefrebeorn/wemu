@@ -680,14 +680,14 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
             push64(c, c->rip + in->len);
             c->rip = a;
             return 0;
-        } else if (op == 3) { /* far CALL: task switch through TSS selector */
+        } else if (op == 3) { /* far CALL: call gate / task gate / TSS */
             uint16_t sel;
             if (far_ptr_selector(c, in, &sel) != 0) return -1;
-            return wemu_cpu_task_switch(c, sel, c->rip + in->len, 1);
+            return wemu_cpu_far_call(c, sel, c->rip + in->len);
         } else if (op == 4) { /* jmp rm */
             c->rip = read_rm(c, in, 8);
             return 0;
-        } else if (op == 5) { /* far JMP: task switch through TSS selector */
+        } else if (op == 5) { /* far JMP: task gate / TSS (not a call gate) */
             uint16_t sel;
             if (far_ptr_selector(c, in, &sel) != 0) return -1;
             return wemu_cpu_task_switch(c, sel, c->rip + in->len, 0);

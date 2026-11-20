@@ -85,6 +85,7 @@ struct WemuCpu {
 #define WF_SF 0x080
 #define WF_OF 0x800
 #define WF_IF 0x200 /* EFLAGS.IF: interrupt gate clears this on delivery */
+#define WF_NT 0x4000 /* EFLAGS.NT: nested task, IRET follows the TSS back-link */
 
 /* decoded instruction (wemu_decode.c fills, wemu_exec.c consumes) */
 typedef struct {
