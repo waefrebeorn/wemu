@@ -33,6 +33,8 @@ struct WemuCpu {
     struct { uint64_t base; uint16_t limit; uint8_t configured; } idtr;
     int cpl;                 /* modelled CPL 0..3 (reset 0) */
     int cs_rpl;              /* RPL of the modelled current CS selector */
+    uint16_t cs_selector;    /* modelled current CS selector (reset 0x28) */
+    uint16_t ss_selector;    /* modelled current SS selector (reset 0) */
     uint64_t ist[8];         /* IST stack bases (1..7; 0 reserved) */
     unsigned exc_vector;     /* last delivered vector (0 = none yet) */
     uint64_t exc_error;      /* last delivered error code */
@@ -48,6 +50,7 @@ struct WemuCpu {
      * stay in guest RAM; only base/limit are latched, like the IDTR. */
     struct { uint64_t base; uint16_t limit; uint8_t configured; } gdt;
     uint16_t tss_ss[4];      /* TSS-supplied SS selector per target CPL */
+    uint64_t tss_rsp[4];     /* TSS-supplied RSP per target CPL (RSP0..RSP2) */
     int int_target_cpl;      /* software-INT stack-switch target (0 = no switch) */
     WemuSyscallFn sys_fn;
     void *sys_ud;

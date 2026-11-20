@@ -295,12 +295,43 @@ int  wemu_cpu_gdt_load(WemuCpu *cpu, uint64_t base, uint16_t limit);
 void    wemu_cpu_tss_set_ss(WemuCpu *cpu, int cpl, uint16_t selector);
 uint16_t wemu_cpu_tss_ss(const WemuCpu *cpu, int cpl);
 
-/* Target CPL requested for the next software INT.  Default 0; when it
- * equals the current CPL no stack switch and no segment checks occur.
- * A differing value makes wemu_cpu_deliver_int run the bounded segment
- * checks before delivering (a failure latches #TS/#SS/#NP). */
+/* Target CPL requested for the next software INT.  Default 0.  Kept as a
+ * compatibility observable: when a GDT is loaded, the architectural target
+ * is instead derived from the gate's code-descriptor DPL
+ * (see WEMU_HAS_INT_CPL_SWITCH).  With no GDT there is no segment model, so
+ * the value has no effect. */
 void wemu_cpu_set_int_target_cpl(WemuCpu *cpu, int cpl);
 int  wemu_cpu_int_target_cpl(const WemuCpu *cpu);
+
+/* ---- Guest-executed INT n + real CPL / TSS RSP0 / CS:SS reload --------
+ * Two gaps closed here:
+ *  (1) 0xCD imm8 (INT n) is EXECUTED by wemu_exec, not just callable from
+ *      the host: the guest itself transfers through the loaded IDT via
+ *      wemu_cpu_deliver_int (software-INT semantics, max(CPL,CS.RPL)<=DPL).
+ *      For INT n the saved RIP is the address AFTER the instruction.
+ *  (2) A privilege-changing software INT (target CPL from the gate's code
+ *      descriptor DPL) now performs a REAL x86-64 stack switch: load the
+ *      TSS RSP for the target CPL (RSP0 for ring 0), push the old SS/RSP
+ *      ahead of RFLAGS/CS/RIP, and reload CS from the gate and SS from the
+ *      TSS, updating the modelled CPL.  Same-level INTs keep the legacy
+ *      frame (SS slot 0, no TSS RSP0 load, no CPL change).  Exceptions (host/
+ *      fault raises) are unchanged.  The GDT/TSS table owner is the bounded one
+ *      from WEMU_HAS_SEGMENTS — no second table is introduced. */
+#define WEMU_HAS_INT_CPL_SWITCH 1
+
+/* Current CS / SS selectors. Reset: CS=0x28, SS=0 (the legacy frame value).
+ * Setting CS also updates CS.RPL used by the software-INT DPL check. */
+void    wemu_cpu_set_cs(WemuCpu *cpu, uint16_t selector);
+uint16_t wemu_cpu_cs(const WemuCpu *cpu);
+void    wemu_cpu_set_ss(WemuCpu *cpu, uint16_t selector);
+uint16_t wemu_cpu_ss(const WemuCpu *cpu);
+
+/* TSS stack pointer for a switch to CPL 'cpl' (0=RSP0, 1/2=RSP1/2).
+ * Default 0 for every CPL; 0 means "no base configured" — keep the
+ * current RSP as the frame base (backward-compatible with descriptor-less
+ * guests). A nonzero value is the new RSP the handler frame is built on. */
+void    wemu_cpu_tss_set_rsp(WemuCpu *cpu, int cpl, uint64_t rsp);
+uint64_t wemu_cpu_tss_rsp(const WemuCpu *cpu, int cpl);
 
 /* Machine: CPU + COM1 serial. Output bytes go to the callback. */
 typedef void (*WemuSerialFn)(uint8_t byte, void *ud);

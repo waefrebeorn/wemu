@@ -62,6 +62,8 @@ WemuCpu *wemu_cpu_create(uint64_t ram_size) {
     cpu->rflags = 2;
     cpu->cr0 = 0x11; /* PE|MP: long mode ready, paging OFF until enabled */
     cpu->efer = 0xd00;        /* LME|LMA|NXE */
+    cpu->cs_selector = 0x28;  /* reset CS: 64-bit code selector */
+    cpu->ss_selector = 0;     /* legacy frame convention: SS slot reads 0 */
     cpu->x87_cw = 0x037F;     /* x87 reset: all exceptions masked, round-nearest */
     cpu->r[4] = ram_size - 0x1000; /* default stack near RAM top */
     return cpu;
@@ -118,8 +120,22 @@ void wemu_cpu_set_cpl(WemuCpu *cpu, int cpl) {
     if (cpu) cpu->cpl = cpl < 0 ? 0 : (cpl > 3 ? 3 : cpl);
 }
 int wemu_cpu_cpl(const WemuCpu *cpu) { return cpu ? cpu->cpl : 0; }
+void wemu_cpu_set_cs(WemuCpu *cpu, uint16_t selector) {
+    if (cpu) {
+        cpu->cs_selector = selector;
+        cpu->cs_rpl = (int)(selector & 3u); /* keep the RPL check in sync */
+    }
+}
+uint16_t wemu_cpu_cs(const WemuCpu *cpu) { return cpu ? cpu->cs_selector : 0; }
+void wemu_cpu_set_ss(WemuCpu *cpu, uint16_t selector) {
+    if (cpu) cpu->ss_selector = selector;
+}
+uint16_t wemu_cpu_ss(const WemuCpu *cpu) { return cpu ? cpu->ss_selector : 0; }
 void wemu_cpu_set_cs_rpl(WemuCpu *cpu, int rpl) {
-    if (cpu) cpu->cs_rpl = rpl < 0 ? 0 : (rpl > 3 ? 3 : rpl);
+    if (!cpu) return;
+    rpl = rpl < 0 ? 0 : (rpl > 3 ? 3 : rpl);
+    cpu->cs_rpl = rpl;
+    cpu->cs_selector = (uint16_t)((cpu->cs_selector & ~3u) | (unsigned)rpl);
 }
 int wemu_cpu_cs_rpl(const WemuCpu *cpu) { return cpu ? cpu->cs_rpl : 0; }
 void wemu_cpu_set_ist(WemuCpu *cpu, unsigned index, uint64_t base) {

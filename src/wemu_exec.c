@@ -312,6 +312,22 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
     int eff_locked = implicit_lk || in->lock;
     if (in->lock && !is_rmw) { c->fault = 6; return -1; }
 
+    /* INT n (0xCD imm8): a GUEST-executed software interrupt.  Decoded
+     * before this increment but never executed (it fell through to #UD).
+     * Use the existing software-INT delivery path, which enforces
+     * max(CPL,CS.RPL)<=gate.DPL and performs a real privilege switch when
+     * the gate's code descriptor selects an inner ring.  INT n saves the
+     * address AFTER the instruction, so advance RIP before delivery.
+     * On rejection the secondary vector/error is latched; wemu_cpu_step
+     * rewinds RIP to the INT instruction and delivers that fault, which is
+     * the correct saved RIP for a faulting INT. */
+    if (!in->vex_len && full == 0xCD) {
+        c->rip += in->len;
+        if (wemu_cpu_deliver_int(c, (unsigned)(in->imm & 0xffu)) != 0)
+            return -1;
+        return 0;
+    }
+
     /* SSE/AVX maps and legacy SSE opcodes go to the vector leaf;
      * unhandled two-byte ops fall through to the integer switch below
      * (cmovcc/setcc/movzx/imul/bswap live there). VEX must be handled. */

@@ -139,13 +139,26 @@ static int exc_gdt_access(const WemuCpu *cpu, uint16_t sel, uint8_t *access) {
     return 0;
 }
 
+/* Architectural target CPL of a software INT: the DPL of the gate's code
+ * descriptor (a non-conforming code segment loads that DPL into CPL; a
+ * conforming one keeps the current CPL).  Derived from the SAME bounded
+ * GDT owner, never a second table.  Returns -1 when the selector is outside
+ * the GDT (the caller then lets the segment check latch #NP). */
+static int exc_target_cpl(const WemuCpu *cpu, const ExcTarget *t, int *out) {
+    if (!cpu->gdt.configured) { *out = cpu->cpl; return 0; }
+    uint8_t access;
+    if (exc_gdt_access(cpu, t->selector, &access) != 0) return -1;
+    int conforming = (access & 0x1Cu) == 0x1Cu; /* S=1, code, conforming */
+    *out = conforming ? cpu->cpl : ((access >> 5) & 3);
+    return 0;
+}
+
 /* Bounded segment checks for a privilege-changing software INT.  Called
  * only after the gate itself validated, and only when the requested
  * target CPL differs from the current one.  On rejection the fault and
  * its selector error code are latched for the caller.  A pass generates
- * no state change — the actual privilege switch is NOT modelled here. */
-static int exc_int_segment_check(WemuCpu *cpu, const ExcTarget *t) {
-    int target = cpu->int_target_cpl;
+ * no state change — the privilege switch is performed by exc_deliver. */
+static int exc_int_segment_check(WemuCpu *cpu, const ExcTarget *t, int target) {
     /* No GDT loaded: no segment model, so generate no faults at all. */
     if (!cpu->gdt.configured) return 0;
     if (target == cpu->cpl) return 0;          /* no stack switch */
@@ -206,6 +219,12 @@ void wemu_cpu_tss_set_ss(WemuCpu *cpu, int cpl, uint16_t selector) {
 uint16_t wemu_cpu_tss_ss(const WemuCpu *cpu, int cpl) {
     return (cpu && cpl >= 0 && cpl <= 3) ? cpu->tss_ss[cpl] : 0;
 }
+void wemu_cpu_tss_set_rsp(WemuCpu *cpu, int cpl, uint64_t rsp) {
+    if (cpu && cpl >= 0 && cpl <= 3) cpu->tss_rsp[cpl] = rsp;
+}
+uint64_t wemu_cpu_tss_rsp(const WemuCpu *cpu, int cpl) {
+    return (cpu && cpl >= 0 && cpl <= 3) ? cpu->tss_rsp[cpl] : 0;
+}
 void wemu_cpu_set_int_target_cpl(WemuCpu *cpu, int cpl) {
     if (cpu) cpu->int_target_cpl = cpl < 0 ? 0 : (cpl > 3 ? 3 : cpl);
 }
@@ -264,6 +283,8 @@ static void exc_latch_df(WemuCpu *cpu, unsigned src, uint64_t src_error) {
 static int exc_deliver(WemuCpu *cpu, unsigned vector, int software) {
     if (!cpu || vector == 0 || vector >= 256) return -1;
     ExcTarget t;
+    int target = cpu->cpl;     /* derived target CPL (software INT only) */
+    int priv_switch = 0;       /* 1 when the INT changes privilege */
     if (cpu->idtr.configured) {
         /* Architectural path: parse and validate the gate from guest RAM. */
         if (exc_idt_check(cpu, vector, &t, software) != 0) {
@@ -288,10 +309,21 @@ static int exc_deliver(WemuCpu *cpu, unsigned vector, int software) {
             }
             return -1;
         }
-        /* Privilege-changing software INT: the bounded GDT/TSS segment
-         * checks run after the gate itself validated.  A failure has
+        /* Software INT: the architectural target CPL is the DPL of the
+         * gate's code descriptor in the SAME bounded GDT.  The segment
+         * checks run only for a privilege change; on failure they have
          * already latched #TS/#SS/#NP for the caller. */
-        if (software && exc_int_segment_check(cpu, &t) != 0) return -1;
+        if (software && cpu->gdt.configured) {
+            /* Normally the target is the gate code segment's DPL.  If its
+             * descriptor is outside the GDT, fall back to the legacy
+             * requested target so the segment check below latches #NP with
+             * the selector error code (no silent rejection). */
+            int derived;
+            if (exc_target_cpl(cpu, &t, &derived) == 0) target = derived;
+            else target = cpu->int_target_cpl;
+            if (exc_int_segment_check(cpu, &t, target) != 0) return -1;
+            priv_switch = (target != cpu->cpl);
+        }
     } else {
         /* Legacy registered-RIP path (WEMU_HAS_EXCEPTION_DELIVERY).
          * No descriptor: no IST, trap-gate semantics (IF preserved). */
@@ -302,14 +334,27 @@ static int exc_deliver(WemuCpu *cpu, unsigned vector, int software) {
         t.selector = 0x28;
     }
 
-    uint64_t fault_rip = cpu->rip;      /* saved RIP = faulting instruction */
+    uint64_t fault_rip = cpu->rip;      /* saved RIP (INT n = next insn) */
     uint64_t old_rsp  = cpu->r[4];
-    /* IST switch: a nonzero gate IST index selects TSS.IST[n] as the new
-     * stack base.  WEMU models those bases directly (no TSS descriptor);
-     * index 0 means "use the current RSP". */
-    uint64_t sp = t.ist ? cpu->ist[t.ist & 7] : old_rsp;
+    /* Stack base: on a privilege change the TSS supplies the new RSP
+     * (RSP0 for CPL 0); a nonzero IST index still overrides it.  A zero
+     * TSS RSP means "no base configured" and keeps the old RSP, preserving
+     * descriptor-less / legacy guests. */
+    uint64_t sp;
+    if (priv_switch) {
+        uint64_t tss_rsp = cpu->tss_rsp[target];
+        sp = t.ist ? cpu->ist[t.ist & 7] : (tss_rsp ? tss_rsp : old_rsp);
+    } else {
+        sp = t.ist ? cpu->ist[t.ist & 7] : old_rsp;
+    }
     uint64_t error    = cpu->fault_error;
     uint64_t saved_fl = cpu->rflags;    /* flags as seen before delivery */
+    /* Selectors on the frame.  A privilege switch saves the OLD SS and
+     * reloads CS from the gate and SS from the TSS; a same-level INT keeps
+     * the legacy frame values (SS=0, CS=current CS = 0x28 at reset). */
+    uint64_t saved_ss = priv_switch ? (uint64_t)cpu->ss_selector : 0ull;
+    uint64_t saved_cs = priv_switch ? (uint64_t)t.selector
+                                   : (uint64_t)cpu->cs_selector;
 
     /* Push the saved RFLAGS BEFORE clearing IF: an interrupt gate clears
      * IF for the handler, but the flag saved on the stack retains it.
@@ -326,10 +371,10 @@ static int exc_deliver(WemuCpu *cpu, unsigned vector, int software) {
             push_err = cpu->fault_error;                                      \
         }                                                                     \
     } while (0)
-    EXC_PUSH(0x00ull);        /* SS */
-    EXC_PUSH(old_rsp);        /* old RSP (pre-switch) */
+    EXC_PUSH(saved_ss);   /* SS: old SS on a switch, 0 for same-level */
+    EXC_PUSH(old_rsp);    /* old RSP (pre-switch) */
     EXC_PUSH(saved_fl);       /* RFLAGS */
-    EXC_PUSH(0x28ull);        /* CS: 64-bit code selector */
+    EXC_PUSH(saved_cs);       /* CS: gate selector on a switch */
     EXC_PUSH(fault_rip);      /* RIP */
     if (exc_has_error_code(vector))
         EXC_PUSH(error);      /* error code (#PF etc.) */
@@ -346,6 +391,12 @@ static int exc_deliver(WemuCpu *cpu, unsigned vector, int software) {
 
     cpu->r[4] = sp;
     cpu->rip  = t.rip;
+    if (priv_switch) {
+        cpu->cpl = target;                    /* real privilege transition */
+        cpu->cs_rpl = target;
+        cpu->cs_selector = t.selector;        /* CS reloaded from the gate */
+        cpu->ss_selector = cpu->tss_ss[target]; /* SS from the TSS */
+    }
     if (t.type == 0xE) cpu->rflags &= ~(uint64_t)WF_IF; /* interrupt gate */
     cpu->exc_vector = vector;
     cpu->exc_error  = error;
