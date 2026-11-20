@@ -28,6 +28,10 @@ struct WemuCpu {
     /* exception delivery (wemu_exception.c owns these): a minimal IDT of
      * vector -> guest handler RIP, plus metadata of the last delivery. */
     struct { uint64_t rip; uint8_t present; } idt[256];
+    /* Optional architectural IDT (wemu_exception.c). When configured,
+     * delivery reads/validates the 16-byte gate from guest RAM. */
+    struct { uint64_t base; uint16_t limit; uint8_t configured; } idtr;
+    int cpl;                 /* modelled CPL 0..3 (reset 0) */
     unsigned exc_vector;     /* last delivered vector (0 = none yet) */
     uint64_t exc_error;      /* last delivered error code */
     uint64_t exc_cr2;        /* CR2 captured at last #PF delivery */
@@ -84,7 +88,10 @@ int wemu_exec_sse(WemuCpu *cpu, const WemuInsn *in);
 /* memory helpers (wemu_mem.c) */
 int wemu_gpa_read(WemuCpu *cpu, uint64_t gpa, void *dst, size_t len);
 int wemu_gpa_write(WemuCpu *cpu, uint64_t gpa, const void *src, size_t len);
-uint64_t wemu_translate(WemuCpu *cpu, uint64_t va, int *fault);
+/* 4-level walk; is_write/is_user drive the #PF W/R and U/S error bits.
+ * Sets *fault (#PF=14, #GP=13) and cpu->fault_error on failure. */
+uint64_t wemu_translate(WemuCpu *cpu, uint64_t va, int is_write, int is_user,
+                        int *fault);
 
 /* effective address for a ModRM memory operand (one owner: exec + sse) */
 uint64_t wemu_eff_addr(WemuCpu *cpu, const WemuInsn *in);

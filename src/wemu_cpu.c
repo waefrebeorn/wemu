@@ -111,6 +111,13 @@ void wemu_cpu_halt(WemuCpu *cpu) { cpu->halted = 1; }
 int wemu_cpu_fault(const WemuCpu *cpu) { return cpu->fault; }
 void wemu_cpu_clear_fault(WemuCpu *cpu) { cpu->fault = 0; }
 uint64_t wemu_cpu_fault_addr(const WemuCpu *cpu) { return cpu->cr2; }
+uint64_t wemu_cpu_fault_error(const WemuCpu *cpu) {
+    return cpu ? cpu->fault_error : 0;
+}
+void wemu_cpu_set_cpl(WemuCpu *cpu, int cpl) {
+    if (cpu) cpu->cpl = cpl < 0 ? 0 : (cpl > 3 ? 3 : cpl);
+}
+int wemu_cpu_cpl(const WemuCpu *cpu) { return cpu ? cpu->cpl : 0; }
 void wemu_cpu_xmm(const WemuCpu *cpu, int idx, uint8_t out[16]) {
     if (idx >= 0 && idx < 16) memcpy(out, cpu->xmm[idx], 16);
     else memset(out, 0, 16);
@@ -148,6 +155,9 @@ static int64_t default_syscall(WemuCpu *cpu, uint64_t nr,
 
 int64_t wemu_cpu_step(WemuCpu *cpu) {
     if (cpu->halted) return -1;
+    /* A fault latched before this instruction (host raise) keeps its error
+     * code; otherwise a fresh instruction boundary clears stale metadata. */
+    if (!cpu->fault) cpu->fault_error = 0;
     /* A fault already latched (host raise, or a previous hook) is delivered
      * here at the instruction boundary.  No handler -> legacy -1. */
     if (cpu->fault) {
@@ -174,11 +184,19 @@ int64_t wemu_cpu_step(WemuCpu *cpu) {
         cpu->rip += in.len;
         return 1;
     }
-    if (wemu_exec(cpu, &in) != 0) {
-        if (cpu->fault &&
-            wemu_cpu_deliver_exception(cpu, (unsigned)cpu->fault) == 0) return 1;
+    uint64_t insn_rip = cpu->rip;
+    int er = wemu_exec(cpu, &in);
+    /* Memory faults latched inside exec (read_rm/write_rm ignore the
+     * helper's return) must still reach delivery, and must save the
+     * faulting instruction's RIP — not the advanced RIP of a completed
+     * instruction. */
+    if (cpu->fault) {
+        cpu->rip = insn_rip;
+        if (wemu_cpu_deliver_exception(cpu, (unsigned)cpu->fault) == 0)
+            return 1;
         return -1;
     }
+    if (er != 0) return -1;
     return 1;
 }
 

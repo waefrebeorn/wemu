@@ -168,6 +168,54 @@ unsigned wemu_cpu_exception_vector(const WemuCpu *cpu);
 uint64_t wemu_cpu_exception_error(const WemuCpu *cpu);
 uint64_t wemu_cpu_exception_cr2(const WemuCpu *cpu);
 
+/* ---- Architectural IDT descriptors + real #PF error codes ------------
+ * The registered-RIP IDT above is kept for backwards compatibility.  In
+ * addition, a guest may install a REAL long-mode IDT in memory and point
+ * the CPU at it with wemu_cpu_idt_load(base, limit).  When an IDTR is
+ * loaded, exception delivery READS the 16-byte gate from guest physical
+ * memory and validates it (limit, gate type, present, DPL) before using
+ * its 64-bit offset as the handler RIP.  Frame pushing stays in the
+ * exception owner; no CS/RPL/IST stack switch is performed.
+ *
+ * Gate validation follows the SDM interrupt-delivery pseudocode:
+ *   index outside IDT limit, or not an interrupt/trap gate  -> #GP(code)
+ *   software vector with gate DPL < CPL                     -> #GP(code)
+ *   gate not present                                        -> #NP(code)
+ * code = (vector << 3) | 2  (IDT bit set, EXT=0, TI=0).
+ *
+ * #PF error codes are now computed by the page-walk owner: bit0 P
+ * (0=not-present, 1=protection), bit1 W/R, bit2 U/S.  RSVD, I/D and PK
+ * remain 0 (those checks are not modelled).  U/S is driven by the
+ * modelled CPL: a data access with CPL=3 is a user access. */
+#define WEMU_HAS_ARCH_IDT 1
+
+typedef struct {
+    uint64_t offset;   /* 64-bit handler offset encoded in the gate */
+    uint16_t selector; /* target code selector (not used for a switch) */
+    uint8_t  ist;      /* IST index (no IST stack switch is modelled) */
+    uint8_t  type;     /* low nibble: 0xE interrupt gate, 0xF trap gate */
+    uint8_t  dpl;      /* descriptor privilege level (0..3) */
+    uint8_t  present;  /* P bit */
+} WemuIdtGate;
+
+/* Install an IDTR (guest-physical base, byte limit = base+limit-1).
+ * Bounded: base+limit must fit in guest RAM. Returns 0 or -1. */
+int  wemu_cpu_idt_load(WemuCpu *cpu, uint64_t base, uint16_t limit);
+/* Read one 16-byte gate from the loaded IDT without side effects.
+ * Bounded: vector<256 and the whole gate must fit inside the IDT limit.
+ * Returns 0 on success, -1 on bad vector/out-of-limit/read failure. */
+int  wemu_cpu_idt_gate(const WemuCpu *cpu, unsigned vector, WemuIdtGate *out);
+/* Modelled current privilege level (0..3, reset 0). Used for the #PF U/S
+ * bit and for the software-vector DPL gate check. */
+void wemu_cpu_set_cpl(WemuCpu *cpu, int cpl);
+int  wemu_cpu_cpl(const WemuCpu *cpu);
+/* Error code of the currently latched fault (0 if none). */
+uint64_t wemu_cpu_fault_error(const WemuCpu *cpu);
+/* Deliver a SOFTWARE vector (INT n semantics): same gate validation as an
+ * exception, plus the CPL<=DPL check. Returns 0 delivered, -1 rejected
+ * (the resulting #GP/#NP is latched — see wemu_cpu_fault/_fault_error). */
+int  wemu_cpu_deliver_int(WemuCpu *cpu, unsigned vector);
+
 /* Machine: CPU + COM1 serial. Output bytes go to the callback. */
 typedef void (*WemuSerialFn)(uint8_t byte, void *ud);
 WemuMachine *wemu_machine_create(uint64_t ram_size, WemuSerialFn out, void *ud);

@@ -28,6 +28,84 @@ static int exc_has_error_code(unsigned v) {
     }
 }
 
+/* SDM error_code(vector, IDT=1, EXT=0): bits 15:3 hold the vector, bit 1
+ * is the IDT flag.  For vector 6 this is 0x32. */
+static uint64_t exc_idt_code(unsigned vector) {
+    return ((uint64_t)vector << 3) | 0x2ull;
+}
+
+/* Read a 16-byte long-mode gate from guest RAM at the loaded IDTR.  This
+ * is a pure read: bounded by vector<256 and by the IDT byte limit, both
+ * checked at load time against guest RAM, so no fault can be raised here.
+ * The IDT base is a guest-physical address (no paging of the IDT itself). */
+static int exc_idt_gate_read(const WemuCpu *cpu, unsigned vector,
+                             WemuIdtGate *g) {
+    if (!cpu || !cpu->idtr.configured || vector >= 256 || !g) return -1;
+    uint64_t off = (uint64_t)vector * 16;
+    if (off + 15 > cpu->idtr.limit) return -1;
+    const uint8_t *raw = cpu->ram + cpu->idtr.base + off;
+    g->offset = (uint64_t)raw[0] | ((uint64_t)raw[1] << 8) |
+                ((uint64_t)raw[6] << 16) | ((uint64_t)raw[7] << 24) |
+                ((uint64_t)raw[8] << 32) | ((uint64_t)raw[9] << 40) |
+                ((uint64_t)raw[10] << 48) | ((uint64_t)raw[11] << 56);
+    g->selector = (uint16_t)raw[2] | ((uint16_t)raw[3] << 8);
+    g->ist      = raw[4] & 0x7;
+    g->type     = raw[5] & 0xf;
+    g->dpl      = (raw[5] >> 5) & 0x3;
+    g->present  = (raw[5] >> 7) & 1;
+    return 0;
+}
+
+/* SDM interrupt-delivery checks, in pseudocode order.  On rejection the
+ * original vector is REPLACED by #GP/#NP with the IDT error code latched.
+ * 'software' gates the CPL<=DPL rule: exceptions ignore gate DPL. */
+static int exc_idt_check(WemuCpu *cpu, unsigned vector, uint64_t *rip,
+                         int software) {
+    WemuIdtGate g;
+    if (exc_idt_gate_read(cpu, vector, &g) != 0) {
+        cpu->fault = 13; /* descriptor outside the IDT limit */
+        cpu->fault_error = exc_idt_code(vector);
+        return -1;
+    }
+    if (g.type != 0xE && g.type != 0xF) { /* long mode: intr/trap gate only */
+        cpu->fault = 13;
+        cpu->fault_error = exc_idt_code(vector);
+        return -1;
+    }
+    if (software && (int)g.dpl < cpu->cpl) {
+        cpu->fault = 13; /* software INT through a more-privileged gate */
+        cpu->fault_error = exc_idt_code(vector);
+        return -1;
+    }
+    if (!g.present) {
+        cpu->fault = 11; /* #NP, not #GP: SDM "gate not present" */
+        cpu->fault_error = exc_idt_code(vector);
+        return -1;
+    }
+    *rip = g.offset;
+    return 0;
+}
+
+int wemu_cpu_idt_load(WemuCpu *cpu, uint64_t base, uint16_t limit) {
+    if (!cpu) return -1;
+    /* Bounded descriptor table: the whole [base, base+limit] must fit in
+     * guest RAM.  A 16-bit limit caps the table at 64KiB. */
+    if (base > cpu->ram_size || (uint64_t)limit > cpu->ram_size - base)
+        return -1;
+    cpu->idtr.base = base;
+    cpu->idtr.limit = limit;
+    cpu->idtr.configured = 1;
+    return 0;
+}
+
+int wemu_cpu_idt_gate(const WemuCpu *cpu, unsigned vector, WemuIdtGate *out) {
+    if (!cpu || !out) return -1;
+    WemuIdtGate g;
+    if (exc_idt_gate_read(cpu, vector, &g) != 0) return -1;
+    *out = g;
+    return 0;
+}
+
 /* push a 64-bit slot; the guest stack grows down (address-space owner). */
 static void exc_push(WemuCpu *cpu, uint64_t *sp, uint64_t v) {
     *sp -= 8;
@@ -51,13 +129,20 @@ int wemu_cpu_exception_handler(const WemuCpu *cpu, unsigned vector,
 
 /* Real delivery.  Called from wemu_cpu_step at the fault boundary (and
  * available to a host bridge).  Returns 0 when the guest was transferred
- * to a handler, -1 when no handler is registered — in which case the
- * legacy behaviour (fault left latched, step returns -1) is preserved. */
-int wemu_cpu_deliver_exception(WemuCpu *cpu, unsigned vector) {
+ * to a handler, -1 when no handler is registered / the gate was rejected
+ * (in which case #GP/#NP is latched for the caller). */
+static int exc_deliver(WemuCpu *cpu, unsigned vector, int software) {
     if (!cpu || vector == 0 || vector >= 256) return -1;
-    if (!cpu->idt[vector].present) return -1;
+    uint64_t handler;
+    if (cpu->idtr.configured) {
+        /* Architectural path: parse and validate the gate from guest RAM. */
+        if (exc_idt_check(cpu, vector, &handler, software) != 0) return -1;
+    } else {
+        /* Legacy registered-RIP path (WEMU_HAS_EXCEPTION_DELIVERY). */
+        if (!cpu->idt[vector].present) return -1;
+        handler = cpu->idt[vector].rip;
+    }
 
-    uint64_t handler  = cpu->idt[vector].rip;
     uint64_t fault_rip = cpu->rip;      /* saved RIP = faulting instruction */
     uint64_t old_rsp  = cpu->r[4];
     uint64_t sp       = old_rsp;
@@ -82,6 +167,14 @@ int wemu_cpu_deliver_exception(WemuCpu *cpu, unsigned vector) {
     cpu->fault      = 0;                  /* delivered: resume at handler */
     cpu->fault_error = 0;
     return 0;
+}
+
+int wemu_cpu_deliver_exception(WemuCpu *cpu, unsigned vector) {
+    return exc_deliver(cpu, vector, 0); /* exceptions ignore gate DPL */
+}
+
+int wemu_cpu_deliver_int(WemuCpu *cpu, unsigned vector) {
+    return exc_deliver(cpu, vector, 1); /* INT n: CPL<=DPL is enforced */
 }
 
 /* Host-side raise (VSL mprotect write hook, device, external event).

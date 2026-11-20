@@ -21,13 +21,34 @@ int wemu_gpa_write(WemuCpu *cpu, uint64_t gpa, const void *src, size_t len) {
     return 0;
 }
 
+/* x86 #PF error code: P (0/1), W/R (1/2), U/S (2/4).  RSVD (3), I/D (4)
+ * and PK (5) are not modelled and stay clear. */
+static uint64_t pf_code(int present, int write, int user) {
+    return (uint64_t)(present ? 1 : 0) | (uint64_t)(write ? 2 : 0) |
+           (uint64_t)(user ? 4 : 0);
+}
+
+/* Leaf permission check.  U/S: a user access needs U=1 on the leaf.
+ * W/R: a write needs RW=1; supervisor writes are checked only when
+ * CR0.WP is set (SDM), user writes are always checked. */
+static int leaf_prot_fault(const WemuCpu *cpu, uint64_t ent,
+                           int is_write, int is_user) {
+    if (is_user && !(ent & 0x4)) return 1;
+    if (is_write && !(ent & 0x2) && (is_user || (cpu->cr0 & 0x10000ull)))
+        return 1;
+    return 0;
+}
+
 /* 4-level walk (4KiB pages; 2MiB/1GiB leaves honored via PS bit).
- * Returns translated GPA, sets *fault (#PF=14) on failure. */
-uint64_t wemu_translate(WemuCpu *cpu, uint64_t va, int *fault) {
+ * Returns translated GPA, sets *fault (#PF=14, #GP=13) and the architectural
+ * error code in cpu->fault_error on failure. */
+uint64_t wemu_translate(WemuCpu *cpu, uint64_t va, int is_write, int is_user,
+                        int *fault) {
     *fault = 0;
     if (!(cpu->cr0 & 0x80000000ull)) /* PG clear: identity */
         return va;
-    if (va >> 47) { /* non-canonical */
+    if (va >> 47) { /* non-canonical: #GP, no selector error code */
+        cpu->fault_error = 0;
         *fault = 13;
         return 0;
     }
@@ -38,23 +59,41 @@ uint64_t wemu_translate(WemuCpu *cpu, uint64_t va, int *fault) {
         uint64_t ent;
         if (wemu_gpa_read(cpu, table + idx * 8, &ent, 8) != 0) {
             *fault = 14;
+            cpu->cr2 = va;
+            cpu->fault_error = pf_code(0, is_write, is_user);
             return 0;
         }
         if (!(ent & 1)) { /* not present */
             *fault = 14;
             cpu->cr2 = va;
+            cpu->fault_error = pf_code(0, is_write, is_user);
             return 0;
         }
         if ((ent & 0x80) && level < 3) { /* large page (2MiB/1GiB) */
+            if (leaf_prot_fault(cpu, ent, is_write, is_user)) {
+                *fault = 14;
+                cpu->cr2 = va;
+                cpu->fault_error = pf_code(1, is_write, is_user);
+                return 0;
+            }
             uint64_t mask = (1ull << shift) - 1;
             return (ent & 0x000ffffffffff000ull & ~mask) | (va & mask);
         }
-        if (level == 3)
+        if (level == 3) {
+            if (leaf_prot_fault(cpu, ent, is_write, is_user)) {
+                *fault = 14;
+                cpu->cr2 = va;
+                cpu->fault_error = pf_code(1, is_write, is_user);
+                return 0;
+            }
             return (ent & 0x000ffffffffff000ull) | (va & 0xfff);
+        }
         table = ent & 0x000ffffffffff000ull;
         shift -= 9;
     }
     *fault = 14;
+    cpu->cr2 = va;
+    cpu->fault_error = pf_code(0, is_write, is_user);
     return 0;
 }
 
@@ -62,7 +101,7 @@ int wemu_mem_read(WemuCpu *cpu, uint64_t va, void *dst, size_t len) {
     uint8_t *d = dst;
     while (len) {
         int f;
-        uint64_t gpa = wemu_translate(cpu, va, &f);
+        uint64_t gpa = wemu_translate(cpu, va, 0, cpu->cpl == 3, &f);
         if (f) { cpu->fault = f; return -1; }
         uint64_t chunk = 0x1000 - (va & 0xfff);
         if (chunk > len) chunk = len;
@@ -76,7 +115,7 @@ int wemu_mem_write(WemuCpu *cpu, uint64_t va, const void *src, size_t len) {
     const uint8_t *s = src;
     while (len) {
         int f;
-        uint64_t gpa = wemu_translate(cpu, va, &f);
+        uint64_t gpa = wemu_translate(cpu, va, 1, cpu->cpl == 3, &f);
         if (f) { cpu->fault = f; return -1; }
         uint64_t chunk = 0x1000 - (va & 0xfff);
         if (chunk > len) chunk = len;
