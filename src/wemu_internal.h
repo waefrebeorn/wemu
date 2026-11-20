@@ -44,6 +44,11 @@ struct WemuCpu {
     uint8_t  df_latched;     /* 1 after the first #DF condition */
     uint8_t  df_src_vector;  /* secondary vector that caused it (#NP/#GP) */
     uint64_t df_src_error;   /* that secondary vector's error code */
+    /* bounded GDT + TSS SS selectors (wemu_exception.c). GDT descriptors
+     * stay in guest RAM; only base/limit are latched, like the IDTR. */
+    struct { uint64_t base; uint16_t limit; uint8_t configured; } gdt;
+    uint16_t tss_ss[4];      /* TSS-supplied SS selector per target CPL */
+    int int_target_cpl;      /* software-INT stack-switch target (0 = no switch) */
     WemuSyscallFn sys_fn;
     void *sys_ud;
     /* optional observer modelling a competing hardware agent (LOCK atomics) */

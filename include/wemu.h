@@ -258,6 +258,50 @@ int      wemu_cpu_double_fault_latched(const WemuCpu *cpu);   /* sticky bit */
 unsigned wemu_cpu_double_fault_source(const WemuCpu *cpu);    /* #NP/#GP */
 uint64_t wemu_cpu_double_fault_source_error(const WemuCpu *cpu);
 
+/* ---- Frame-push #DF + bounded GDT/TSS segment-origin faults -----------
+ * Two fault-origin gaps are now covered:
+ *  (1) An interrupt-frame push goes through wemu_gpa_write.  If that write
+ *      fails (the guest stack lies outside RAM, so the secondary fault is
+ *      #GP) the condition is a #DF contributor: it is fed into the #DF
+ *      latch with the secondary vector/error preserved.  Delivery is NOT
+ *      completed and RSP/RIP are left untouched — with no valid stack a
+ *      #DF frame cannot be pushed either, so this is the triple-fault
+ *      boundary.  Latches stay observable via wemu_cpu_double_fault_*.
+ *  (2) A bounded GDT/TSS model checks the code and stack selectors of a
+ *      privilege-changing SOFTWARE INT and generates:
+ *        #NP(selector) - gate target code segment not present,
+ *        #TS(selector) - TSS has no valid SS for the target CPL,
+ *        #SS(selector) - SS segment not present / not writable data.
+ *      Selector error codes follow the SDM: (selector & 0xFFFC), i.e.
+ *      index + TI with IDT/EXT/RPL clear.  A passing check leaves the
+ *      existing INT delivery unchanged.
+ *
+ * NOT modelled (an explicit, honest boundary): there is no actual CPL
+ * change, no RSP0/1/2 load from the TSS, no CS/SS register reload and no
+ * pushing of the old SS/RSP for a stack switch.  There are no conforming-
+ * code checks, no segment limit / expand-down / DPL checks, no LDT, no
+ * 16-bit or VM86 stack switch, and no task-gate or #DF delivery on a bad
+ * stack.  This increment generates the FAULTS only. */
+#define WEMU_HAS_SEGMENTS 1
+
+/* Load a bounded GDT (guest-physical base, byte limit). base+limit must
+ * fit in guest RAM; the whole table is bounded at load time. Returns 0
+ * or -1.  Descriptors are parsed lazily, 8 bytes each, from guest RAM. */
+int  wemu_cpu_gdt_load(WemuCpu *cpu, uint64_t base, uint16_t limit);
+
+/* The SS selector the TSS would supply for a switch to CPL 'cpl' (0..3).
+ * Default 0 for every CPL (no stack available).  A valid stack selector
+ * must have RPL == cpl and point at a present writable data segment. */
+void    wemu_cpu_tss_set_ss(WemuCpu *cpu, int cpl, uint16_t selector);
+uint16_t wemu_cpu_tss_ss(const WemuCpu *cpu, int cpl);
+
+/* Target CPL requested for the next software INT.  Default 0; when it
+ * equals the current CPL no stack switch and no segment checks occur.
+ * A differing value makes wemu_cpu_deliver_int run the bounded segment
+ * checks before delivering (a failure latches #TS/#SS/#NP). */
+void wemu_cpu_set_int_target_cpl(WemuCpu *cpu, int cpl);
+int  wemu_cpu_int_target_cpl(const WemuCpu *cpu);
+
 /* Machine: CPU + COM1 serial. Output bytes go to the callback. */
 typedef void (*WemuSerialFn)(uint8_t byte, void *ud);
 WemuMachine *wemu_machine_create(uint64_t ram_size, WemuSerialFn out, void *ud);

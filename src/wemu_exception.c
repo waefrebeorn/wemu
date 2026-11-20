@@ -62,6 +62,7 @@ typedef struct {
     uint64_t rip;             /* handler offset */
     uint8_t  ist;             /* IST index from gate byte 4 (0 = none) */
     uint8_t  type;            /* 0xE interrupt (clears IF), 0xF trap */
+    uint16_t selector;        /* gate target code selector */
 } ExcTarget;
 
 /* SDM interrupt-delivery checks, in pseudocode order.  On rejection the
@@ -99,6 +100,7 @@ static int exc_idt_check(WemuCpu *cpu, unsigned vector, ExcTarget *t,
     t->rip  = g.offset;
     t->ist  = g.ist;
     t->type = g.type;
+    t->selector = g.selector;
     return 0;
 }
 
@@ -122,10 +124,99 @@ int wemu_cpu_idt_gate(const WemuCpu *cpu, unsigned vector, WemuIdtGate *out) {
     return 0;
 }
 
+/* ---- bounded GDT/TSS segment-origin checks (software INT only) -------
+ * Read the access byte of a GDT descriptor by selector.  Descriptors live
+ * in guest RAM and are bounded by the limit latched at wemu_cpu_gdt_load.
+ * TI=1 selects an LDT, which WEMU does not model: treated as invalid. */
+static int exc_gdt_access(const WemuCpu *cpu, uint16_t sel, uint8_t *access) {
+    if (!cpu || !cpu->gdt.configured || !access) return -1;
+    if (sel & 0x4u) return -1;                 /* LDT not modelled */
+    unsigned index = (unsigned)sel >> 3;
+    if (index == 0) return -1;                 /* null selector */
+    uint64_t off = (uint64_t)index * 8;
+    if (off + 7 > cpu->gdt.limit) return -1;   /* outside the GDT */
+    *access = cpu->ram[cpu->gdt.base + off + 5];
+    return 0;
+}
+
+/* Bounded segment checks for a privilege-changing software INT.  Called
+ * only after the gate itself validated, and only when the requested
+ * target CPL differs from the current one.  On rejection the fault and
+ * its selector error code are latched for the caller.  A pass generates
+ * no state change — the actual privilege switch is NOT modelled here. */
+static int exc_int_segment_check(WemuCpu *cpu, const ExcTarget *t) {
+    int target = cpu->int_target_cpl;
+    /* No GDT loaded: no segment model, so generate no faults at all. */
+    if (!cpu->gdt.configured) return 0;
+    if (target == cpu->cpl) return 0;          /* no stack switch */
+    if (target < 0 || target > 3) return 0;    /* invalid request: no switch */
+
+    /* Gate target code segment: a not-present descriptor is #NP(selector).
+     * Skipped when no GDT is loaded, preserving the descriptor-less path. */
+    if (cpu->gdt.configured) {
+        uint8_t cs_access;
+        uint16_t cs = t->selector;
+        if (exc_gdt_access(cpu, cs, &cs_access) != 0 || !(cs_access & 0x80u)) {
+            cpu->fault = 11; /* #NP */
+            cpu->fault_error = (uint64_t)(cs & 0xFFFCu);
+            return -1;
+        }
+    }
+
+    /* The TSS must supply an SS selector for the target CPL.  A null
+     * selector, a mismatched RPL, an LDT selector or a selector outside
+     * the GDT is an invalid-TSS condition (#TS). */
+    uint16_t ss = cpu->tss_ss[target];
+    uint64_t ss_err = (uint64_t)(ss & 0xFFFCu);
+    if (!cpu->gdt.configured || (ss & 0xFFFCu) == 0 ||
+        (ss & 3u) != (unsigned)target || (ss & 4u)) {
+        cpu->fault = 10; /* #TS */
+        cpu->fault_error = ss_err;
+        return -1;
+    }
+    uint8_t ss_access;
+    if (exc_gdt_access(cpu, ss, &ss_access) != 0) {
+        cpu->fault = 10; /* #TS: SS outside the GDT limit */
+        cpu->fault_error = ss_err;
+        return -1;
+    }
+    /* Stack must be a present writable data segment: P, S=1, W=1. */
+    if (!(ss_access & 0x80u) || !(ss_access & 0x10u) ||
+        !(ss_access & 0x02u)) {
+        cpu->fault = 12; /* #SS */
+        cpu->fault_error = ss_err;
+        return -1;
+    }
+    return 0;
+}
+
+int wemu_cpu_gdt_load(WemuCpu *cpu, uint64_t base, uint16_t limit) {
+    if (!cpu) return -1;
+    if (base > cpu->ram_size || (uint64_t)limit > cpu->ram_size - base)
+        return -1;
+    cpu->gdt.base = base;
+    cpu->gdt.limit = limit;
+    cpu->gdt.configured = 1;
+    return 0;
+}
+
+void wemu_cpu_tss_set_ss(WemuCpu *cpu, int cpl, uint16_t selector) {
+    if (cpu && cpl >= 0 && cpl <= 3) cpu->tss_ss[cpl] = selector;
+}
+uint16_t wemu_cpu_tss_ss(const WemuCpu *cpu, int cpl) {
+    return (cpu && cpl >= 0 && cpl <= 3) ? cpu->tss_ss[cpl] : 0;
+}
+void wemu_cpu_set_int_target_cpl(WemuCpu *cpu, int cpl) {
+    if (cpu) cpu->int_target_cpl = cpl < 0 ? 0 : (cpl > 3 ? 3 : cpl);
+}
+int wemu_cpu_int_target_cpl(const WemuCpu *cpu) {
+    return cpu ? cpu->int_target_cpl : 0;
+}
+
 /* push a 64-bit slot; the guest stack grows down (address-space owner). */
-static void exc_push(WemuCpu *cpu, uint64_t *sp, uint64_t v) {
+static int exc_push(WemuCpu *cpu, uint64_t *sp, uint64_t v) {
     *sp -= 8;
-    (void)wemu_gpa_write(cpu, *sp, &v, 8);
+    return wemu_gpa_write(cpu, *sp, &v, 8);
 }
 
 int wemu_cpu_register_exception_handler(WemuCpu *cpu, unsigned vector,
@@ -197,6 +288,10 @@ static int exc_deliver(WemuCpu *cpu, unsigned vector, int software) {
             }
             return -1;
         }
+        /* Privilege-changing software INT: the bounded GDT/TSS segment
+         * checks run after the gate itself validated.  A failure has
+         * already latched #TS/#SS/#NP for the caller. */
+        if (software && exc_int_segment_check(cpu, &t) != 0) return -1;
     } else {
         /* Legacy registered-RIP path (WEMU_HAS_EXCEPTION_DELIVERY).
          * No descriptor: no IST, trap-gate semantics (IF preserved). */
@@ -204,6 +299,7 @@ static int exc_deliver(WemuCpu *cpu, unsigned vector, int software) {
         t.rip  = cpu->idt[vector].rip;
         t.ist  = 0;
         t.type = 0xF;
+        t.selector = 0x28;
     }
 
     uint64_t fault_rip = cpu->rip;      /* saved RIP = faulting instruction */
@@ -216,14 +312,37 @@ static int exc_deliver(WemuCpu *cpu, unsigned vector, int software) {
     uint64_t saved_fl = cpu->rflags;    /* flags as seen before delivery */
 
     /* Push the saved RFLAGS BEFORE clearing IF: an interrupt gate clears
-     * IF for the handler, but the flag saved on the stack retains it. */
-    exc_push(cpu, &sp, 0x00ull);        /* SS */
-    exc_push(cpu, &sp, old_rsp);        /* old RSP (pre-switch) */
-    exc_push(cpu, &sp, saved_fl);       /* RFLAGS */
-    exc_push(cpu, &sp, 0x28ull);        /* CS: 64-bit code selector */
-    exc_push(cpu, &sp, fault_rip);      /* RIP */
+     * IF for the handler, but the flag saved on the stack retains it.
+     * A failed push is a #DF contributor: the secondary fault (#GP for an
+     * out-of-RAM stack) is fed into the latch below and delivery is NOT
+     * completed — with no valid stack a #DF frame cannot be pushed either. */
+    int push_fault = 0;
+    unsigned push_vec = 13;
+    uint64_t push_err = 0;
+#define EXC_PUSH(v) do {                                                      \
+        if (!push_fault && exc_push(cpu, &sp, (uint64_t)(v)) != 0) {          \
+            push_fault = 1;                                                   \
+            push_vec = (unsigned)cpu->fault;                                  \
+            push_err = cpu->fault_error;                                      \
+        }                                                                     \
+    } while (0)
+    EXC_PUSH(0x00ull);        /* SS */
+    EXC_PUSH(old_rsp);        /* old RSP (pre-switch) */
+    EXC_PUSH(saved_fl);       /* RFLAGS */
+    EXC_PUSH(0x28ull);        /* CS: 64-bit code selector */
+    EXC_PUSH(fault_rip);      /* RIP */
     if (exc_has_error_code(vector))
-        exc_push(cpu, &sp, error);      /* error code (#PF etc.) */
+        EXC_PUSH(error);      /* error code (#PF etc.) */
+#undef EXC_PUSH
+
+    if (push_fault) {
+        exc_latch_df(cpu, push_vec ? push_vec : 13u, push_err);
+        /* Keep the secondary fault visible as the legacy latch and leave
+         * RSP/RIP untouched: no frame was committed and no handler ran. */
+        cpu->fault = push_vec ? (int)push_vec : 13;
+        cpu->fault_error = push_err;
+        return -1;
+    }
 
     cpu->r[4] = sp;
     cpu->rip  = t.rip;
