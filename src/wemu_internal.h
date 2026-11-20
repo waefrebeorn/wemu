@@ -49,6 +49,10 @@ struct WemuCpu {
     /* bounded GDT + TSS SS selectors (wemu_exception.c). GDT descriptors
      * stay in guest RAM; only base/limit are latched, like the IDTR. */
     struct { uint64_t base; uint16_t limit; uint8_t configured; } gdt;
+    /* bounded LDT (wemu_exception.c). TI=1 selectors select descriptors in
+     * this table; TI=0 keeps selecting the GDT above. base+limit is bounded
+     * to guest RAM at load time, exactly like GDTR/IDTR. */
+    struct { uint64_t base; uint32_t limit; uint8_t configured; } ldt;
     uint16_t tss_ss[4];      /* TSS-supplied SS selector per target CPL */
     uint64_t tss_rsp[4];     /* TSS-supplied RSP per target CPL (RSP0..RSP2) */
     /* task register, cached by wemu_cpu_ltr (wemu_exception.c) */

@@ -279,8 +279,9 @@ uint64_t wemu_cpu_double_fault_source_error(const WemuCpu *cpu);
  * This increment generates FAULTS only; the CPL switch, RSP0/SS0 load and
  * CS/SS reload were added by WEMU_HAS_INT_CPL_SWITCH and WEMU_HAS_LTR_TSS
  * below.  Still not modelled: conforming-code checks, segment limit /
- * expand-down / DPL checks, LDT, 16-bit or VM86 stack switches, task gates
- * and #DF delivery on a bad stack. */
+ * expand-down / DPL checks, 16-bit or VM86 stack switches, task gates
+ * and #DF delivery on a bad stack.  Bounded LDT descriptors and TI=1
+ * selector decode were added by WEMU_HAS_LDT below. */
 #define WEMU_HAS_SEGMENTS 1
 
 /* Load a bounded GDT (guest-physical base, byte limit). base+limit must
@@ -364,8 +365,8 @@ int wemu_cpu_iret(WemuCpu *cpu);
  *
  * Faults are latched with a selector error code (selector & 0xfffc):
  *   #GP(0)   null selector, or CPL != 0 (LTR is ring-0 only);
- *   #GP(sel) TI=1 (LDT not modelled), outside GDT, non-TSS type, busy TSS,
- *            or nonzero reserved dwords in the upper 8 descriptor bytes;
+ *   #GP(sel) TI=1 with no loaded LDT, outside the table, non-TSS type, busy
+ *            TSS, or nonzero reserved dwords in the upper 8 descriptor bytes;
  *   #NP(sel) descriptor not present;
  *   #TS(sel) TSS limit too small for RSP0/SS0, or TSS outside guest RAM.
  *
@@ -427,8 +428,9 @@ uint32_t wemu_cpu_tr_limit(const WemuCpu *cpu);
  * The suspended task's state is written to these same offsets in its OWN
  * TSS; the entering task's initial state is read from them in its TSS.
  *
- * NOT modelled: general register state save/restore, LDT, and non-canonical
- * checks (RAM is bounded by ram_size). */
+ * NOT modelled: non-canonical checks (RAM is bounded by ram_size).  Bounded
+ * LDT selectors and full GPR save/restore were added by WEMU_HAS_LDT and
+ * WEMU_HAS_TASK_GPR_STATE below. */
 #define WEMU_HAS_TASK_SWITCH 1
 
 /* ---- Bounded call/task gates + nested task returns --------------------
@@ -457,9 +459,9 @@ uint32_t wemu_cpu_tr_limit(const WemuCpu *cpu);
  *
  * A far CALL/JMP dispatches by descriptor type: 0xC -> call gate, 0x5/0x9
  * -> task gate / TSS, anything else -> #GP(selector).  A register far
- * pointer is #UD.  Privilege-changing call gates (TSS stack switch) are not
- * modelled; same-level call gates and all task-gate forms are.
- */
+ * pointer is #UD.  Privilege-changing call gates (TSS stack switch, old
+ * SS:RSP push and parameter copy) are modelled by WEMU_HAS_PRIV_CALL_GATE
+ * below; same-level call gates and all task-gate forms are modelled here. */
 #define WEMU_HAS_TASK_GATES 1
 
 /* Far CALL dispatch: decode descriptor type and route to call gate or task
@@ -478,6 +480,85 @@ int      wemu_cpu_task_switch(WemuCpu *cpu, uint16_t selector,
 int      wemu_cpu_task_return(WemuCpu *cpu);
 int      wemu_cpu_task_nested(const WemuCpu *cpu);
 unsigned wemu_cpu_task_switches(const WemuCpu *cpu);
+
+/* ---- Bounded LDT descriptors + TI=1 selector decode -------------------
+ * The bounded GDT owner now routes EVERY descriptor read by the selector's
+ * TI bit (selector bit 2): TI=0 selects the GDT, TI=1 selects the loaded
+ * LDT.  The same table owner therefore decodes code/data descriptors, call
+ * gates, task gates and TSS descriptors from either table; error codes keep
+ * the TI bit ((selector & 0xfffc), SDM).  With no LDT loaded a TI=1 selector
+ * is #GP(selector) — the old "LDT not modelled" rejection is now just the
+ * "LDTR not loaded" case.
+ *
+ * wemu_cpu_ldt_load is the bounded host side of LLDT with an already-built
+ * LDT image in guest RAM: base+limit must fit in RAM (the 20-bit descriptor
+ * limit is capped at 0xfffff).  wemu_cpu_lldt is the real LLDT form: it
+ * parses an 8-byte LDT system descriptor (S=0, type 0x2) from the
+ * GDT, validates it and latches base/limit.  LLDT is ring-0 only.  Faults
+ * (selector error code = selector & 0xfffc):
+ *   #GP(0)   CPL != 0, or a null selector;
+ *   #GP(sel) TI=1 (an LDT descriptor must live in the GDT), outside the GDT,
+ *            S=1 or type != 0x2;
+ *   #NP(sel) descriptor not present;
+ *   #TS(sel) LDT image outside guest RAM.
+ * A real LLDT instruction is not decoded (the host setter is the API). */
+#define WEMU_HAS_LDT 1
+
+typedef struct {
+    uint64_t base;      /* LDT base from both descriptor halves */
+    uint32_t limit;     /* 20-bit limit */
+    uint16_t selector;  /* GDT selector used to load LDTR */
+    uint8_t  type;      /* type as read (0x2 LDT) */
+    uint8_t  dpl;
+    uint8_t  present;
+} WemuLdtDescriptor;
+
+int      wemu_cpu_ldt_load(WemuCpu *cpu, uint64_t base, uint32_t limit);
+int      wemu_cpu_lldt(WemuCpu *cpu, uint16_t selector,
+                       WemuLdtDescriptor *out);
+int      wemu_cpu_ldt_loaded(const WemuCpu *cpu);
+uint64_t wemu_cpu_ldt_base(const WemuCpu *cpu);
+uint32_t wemu_cpu_ldt_limit(const WemuCpu *cpu);
+
+/* ---- Privilege-changing call gates ------------------------------------
+ * A 64-bit GDT/LDT call gate whose target code descriptor DPL differs from
+ * the running CPL performs an architectural stack switch instead of the
+ * same-level call:
+ *   - target CPL comes from the gate's code descriptor (RPL/DPL),
+ *   - SS and RSP come from the TSS for that CPL (SS0/RSP0 for ring 0),
+ *   - the OLD SS:RSP are pushed on the new stack (8 bytes each, SDM),
+ *   - 'param_count' (gate bytes 4:0, count in 64-bit words) parameters are
+ *     copied from the caller's stack to the new stack,
+ *   - return CS:RIP are pushed last, so the handler resumes with RSP at the
+ *     return RIP, parameters at RSP+8, old RSP/SS above them:
+ *       [rsp+0]  return RIP   [rsp+8]  return CS
+ *       [rsp+16] param[0] ... [rsp+16+8*(n-1)] param[n-1]
+ *       [rsp+16+8*n] old RSP  [rsp+24+8*n] old SS
+ *     (n = param_count; with n=0 this is the classic 32-byte frame).
+ *   - CS/SS/CPL are reloaded from the gate and TSS; a same-level gate keeps
+ *     the legacy 16-byte return-far-pointer frame.
+ * Faults: #GP(gate) for a bad gate/target code, #TS(ss) for a missing or
+ * bad TSS stack, #SS(0) when the new stack write leaves guest RAM, #NP(gate)
+ * for a not-present gate.  Old WEMU #GPs every privilege-changing gate. */
+#define WEMU_HAS_PRIV_CALL_GATE 1
+
+/* ---- Full GPR state in the TSS on task switch --------------------------
+ * A 64-bit hardware TSS has no general-register area, so WEMU extends its
+ * TSS image (as it already does for the task CS/SS/RIP/RSP/RFLAGS state).
+ * Task-state offsets (little-endian, guest physical):
+ *   +0x48 RAX  +0x50 RCX  +0x58 RDX  +0x60 RBX  +0x68 RSP  +0x70 RBP
+ *   +0x78 RSI  +0x80 RDI  +0x88 R8   ...        +0xC0 R15
+ * A full task-state image needs a TSS limit >= 0xC8.  The save/restore is
+ * bounded: a TSS with the smaller legacy limit (0x48..0xC7) keeps the old
+ * CS/SS/RIP/RSP/RFLAGS-only behaviour, so existing guests/tasks are
+ * unchanged.  RSP is architecturally reloaded from +0x38 (the slot at
+ * +0x68 is still saved for a complete register snapshot).  The same area is
+ * saved on task entry (far CALL/JMP/task gate) and restored on a back-link
+ * IRET task return, so nested A->B->C->B->A chains preserve GPRs at each
+ * level. */
+#define WEMU_HAS_TASK_GPR_STATE 1
+#define WEMU_TSS_TASK_GPR_BASE 0x48u
+#define WEMU_TSS_TASK_GPR_END  0xc8u
 
 /* Machine: CPU + COM1 serial. Output bytes go to the callback. */
 typedef void (*WemuSerialFn)(uint8_t byte, void *ud);

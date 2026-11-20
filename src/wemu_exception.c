@@ -127,18 +127,33 @@ int wemu_cpu_idt_gate(const WemuCpu *cpu, unsigned vector, WemuIdtGate *out) {
     return 0;
 }
 
-/* ---- bounded GDT/TSS segment-origin checks (software INT only) -------
- * Read the access byte of a GDT descriptor by selector.  Descriptors live
- * in guest RAM and are bounded by the limit latched at wemu_cpu_gdt_load.
- * TI=1 selects an LDT, which WEMU does not model: treated as invalid. */
+/* ---- bounded descriptor tables: GDT + LDT -----------------------------
+ * Every descriptor read is routed by the selector's TI bit (bit 2): TI=0
+ * selects the latched GDT, TI=1 the latched LDT.  Both tables stay in guest
+ * RAM and are bounded by the limit latched at load time.  A TI=1 selector
+ * with no loaded LDTR is simply rejected — that is the old "LDT not
+ * modelled" boundary, now a "not loaded" boundary instead. */
+static int exc_desc_table(const WemuCpu *cpu, uint16_t sel,
+                          uint64_t *base, uint32_t *limit) {
+    if (!cpu || !base || !limit) return -1;
+    if (sel & 0x4u) {
+        if (!cpu->ldt.configured) return -1;
+        *base = cpu->ldt.base; *limit = cpu->ldt.limit;
+    } else {
+        if (!cpu->gdt.configured) return -1;
+        *base = cpu->gdt.base; *limit = cpu->gdt.limit;
+    }
+    return 0;
+}
+
 static int exc_gdt_access(const WemuCpu *cpu, uint16_t sel, uint8_t *access) {
-    if (!cpu || !cpu->gdt.configured || !access) return -1;
-    if (sel & 0x4u) return -1;                 /* LDT not modelled */
+    uint64_t base; uint32_t limit;
+    if (!access || exc_desc_table(cpu, sel, &base, &limit) != 0) return -1;
     unsigned index = (unsigned)sel >> 3;
     if (index == 0) return -1;                 /* null selector */
     uint64_t off = (uint64_t)index * 8;
-    if (off + 7 > cpu->gdt.limit) return -1;   /* outside the GDT */
-    *access = cpu->ram[cpu->gdt.base + off + 5];
+    if (off + 7 > limit) return -1;            /* outside the table */
+    *access = cpu->ram[base + off + 5];
     return 0;
 }
 
@@ -216,6 +231,74 @@ int wemu_cpu_gdt_load(WemuCpu *cpu, uint64_t base, uint16_t limit) {
     return 0;
 }
 
+/* ---- LLDT-like host setters: bounded LDT ------------------------------ */
+int wemu_cpu_ldt_load(WemuCpu *cpu, uint64_t base, uint32_t limit) {
+    if (!cpu) return -1;
+    limit &= 0xfffffu;             /* an LDT descriptor limit is 20 bits */
+    if (base > cpu->ram_size || (uint64_t)limit > cpu->ram_size - base)
+        return -1;
+    cpu->ldt.base = base;
+    cpu->ldt.limit = limit;
+    cpu->ldt.configured = 1;
+    return 0;
+}
+
+int wemu_cpu_lldt(WemuCpu *cpu, uint16_t selector, WemuLdtDescriptor *out) {
+    if (!cpu) return -1;
+    uint64_t sel_err = (uint64_t)(selector & 0xFFFCu);
+    /* LLDT is ring-0 only; a null selector is #GP(0). */
+    if (cpu->cpl != 0 || sel_err == 0) {
+        cpu->fault = 13; cpu->fault_error = 0; return -1;
+    }
+    /* The LDT DESCRIPTOR must live in the GDT (TI=0). */
+    if ((selector & 0x4u) || !cpu->gdt.configured) {
+        cpu->fault = 13; cpu->fault_error = sel_err; return -1;
+    }
+    uint64_t off = (uint64_t)(selector >> 3) * 8;
+    if (off + 7 > cpu->gdt.limit) {
+        cpu->fault = 13; cpu->fault_error = sel_err; return -1;
+    }
+    /* An LDT descriptor is one 8-byte GDT slot; bytes 8..15 belong to the
+     * NEXT descriptor and must not be read as reserved dwords. */
+    uint8_t d[8];
+    memcpy(d, cpu->ram + cpu->gdt.base + off, 8);
+    uint8_t access = d[5];
+    uint8_t type = (uint8_t)(access & 0x0fu);
+    int present = (access >> 7) & 1;
+    /* An LDT descriptor is S=0, type 0x2. */
+    if ((access & 0x10u) || type != 0x2u) {
+        cpu->fault = 13; cpu->fault_error = sel_err; return -1;
+    }
+    if (!present) {
+        cpu->fault = 11; cpu->fault_error = sel_err; return -1; /* #NP */
+    }
+    uint64_t base = (uint64_t)d[2]  | ((uint64_t)d[3]  << 8) |
+                    ((uint64_t)d[4] << 16) | ((uint64_t)d[7] << 24);
+    uint32_t limit = (uint32_t)d[0] | ((uint32_t)d[1] << 8) |
+                     ((uint32_t)(d[6] & 0x0fu) << 16);
+    if (base > cpu->ram_size || (uint64_t)limit > cpu->ram_size - base) {
+        cpu->fault = 10; cpu->fault_error = sel_err; return -1; /* #TS */
+    }
+    cpu->ldt.base = base; cpu->ldt.limit = limit; cpu->ldt.configured = 1;
+    if (out) {
+        out->base = base; out->limit = limit; out->selector = selector;
+        out->type = type; out->dpl = (uint8_t)((access >> 5) & 3);
+        out->present = (uint8_t)present;
+    }
+    cpu->fault = 0; cpu->fault_error = 0;
+    return 0;
+}
+
+int wemu_cpu_ldt_loaded(const WemuCpu *cpu) {
+    return cpu && cpu->ldt.configured;
+}
+uint64_t wemu_cpu_ldt_base(const WemuCpu *cpu) {
+    return (cpu && cpu->ldt.configured) ? cpu->ldt.base : 0;
+}
+uint32_t wemu_cpu_ldt_limit(const WemuCpu *cpu) {
+    return (cpu && cpu->ldt.configured) ? cpu->ldt.limit : 0;
+}
+
 void wemu_cpu_tss_set_ss(WemuCpu *cpu, int cpl, uint16_t selector) {
     if (cpu && cpl >= 0 && cpl <= 3) cpu->tss_ss[cpl] = selector;
 }
@@ -229,20 +312,27 @@ uint64_t wemu_cpu_tss_rsp(const WemuCpu *cpu, int cpl) {
     return (cpu && cpl >= 0 && cpl <= 3) ? cpu->tss_rsp[cpl] : 0;
 }
 
-/* ---- LTR: bounded 64-bit TSS descriptor parse + stack load ------------
- * The descriptor is a 16-byte system segment in the bounded GDT (two GDT
- * slots).  TI=1 selects an LDT (not modelled).  A 64-bit TSS descriptor
- * must have S=0 and type 0x9 (available); LTR rejects a busy (0xB) TSS and
- * a nonzero reserved dword in the upper half, then marks the descriptor
- * busy with a locked write to the GDT (SDM LTR pseudocode). */
+/* Parse a 16-byte system descriptor (TSS / call gate / LDT) from the table
+ * named by the selector's TI bit: GDT for TI=0, the loaded LDT for TI=1. */
 static int exc_gdt_tss_desc(const WemuCpu *cpu, uint16_t sel, uint8_t d[16]) {
-    if (!cpu || !cpu->gdt.configured || !d) return -1;
-    if (sel & 0x4u) return -1;                 /* LDT not modelled */
+    uint64_t base; uint32_t limit;
+    if (!d || exc_desc_table(cpu, sel, &base, &limit) != 0) return -1;
     unsigned index = (unsigned)sel >> 3;
     if (index == 0) return -1;                 /* null selector */
     uint64_t off = (uint64_t)index * 8;
-    if (off + 15 > cpu->gdt.limit) return -1;  /* full 16-byte descriptor */
-    memcpy(d, cpu->ram + cpu->gdt.base + off, 16);
+    if (off + 15 > limit) return -1;           /* full 16-byte descriptor */
+    memcpy(d, cpu->ram + base + off, 16);
+    return 0;
+}
+
+/* Mark a descriptor busy/available with a bounded RMW on the table that
+ * actually holds it (GDT or LDT, chosen by TI). */
+static int exc_desc_set_access(WemuCpu *cpu, uint16_t sel, uint8_t access) {
+    uint64_t base; uint32_t limit;
+    if (exc_desc_table(cpu, sel, &base, &limit) != 0) return -1;
+    uint64_t off = (uint64_t)(sel >> 3) * 8 + 5;
+    if (off > limit) return -1;
+    cpu->ram[base + off] = access;
     return 0;
 }
 
@@ -313,9 +403,9 @@ int wemu_cpu_ltr(WemuCpu *cpu, uint16_t selector, WemuTssDescriptor *out) {
     cpu->tss_rsp[0] = rsp0; cpu->tss_rsp[1] = rsp1; cpu->tss_rsp[2] = rsp2;
     cpu->tss_ss[0]  = ss0;  cpu->tss_ss[1]  = ss1;  cpu->tss_ss[2]  = ss2;
 
-    /* Mark the descriptor busy in guest GDT memory (locked RMW on hardware). */
-    cpu->ram[cpu->gdt.base + (uint64_t)(selector >> 3) * 8 + 5] =
-        (uint8_t)((access & ~0x0fu) | 0x0bu);
+    /* Mark the descriptor busy in its table (locked RMW on hardware). */
+    (void)exc_desc_set_access(cpu, selector,
+                              (uint8_t)((access & ~0x0fu) | 0x0bu));
 
     cpu->tr.selector = selector;
     cpu->tr.base = base;
@@ -355,6 +445,28 @@ uint32_t wemu_cpu_tr_limit(const WemuCpu *cpu) {
 #define TSS_TASK_RSP_OFF   0x38u
 #define TSS_TASK_FL_OFF    0x40u
 #define TSS_TASK_MIN_LIMIT (TSS_TASK_FL_OFF + 8u) /* 0x48 */
+/* WEMU TSS extension: full GPR snapshot (RAX..R15, 8 bytes each). */
+#define TSS_TASK_GPR_BASE  0x48u
+#define TSS_TASK_GPR_END   0xc8u   /* 0x48 + 16*8 */
+
+/* The GPR area is only present when the TSS limit covers it.  A TSS with
+ * the legacy 0x48..0xC7 limit keeps the old CS/SS/RIP/RSP/RFLAGS-only
+ * behaviour, so existing tasks/guests are untouched. */
+static int exc_tss_has_gprs(uint32_t limit) { return limit >= TSS_TASK_GPR_END; }
+
+static void exc_tss_save_gprs(const WemuCpu *cpu, uint64_t base) {
+    for (unsigned i = 0; i < 16; i++)
+        memcpy(cpu->ram + base + TSS_TASK_GPR_BASE + i * 8, &cpu->r[i], 8);
+}
+
+static void exc_tss_load_gprs(WemuCpu *cpu, uint64_t base, uint32_t limit) {
+    if (!exc_tss_has_gprs(limit)) return;
+    for (unsigned i = 0; i < 16; i++) {
+        /* RSP is architectural state reloaded from +0x38, not the snapshot. */
+        if (i == 4) continue;
+        memcpy(&cpu->r[i], cpu->ram + base + TSS_TASK_GPR_BASE + i * 8, 8);
+    }
+}
 
 /* Parse base/limit/access from an already-bounded 16-byte TSS descriptor. */
 static void exc_tss_parse(const uint8_t d[16], uint64_t *base,
@@ -374,9 +486,9 @@ static int exc_tss_bounded(const WemuCpu *cpu, uint64_t base, uint32_t limit) {
            (uint64_t)limit <= cpu->ram_size - base;
 }
 
-/* Peek just the system-descriptor type (access low nibble) of a GDT selector
- * using the SAME bounded GDT owner.  0 with *type on a readable descriptor,
- * -1 when null / LDT / outside the table. */
+/* Peek just the system-descriptor type (access low nibble) of a selector
+ * using the SAME bounded table owner (GDT/LDT by TI).  0 with *type on a
+ * readable descriptor, -1 when null / table unloaded / outside the table. */
 static int exc_gdt_type(const WemuCpu *cpu, uint16_t sel, uint8_t *type) {
     uint8_t access;
     if (exc_gdt_access(cpu, sel, &access) != 0) return -1;
@@ -389,8 +501,10 @@ int wemu_cpu_task_switch(WemuCpu *cpu, uint16_t selector, uint64_t return_rip,
     if (!cpu) return -1;
     uint64_t sel_err = (uint64_t)(selector & 0xFFFCu);
 
-    /* Null / LDT / no GDT: #GP with a selector error code. */
-    if (!cpu->gdt.configured || sel_err == 0 || (selector & 0x4u)) {
+    /* Null selector: #GP with a selector error code.  A missing table
+     * (GDT for TI=0, unloaded LDTR for TI=1) is rejected by the bounded
+     * descriptor read below with the same #GP(selector). */
+    if (sel_err == 0) {
         cpu->fault = 13; cpu->fault_error = sel_err; return -1;
     }
     uint8_t d[16];
@@ -417,7 +531,7 @@ int wemu_cpu_task_switch(WemuCpu *cpu, uint16_t selector, uint64_t return_rip,
         }
         tss_sel = (uint16_t)d[2] | ((uint16_t)d[3] << 8);
         tss_err = (uint64_t)(tss_sel & 0xFFFCu);
-        if (tss_err == 0 || (tss_sel & 0x4u) ||
+        if (tss_err == 0 ||
             exc_gdt_tss_desc(cpu, tss_sel, d) != 0) {
             cpu->fault = 13; cpu->fault_error = tss_err; return -1;
         }
@@ -477,19 +591,21 @@ int wemu_cpu_task_switch(WemuCpu *cpu, uint16_t selector, uint64_t return_rip,
     memcpy(cpu->ram + ob + TSS_TASK_RIP_OFF, &return_rip, 8);
     memcpy(cpu->ram + ob + TSS_TASK_RSP_OFF, &old_rsp,   8);
     memcpy(cpu->ram + ob + TSS_TASK_FL_OFF,  &old_fl,    8);
+    if (exc_tss_has_gprs(cpu->tr.limit)) exc_tss_save_gprs(cpu, ob);
 
     /* Back-link of the NEW task = selector of the OLD task (SDM). */
     memcpy(cpu->ram + base + TSS_BACKLINK_OFF, &old_sel, 2);
 
-    /* Mark the new descriptor busy in guest GDT memory (locked RMW on HW). */
-    cpu->ram[cpu->gdt.base + (uint64_t)(tss_sel >> 3) * 8 + 5] =
-        (uint8_t)((access & ~0x0fu) | 0x0bu);
+    /* Mark the new descriptor busy in its table (locked RMW on HW). */
+    (void)exc_desc_set_access(cpu, tss_sel,
+                              (uint8_t)((access & ~0x0fu) | 0x0bu));
 
     /* Load the entering task's state from its TSS image. */
     uint64_t n_rip, n_rsp, n_fl;
     memcpy(&n_rip, cpu->ram + base + TSS_TASK_RIP_OFF, 8);
     memcpy(&n_rsp, cpu->ram + base + TSS_TASK_RSP_OFF, 8);
     memcpy(&n_fl,  cpu->ram + base + TSS_TASK_FL_OFF,  8);
+    exc_tss_load_gprs(cpu, base, limit);
     cpu->rip = n_rip;
     cpu->r[4] = n_rsp;
     if (n_fl) cpu->rflags = n_fl | 2ull;
@@ -512,7 +628,7 @@ int wemu_cpu_task_return(WemuCpu *cpu) {
     uint16_t back;
     memcpy(&back, cpu->ram + cpu->tr.base + TSS_BACKLINK_OFF, 2);
     uint64_t back_err = (uint64_t)(back & 0xFFFCu);
-    if (!cpu->gdt.configured || back_err == 0 || (back & 0x4u)) {
+    if (back_err == 0) {
         cpu->fault = 10; cpu->fault_error = back_err; return -1; /* #TS */
     }
     uint8_t d[16];
@@ -533,6 +649,7 @@ int wemu_cpu_task_return(WemuCpu *cpu) {
     memcpy(&rip, cpu->ram + base + TSS_TASK_RIP_OFF, 8);
     memcpy(&rsp, cpu->ram + base + TSS_TASK_RSP_OFF, 8);
     memcpy(&fl,  cpu->ram + base + TSS_TASK_FL_OFF,  8);
+    exc_tss_load_gprs(cpu, base, limit);
     cpu->rip = rip;
     cpu->r[4] = rsp;
     cpu->rflags = fl | 2ull;
@@ -544,15 +661,18 @@ int wemu_cpu_task_return(WemuCpu *cpu) {
      * follows B's back-link to A.  rflags was just reloaded from fl above. */
     cpu->task_nested = (fl & WF_NT) ? 1 : 0;
 
-    /* The task we are leaving is no longer active: mark its TSS available. */
+    /* The task we are leaving is no longer active: mark its TSS available
+     * in whichever table (GDT/LDT by TI) holds its descriptor. */
     uint16_t cur = cpu->tr.selector;
-    uint64_t coff = cpu->gdt.base + (uint64_t)(cur >> 3) * 8 + 5;
-    if ((cur & 0xFFFCu) && !(cur & 0x4u) &&
-        (uint64_t)((cur >> 3) * 8 + 5) <= cpu->gdt.limit &&
-        coff < cpu->ram_size) {
-        uint8_t a = cpu->ram[coff];
-        if ((a & 0x0fu) == 0x0bu)
-            cpu->ram[coff] = (uint8_t)((a & ~0x0fu) | 0x09u);
+    if (cur & 0xFFFCu) {
+        uint64_t tbase; uint32_t tlimit;
+        if (exc_desc_table(cpu, cur, &tbase, &tlimit) == 0 &&
+            (uint64_t)((cur >> 3) * 8 + 5) <= tlimit) {
+            uint8_t a = cpu->ram[tbase + (uint64_t)(cur >> 3) * 8 + 5];
+            if ((a & 0x0fu) == 0x0bu)
+                (void)exc_desc_set_access(cpu, cur,
+                                          (uint8_t)((a & ~0x0fu) | 0x09u));
+        }
     }
     cpu->tr.selector = back; cpu->tr.base = base; cpu->tr.limit = limit;
     cpu->tr.busy = 1;
@@ -566,17 +686,18 @@ unsigned wemu_cpu_task_switches(const WemuCpu *cpu) {
     return cpu ? cpu->task_switches : 0;
 }
 
-/* ---- Bounded 64-bit GDT call gate (S=0, type 0xC) ----------------------
+/* ---- Bounded 64-bit GDT/LDT call gate (S=0, type 0xC) -------------------
  * A far CALL through a call-gate selector reads target code:offset from the
- * 16-byte gate and performs a SAME-LEVEL far call: push the return far
- * pointer (CS at the higher address, RIP at the top) on the guest stack and
- * transfer to code:offset.  Bounded by the GDT limit and guest RAM.  A
- * privilege-changing call gate would need a TSS stack switch and is not
- * modelled here. */
+ * 16-byte gate.  A same-level gate pushes the 16-byte return far pointer on
+ * the current stack.  A privilege-changing gate performs the architectural
+ * TSS stack switch: old SS:RSP, copied parameters and return CS:RIP are
+ * written on the new stack, and CS/SS/CPL are reloaded from the gate/TSS.
+ * All descriptor reads go through the TI-aware table owner; all stack writes
+ * go through the memory owner and are bounded to guest RAM. */
 int wemu_cpu_call_gate(WemuCpu *cpu, uint16_t selector, uint64_t return_rip) {
     if (!cpu) return -1;
     uint64_t err = (uint64_t)(selector & 0xFFFCu);
-    if (!cpu->gdt.configured || err == 0 || (selector & 0x4u)) {
+    if (err == 0) {
         cpu->fault = 13; cpu->fault_error = err; return -1;
     }
     uint8_t d[16];
@@ -604,25 +725,78 @@ int wemu_cpu_call_gate(WemuCpu *cpu, uint16_t selector, uint64_t return_rip) {
                    ((uint64_t)d[6] << 16) | ((uint64_t)d[7] << 24) |
                    ((uint64_t)d[8] << 32) | ((uint64_t)d[9] << 40) |
                    ((uint64_t)d[10] << 48) | ((uint64_t)d[11] << 56);
-    /* Target code segment must be a present code descriptor in the GDT. */
+    /* Parameter count: gate byte 4, low 5 bits (64-bit words on a switch). */
+    unsigned param_count = (unsigned)(d[4] & 0x1fu);
+    /* Target code segment must be a present code descriptor in its table. */
     uint8_t cs_acc;
     if ((cs & 0xFFFCu) == 0 || exc_gdt_access(cpu, cs, &cs_acc) != 0 ||
         !(cs_acc & 0x80u) || !(cs_acc & 0x10u) || !(cs_acc & 0x08u)) {
         cpu->fault = 13; cpu->fault_error = err; return -1; /* #GP(gate) */
     }
     int target = (int)(cs & 3u);
-    if (target != cpu->cpl) {
-        /* Privilege-changing call gate: beyond this bounded model. */
+    /* A non-conforming target code selector's RPL is the new CPL and must
+     * equal its DPL (SDM); bit 2 (0x4) is the conforming bit, bit 3 (0x8)
+     * is the code/data indicator in this bounded descriptor model. */
+    if ((cs_acc & 0x04u) == 0 &&
+        target != (int)((cs_acc >> 5) & 3u)) {
         cpu->fault = 13; cpu->fault_error = err; return -1; /* #GP(gate) */
     }
-    uint64_t sp = cpu->r[4], ret_cs = cpu->cs_selector;
-    if (wemu_gpa_write(cpu, sp - 8, &ret_cs, 8) != 0 ||
-        wemu_gpa_write(cpu, sp - 16, &return_rip, 8) != 0) {
-        cpu->fault = 12; cpu->fault_error = 0; return -1; /* #SS */
+    if (target == cpu->cpl) {
+        /* Same-level far call: 16-byte return far pointer, no TSS switch. */
+        uint64_t sp = cpu->r[4], ret_cs = cpu->cs_selector;
+        if (wemu_gpa_write(cpu, sp - 8, &ret_cs, 8) != 0 ||
+            wemu_gpa_write(cpu, sp - 16, &return_rip, 8) != 0) {
+            cpu->fault = 12; cpu->fault_error = 0; return -1; /* #SS */
+        }
+        cpu->r[4] = sp - 16;
+        cpu->rip = off;
+        cpu->cs_selector = cs; cpu->cs_rpl = target;
+        cpu->fault = 0; cpu->fault_error = 0;
+        return 0;
     }
-    cpu->r[4] = sp - 16;
+
+    /* ---- Privilege change: TSS stack switch --------------------------- */
+    uint16_t ss = cpu->tss_ss[target];
+    uint64_t ss_err = (uint64_t)(ss & 0xFFFCu);
+    if (ss_err == 0 || (ss & 3u) != (unsigned)target) {
+        cpu->fault = 10; cpu->fault_error = ss_err; return -1; /* #TS(ss) */
+    }
+    uint8_t ss_acc;
+    if (exc_gdt_access(cpu, ss, &ss_acc) != 0 ||
+        !(ss_acc & 0x80u) || !(ss_acc & 0x10u) || !(ss_acc & 0x02u)) {
+        cpu->fault = 10; cpu->fault_error = ss_err; return -1; /* #TS(ss) */
+    }
+    uint64_t new_rsp = cpu->tss_rsp[target];
+    int from_tss = cpu->tr.loaded && target >= 0 && target <= 2;
+    if (!from_tss && new_rsp == 0) {
+        cpu->fault = 10; cpu->fault_error = ss_err; return -1; /* #TS(ss) */
+    }
+    uint64_t old_rsp = cpu->r[4], old_ss = cpu->ss_selector;
+    uint64_t ret_cs = cpu->cs_selector;
+    uint64_t final_rsp = new_rsp - 32ull - 8ull * param_count;
+    /* Old SS:RSP at the top of the new frame (SDM: 8-byte slots in 64-bit). */
+    if (wemu_gpa_write(cpu, new_rsp - 8, &old_ss, 8) != 0 ||
+        wemu_gpa_write(cpu, new_rsp - 16, &old_rsp, 8) != 0) {
+        cpu->fault = 12; cpu->fault_error = ss_err; return -1; /* #SS */
+    }
+    /* Copy 'param_count' parameters from the caller stack to the new stack,
+     * preserving cdecl order: param[0] ends up nearest the return address. */
+    for (unsigned i = 0; i < param_count; i++) {
+        uint64_t p;
+        if (wemu_gpa_read(cpu, old_rsp + 8ull * i, &p, 8) != 0 ||
+            wemu_gpa_write(cpu, final_rsp + 16 + 8ull * i, &p, 8) != 0) {
+            cpu->fault = 12; cpu->fault_error = ss_err; return -1; /* #SS */
+        }
+    }
+    /* Return CS:RIP last, so RSP lands on the return RIP. */
+    if (wemu_gpa_write(cpu, final_rsp + 8, &ret_cs, 8) != 0 ||
+        wemu_gpa_write(cpu, final_rsp, &return_rip, 8) != 0) {
+        cpu->fault = 12; cpu->fault_error = ss_err; return -1; /* #SS */
+    }
+    cpu->r[4] = final_rsp;
     cpu->rip = off;
     cpu->cs_selector = cs; cpu->cs_rpl = target;
+    cpu->ss_selector = ss; cpu->cpl = target;
     cpu->fault = 0; cpu->fault_error = 0;
     return 0;
 }
