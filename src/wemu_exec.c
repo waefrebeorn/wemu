@@ -328,6 +328,13 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
         return 0;
     }
 
+    /* IRET (0xCF): pop the interrupt frame.  wemu_iret restores RIP
+     * itself (it is the saved return address), so no RIP advance here. */
+    if (!in->vex_len && full == 0xCF) {
+        if (wemu_iret(c) != 0) return -1;
+        return 0;
+    }
+
     /* SSE/AVX maps and legacy SSE opcodes go to the vector leaf;
      * unhandled two-byte ops fall through to the integer switch below
      * (cmovcc/setcc/movzx/imul/bswap live there). VEX must be handled. */

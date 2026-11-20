@@ -171,7 +171,8 @@ static void test_if_clearing(void) {
                    (unsigned long long)fl, (unsigned long long)saved);
         }
         CHECK(frame_qword(c, sp, 0) == CODE + 1, "saved RIP after STI");
-        CHECK(sp == STACK - 5 * 8, "no error code: 5 qword frame");
+        /* Same-level software INT: architectural 3-qword frame. */
+        CHECK(sp == STACK - 3 * 8, "same-level INT: 3-qword frame");
         wemu_cpu_destroy(c);
     }
 }

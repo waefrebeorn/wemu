@@ -100,6 +100,10 @@ int wemu_decode(WemuCpu *cpu, WemuInsn *in);
 /* execute a decoded instruction; returns 0 ok, -1 fault */
 int wemu_exec(WemuCpu *cpu, const WemuInsn *in);
 
+/* IRET (0xCF): pop an interrupt frame, restoring RIP/CS/RFLAGS and, on a
+ * privilege return, RSP/SS/CPL (wemu_exception.c). */
+int wemu_iret(WemuCpu *cpu);
+
 /* SSE/AVX leaf: returns 1 if it handled the opcode, 0 if not, -1 fault */
 int wemu_exec_sse(WemuCpu *cpu, const WemuInsn *in);
 

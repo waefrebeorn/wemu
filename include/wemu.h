@@ -333,6 +333,28 @@ uint16_t wemu_cpu_ss(const WemuCpu *cpu);
 void    wemu_cpu_tss_set_rsp(WemuCpu *cpu, int cpl, uint64_t rsp);
 uint64_t wemu_cpu_tss_rsp(const WemuCpu *cpu, int cpl);
 
+/* ---- IRET (0xCF) + architectural same-level frames + exception CPL ----
+ * Three gaps closed here:
+ *  (1) 0xCF is EXECUTED by wemu_exec.  IRET pops RIP, CS and RFLAGS and,
+ *      when the popped CS.RPL differs from the running CPL, also RSP and
+ *      SS — restoring the pre-interrupt CPL/RIP/RSP.  The frame's CS is the
+ *      interrupted procedure's selector (RPL = old CPL), so a ring-3 INT
+ *      followed by IRET in the ring-0 handler returns exactly to ring 3.
+ *  (2) A same-level SOFTWARE INT now pushes the architectural 3-qword
+ *      frame (RIP, CS, RFLAGS [+ error]) instead of the legacy 5-qword
+ *      one; a privilege switch keeps the 5-qword frame with old SS/RSP.
+ *  (3) Host/fault-raised exceptions now use the SAME CPL-switch path as
+ *      software INTs: when the gate's code descriptor in the bounded GDT
+ *      has a DPL different from the current CPL, the stack switch, CS/SS
+ *      reload and CPL update happen exactly as for INT n.  Descriptor-less
+ *      guests and same-level exceptions keep their legacy frame layout.
+ * An error code sits below the popped frame; as on hardware the handler
+ * must adjust RSP past it before IRET. */
+#define WEMU_HAS_IRET 1
+
+/* Host-callable form of the same primitive the 0xCF opcode executes. */
+int wemu_cpu_iret(WemuCpu *cpu);
+
 /* Machine: CPU + COM1 serial. Output bytes go to the callback. */
 typedef void (*WemuSerialFn)(uint8_t byte, void *ud);
 WemuMachine *wemu_machine_create(uint64_t ram_size, WemuSerialFn out, void *ud);

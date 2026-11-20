@@ -123,6 +123,12 @@ static void expect_swint_fault(SegSetup setup, unsigned want_vec,
     CHECK(wemu_cpu_fault(c) == (int)want_vec, "generated fault vector");
     CHECK(wemu_cpu_fault_error(c) == want_err, "generated fault error code");
     CHECK(wemu_cpu_rip(c) == CODE, "no handler transfer on segment fault");
+    /* The latched #TS/#SS is delivered as an EXCEPTION through a ring-0
+     * gate.  From CPL 3 that now takes the same CPL-switch path as INT n,
+     * so arm a valid ring-0 stack at THIS step; the earlier INT still saw
+     * the deliberately broken TSS/SS state it was meant to fault on. */
+    set_desc(c, SS_SEL, ACC_RW);
+    wemu_cpu_tss_set_ss(c, 0, SS_SEL);
     CHECK(wemu_cpu_step(c) == 1, "latched fault delivered to its handler");
     CHECK(wemu_cpu_exception_vector(c) == want_vec, "delivered vector matches");
     CHECK(wemu_cpu_exception_error(c) == want_err, "delivered error matches");

@@ -309,18 +309,21 @@ static int exc_deliver(WemuCpu *cpu, unsigned vector, int software) {
             }
             return -1;
         }
-        /* Software INT: the architectural target CPL is the DPL of the
-         * gate's code descriptor in the SAME bounded GDT.  The segment
+        /* The architectural target CPL is the DPL of the gate's code
+         * descriptor in the SAME bounded GDT.  This applies to a software
+         * INT AND to an exception whose gate targets a different ring —
+         * both take the identical stack/CPL switch path below.  Segment
          * checks run only for a privilege change; on failure they have
-         * already latched #TS/#SS/#NP for the caller. */
-        if (software && cpu->gdt.configured) {
-            /* Normally the target is the gate code segment's DPL.  If its
-             * descriptor is outside the GDT, fall back to the legacy
-             * requested target so the segment check below latches #NP with
-             * the selector error code (no silent rejection). */
+         * already latched #TS/#SS/#NP for the caller.  With no GDT there
+         * is no descriptor to derive a target from, so both paths keep the
+         * current CPL (the legacy descriptor-less behaviour). */
+        if (cpu->gdt.configured) {
             int derived;
             if (exc_target_cpl(cpu, &t, &derived) == 0) target = derived;
-            else target = cpu->int_target_cpl;
+            /* A software INT with an out-of-GDT selector falls back to the
+             * legacy requested target so the segment check latches #NP;
+             * an exception has no such request and simply does not switch. */
+            else target = software ? cpu->int_target_cpl : cpu->cpl;
             if (exc_int_segment_check(cpu, &t, target) != 0) return -1;
             priv_switch = (target != cpu->cpl);
         }
@@ -349,12 +352,15 @@ static int exc_deliver(WemuCpu *cpu, unsigned vector, int software) {
     }
     uint64_t error    = cpu->fault_error;
     uint64_t saved_fl = cpu->rflags;    /* flags as seen before delivery */
-    /* Selectors on the frame.  A privilege switch saves the OLD SS and
-     * reloads CS from the gate and SS from the TSS; a same-level INT keeps
-     * the legacy frame values (SS=0, CS=current CS = 0x28 at reset). */
+    /* x86-64 frame CS is the selector of the INTERRUPTED procedure: its
+     * RPL is the pre-interrupt CPL, which is exactly what IRET consults to
+     * decide whether the frame carries an old RSP/SS.  A privilege switch
+     * reloads the LIVE CS from the gate and the LIVE SS from the TSS
+     * below, but the frame keeps the old CS/SS.  Same-level deliveries
+     * keep the legacy convention (SS slot 0, CS = current CS = 0x28 at
+     * reset). */
     uint64_t saved_ss = priv_switch ? (uint64_t)cpu->ss_selector : 0ull;
-    uint64_t saved_cs = priv_switch ? (uint64_t)t.selector
-                                   : (uint64_t)cpu->cs_selector;
+    uint64_t saved_cs = (uint64_t)cpu->cs_selector;
 
     /* Push the saved RFLAGS BEFORE clearing IF: an interrupt gate clears
      * IF for the handler, but the flag saved on the stack retains it.
@@ -371,10 +377,17 @@ static int exc_deliver(WemuCpu *cpu, unsigned vector, int software) {
             push_err = cpu->fault_error;                                      \
         }                                                                     \
     } while (0)
-    EXC_PUSH(saved_ss);   /* SS: old SS on a switch, 0 for same-level */
-    EXC_PUSH(old_rsp);    /* old RSP (pre-switch) */
+    /* A same-level SOFTWARE INT uses the architectural 3-qword frame
+     * (RIP, CS, RFLAGS [+ error]): no old SS/RSP are pushed when CPL does
+     * not change.  A privilege switch (INT or exception) and the legacy
+     * exception path push the full 5-qword frame with the old SS/RSP. */
+    int push_ss_rsp = priv_switch || !software;
+    if (push_ss_rsp) {
+        EXC_PUSH(saved_ss);   /* SS: old SS on a switch, 0 for same-level */
+        EXC_PUSH(old_rsp);    /* old RSP (pre-switch) */
+    }
     EXC_PUSH(saved_fl);       /* RFLAGS */
-    EXC_PUSH(saved_cs);       /* CS: gate selector on a switch */
+    EXC_PUSH(saved_cs);       /* CS: interrupted procedure's selector */
     EXC_PUSH(fault_rip);      /* RIP */
     if (exc_has_error_code(vector))
         EXC_PUSH(error);      /* error code (#PF etc.) */
@@ -413,6 +426,60 @@ int wemu_cpu_deliver_exception(WemuCpu *cpu, unsigned vector) {
 int wemu_cpu_deliver_int(WemuCpu *cpu, unsigned vector) {
     return exc_deliver(cpu, vector, 1); /* INT n: CPL<=DPL is enforced */
 }
+
+/* ---- IRET (0xCF) -----------------------------------------------------
+ * Return from an interrupt/exception frame.  Long mode pops RIP, CS and
+ * RFLAGS; when the popped CS.RPL differs from the current CPL the frame
+ * also carries the old RSP and SS, which are restored together with CPL.
+ * The frame's CS is the interrupted procedure's selector (RPL = old CPL),
+ * so a ring-3 -> ring-0 INT followed by IRET in the handler lands exactly
+ * back on ring 3 with the original RIP/RSP/SS/RFLAGS.  Frame reads go
+ * through the memory owner; a short stack faults as #SS.  An error code,
+ * when the original event pushed one, sits BELOW the 3/5-qword frame: the
+ * handler is responsible for adjusting RSP before IRET (as on hardware). */
+int wemu_iret(WemuCpu *cpu) {
+    if (!cpu) return -1;
+    uint64_t sp = cpu->r[4];
+    uint64_t rip = 0, cs = 0, fl = 0, rsp = 0, ss = 0;
+    if (wemu_gpa_read(cpu, sp, &rip, 8) != 0 ||
+        wemu_gpa_read(cpu, sp + 8, &cs, 8) != 0 ||
+        wemu_gpa_read(cpu, sp + 16, &fl, 8) != 0) {
+        cpu->fault = 12; /* #SS: stack fault reading the IRET frame */
+        cpu->fault_error = 0;
+        return -1;
+    }
+    int target_cpl = (int)(cs & 3u);
+    int priv_return = (target_cpl != cpu->cpl);
+    if (priv_return && target_cpl > cpu->cpl) {
+        /* Return to a less-privileged level: restore old RSP and SS. */
+        if (wemu_gpa_read(cpu, sp + 24, &rsp, 8) != 0 ||
+            wemu_gpa_read(cpu, sp + 32, &ss, 8) != 0) {
+            cpu->fault = 12;
+            cpu->fault_error = 0;
+            return -1;
+        }
+    } else if (priv_return) {
+        /* IRET may not return to a more privileged level. */
+        cpu->fault = 13; /* #GP */
+        cpu->fault_error = 0;
+        return -1;
+    }
+    /* Commit architectural state only after every frame read succeeded. */
+    cpu->rip = rip;
+    cpu->cs_selector = (uint16_t)cs;
+    cpu->cs_rpl = target_cpl;
+    cpu->rflags = fl | 2ull;   /* EFLAGS bit 1 is reserved, always set */
+    if (priv_return) {
+        cpu->cpl = target_cpl;
+        cpu->ss_selector = (uint16_t)ss;
+        cpu->r[4] = rsp;
+    } else {
+        cpu->r[4] = sp + 24;   /* same-level: 3-qword frame consumed */
+    }
+    return 0;
+}
+
+int wemu_cpu_iret(WemuCpu *cpu) { return wemu_iret(cpu); }
 
 /* Host-side raise (VSL mprotect write hook, device, external event).
  * Latch for delivery at the next step boundary so RIP/stack state is

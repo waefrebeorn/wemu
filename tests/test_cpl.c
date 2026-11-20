@@ -122,7 +122,7 @@ static void test_privilege_switch(void) {
     uint64_t sp = wemu_cpu_reg(c, 4);
     CHECK(sp == R0_RSP0 - 5 * 8, "RSP0 load: 5-qword switch frame");
     CHECK(frame_qword(c, sp, 0) == CODE + 3, "saved RIP = instruction AFTER INT");
-    CHECK(frame_qword(c, sp, 1) == KCS, "frame CS = gate selector");
+    CHECK(frame_qword(c, sp, 1) == UCS, "frame CS = interrupted (ring-3) CS");
     CHECK((frame_qword(c, sp, 2) & 0x200u) != 0, "saved RFLAGS retains IF");
     CHECK(frame_qword(c, sp, 3) == U_RSP, "frame old RSP = ring-3 RSP");
     CHECK(frame_qword(c, sp, 4) == USS, "frame old SS = ring-3 SS");
@@ -154,11 +154,10 @@ static void test_same_level(void) {
     CHECK(wemu_cpu_cpl(c) == 0, "CPL stays 0 (no transition)");
     CHECK(wemu_cpu_cs(c) == KCS, "CS unchanged at same level");
     uint64_t sp = wemu_cpu_reg(c, 4);
-    CHECK(sp == U_RSP - 5 * 8, "same-level: no RSP0 load");
+    CHECK(sp == U_RSP - 3 * 8, "same-level: architectural 3-qword frame");
     CHECK(frame_qword(c, sp, 0) == CODE + 2, "saved RIP = after INT");
     CHECK(frame_qword(c, sp, 1) == KCS, "frame CS = current CS");
-    CHECK(frame_qword(c, sp, 3) == U_RSP, "frame old RSP preserved");
-    CHECK(frame_qword(c, sp, 4) == 0, "same-level frame SS slot = 0");
+    CHECK(frame_qword(c, sp, 2) == 2, "frame RFLAGS slot (no SS/RSP pushed)");
     printf("same_level: cpl=%d vec=%u rsp=0x%llx rip=0x%llx\n",
            wemu_cpu_cpl(c), wemu_cpu_exception_vector(c),
            (unsigned long long)sp, (unsigned long long)frame_qword(c, sp, 0));
@@ -174,6 +173,11 @@ static void test_rejected_int(void) {
     wemu_cpu_set_rsp(c, U_RSP);
     wemu_cpu_set_cpl(c, 3);
     wemu_cpu_set_cs(c, UCS);
+    wemu_cpu_set_ss(c, USS);
+    /* The rejected INT's secondary #GP gate targets ring 0; the exception
+     * now takes the same CPL-switch path, so arm TSS SS[0]/RSP0. */
+    wemu_cpu_tss_set_ss(c, 0, KSS);
+    wemu_cpu_tss_set_rsp(c, 0, R0_RSP0);
 
     CHECK(wemu_cpu_step(c) == 1, "rejected INT delivers #GP to guest");
     CHECK(wemu_cpu_exception_vector(c) == 13, "guest INT violation -> #GP");
