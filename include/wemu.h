@@ -237,6 +237,27 @@ int  wemu_cpu_cs_rpl(const WemuCpu *cpu);
 void wemu_cpu_set_ist(WemuCpu *cpu, unsigned index, uint64_t base);
 uint64_t wemu_cpu_ist(const WemuCpu *cpu, unsigned index);
 
+/* ---- #GP/#SS/#NP delivery + double-fault (#DF) latching ---------------
+ * Vectors 13 (#GP), 12 (#SS) and 11 (#NP) are delivered like #PF: they
+ * push an error code and transfer to the gate offset.  #GP from a
+ * non-canonical linear address carries error code 0 (SDM); #SS/#NP carry
+ * the code supplied by their origin (a selector, or an IDT code for a
+ * not-present gate).
+ *
+ * When an exception's own delivery faults (bad IDT gate: #NP for P=0, #GP
+ * for an invalid type or an out-of-limit index) that secondary fault is a
+ * #DF contributor.  WEMU now records the #DF condition and, when a usable
+ * #DF gate is installed, delivers vector 8 with error code 0.  With no #DF
+ * handler the legacy secondary latch is preserved, so existing guests see
+ * the same wemu_cpu_fault() value as before.  A fault while delivering #DF
+ * is a triple fault: the condition is recorded but never recursed. */
+#define WEMU_HAS_FAULT_DELIVERY 1
+
+unsigned wemu_cpu_double_faults(const WemuCpu *cpu);          /* count */
+int      wemu_cpu_double_fault_latched(const WemuCpu *cpu);   /* sticky bit */
+unsigned wemu_cpu_double_fault_source(const WemuCpu *cpu);    /* #NP/#GP */
+uint64_t wemu_cpu_double_fault_source_error(const WemuCpu *cpu);
+
 /* Machine: CPU + COM1 serial. Output bytes go to the callback. */
 typedef void (*WemuSerialFn)(uint8_t byte, void *ud);
 WemuMachine *wemu_machine_create(uint64_t ram_size, WemuSerialFn out, void *ud);

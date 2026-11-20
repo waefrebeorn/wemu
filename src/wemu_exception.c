@@ -143,6 +143,29 @@ int wemu_cpu_exception_handler(const WemuCpu *cpu, unsigned vector,
     return 0;
 }
 
+/* A usable #DF handler exists when a loaded IDT has a present long-mode
+ * gate for vector 8, or (legacy path) a registered handler for it.  Used
+ * to decide whether a double-fault condition can actually be delivered. */
+static int exc_has_df_handler(const WemuCpu *cpu) {
+    if (!cpu) return 0;
+    if (cpu->idtr.configured) {
+        WemuIdtGate g;
+        if (exc_idt_gate_read(cpu, 8, &g) != 0) return 0;
+        return g.present && (g.type == 0xE || g.type == 0xF);
+    }
+    return cpu->idt[8].present;
+}
+
+/* Record a double-fault condition.  The secondary vector (#NP for a
+ * not-present gate, #GP for a bad gate type / out-of-limit index) and its
+ * error code stay observable even when #DF itself cannot be delivered. */
+static void exc_latch_df(WemuCpu *cpu, unsigned src, uint64_t src_error) {
+    cpu->df_count++;
+    cpu->df_latched = 1;
+    cpu->df_src_vector = (uint8_t)src;
+    cpu->df_src_error = src_error;
+}
+
 /* Real delivery.  Called from wemu_cpu_step at the fault boundary (and
  * available to a host bridge).  Returns 0 when the guest was transferred
  * to a handler, -1 when no handler is registered / the gate was rejected
@@ -152,7 +175,28 @@ static int exc_deliver(WemuCpu *cpu, unsigned vector, int software) {
     ExcTarget t;
     if (cpu->idtr.configured) {
         /* Architectural path: parse and validate the gate from guest RAM. */
-        if (exc_idt_check(cpu, vector, &t, software) != 0) return -1;
+        if (exc_idt_check(cpu, vector, &t, software) != 0) {
+            if (!software) {
+                /* SDM: a fault raised while delivering an exception is a
+                 * double-fault condition (#NP/#GP are #DF contributors).
+                 * Record it.  When a usable #DF gate exists, replace the
+                 * secondary #GP/#NP with #DF and transfer control to the
+                 * #DF handler (error code 0, per SDM).  Without one, keep
+                 * the legacy secondary latch so existing guests that read
+                 * wemu_cpu_fault() observe the same value as before.  A
+                 * fault while delivering #DF itself is a triple fault:
+                 * latch #DF but never recurse. */
+                unsigned src = (unsigned)cpu->fault;
+                uint64_t src_err = cpu->fault_error;
+                exc_latch_df(cpu, src, src_err);
+                if (vector != 8 && exc_has_df_handler(cpu)) {
+                    cpu->fault = 8;
+                    cpu->fault_error = 0;
+                    return exc_deliver(cpu, 8, 0);
+                }
+            }
+            return -1;
+        }
     } else {
         /* Legacy registered-RIP path (WEMU_HAS_EXCEPTION_DELIVERY).
          * No descriptor: no IST, trap-gate semantics (IF preserved). */
@@ -219,4 +263,18 @@ uint64_t wemu_cpu_exception_error(const WemuCpu *cpu) {
 }
 uint64_t wemu_cpu_exception_cr2(const WemuCpu *cpu) {
     return cpu ? cpu->exc_cr2 : 0;
+}
+
+/* ---- Double-fault observables ---------------------------------------- */
+unsigned wemu_cpu_double_faults(const WemuCpu *cpu) {
+    return cpu ? cpu->df_count : 0;
+}
+int wemu_cpu_double_fault_latched(const WemuCpu *cpu) {
+    return cpu && cpu->df_latched;
+}
+unsigned wemu_cpu_double_fault_source(const WemuCpu *cpu) {
+    return cpu ? cpu->df_src_vector : 0;
+}
+uint64_t wemu_cpu_double_fault_source_error(const WemuCpu *cpu) {
+    return cpu ? cpu->df_src_error : 0;
 }

@@ -37,6 +37,13 @@ struct WemuCpu {
     unsigned exc_vector;     /* last delivered vector (0 = none yet) */
     uint64_t exc_error;      /* last delivered error code */
     uint64_t exc_cr2;        /* CR2 captured at last #PF delivery */
+    /* double-fault bookkeeping (wemu_exception.c): a fault raised while
+     * delivering another exception is a #DF condition.  Sticky so a host
+     * or gate can observe it even when no #DF handler is installed. */
+    unsigned df_count;       /* number of #DF conditions latched */
+    uint8_t  df_latched;     /* 1 after the first #DF condition */
+    uint8_t  df_src_vector;  /* secondary vector that caused it (#NP/#GP) */
+    uint64_t df_src_error;   /* that secondary vector's error code */
     WemuSyscallFn sys_fn;
     void *sys_ud;
     /* optional observer modelling a competing hardware agent (LOCK atomics) */
