@@ -8,3 +8,4 @@ test_machine
 test_lock_atomics
 test_exceptions
 test_isa_atomic_fence
+/test_*
