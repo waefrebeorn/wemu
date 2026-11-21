@@ -38,13 +38,29 @@ int main(int argc, char **argv) {
         put("STAGE2:");
         for (int i = 2; i < argc; i++) { put(" ["); put(argv[i]); put("]"); }
         put("\n");
+        /* Env-gated fd census: reports how many fds the NEW image can see.
+         * The fexecve leak control compares this across plain-fd and CLOEXEC
+         * execs — the private internal dup must be closed before stage2 runs. */
+        if (getenv("WEMU_FD_CENSUS")) {
+            int n = 0;
+            for (int fd = 3; fd < 1024; fd++)
+                if (fcntl(fd, F_GETFD) != -1) n++;
+            char b[64];
+            snprintf(b, sizeof b, "FDCOUNT=%d\n", n);
+            put(b);
+        }
         return 42;
     }
 
     const char *path = argc >= 3 ? argv[2] : "tests/exec_chain";
     char *nargv[] = { (char *)path, (char *)"stage2", (char *)"alpha",
                       (char *)"beta (two)", NULL };
-    char *nenv[] = { (char *)"EXECTEST=1", NULL };
+    /* Propagate the optional fd-census marker across the (emulated) exec:
+     * stage1 sees it in the inherited env, stage2 reads it to report how many
+     * fds the NEW image can observe. */
+    char *nenv[] = { (char *)"EXECTEST=1",
+                     getenv("WEMU_FD_CENSUS") ? (char *)"WEMU_FD_CENSUS=1" : NULL,
+                     NULL };
 
     if (argc >= 2 && strcmp(argv[1], "flags") == 0) {
         /* AT_EMPTY_PATH is deliberately refused by the bounded model. */

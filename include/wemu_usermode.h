@@ -166,6 +166,20 @@ int wemu_um_set_thread_exec_enabled(int enabled);
  * behaviour.  Returns 0, or -1 for a value other than 0/1. */
 int wemu_um_set_fd_ofd_check_enabled(int enabled);
 
+/* Negative-control switch: when enabled, kcmp(KCMP_FILE) is treated as if the
+ * kernel did not provide it (-ENOSYS), forcing the bounded fail-closed
+ * dev/ino fallback.  kcmp is used by default.  Returns 0, or -1 for a value
+ * other than 0/1. */
+int wemu_um_set_fd_kcmp_forced_off(int forced_off);
+
+/* Negative-control switch: when enabled, the OLD path is reproduced — every
+ * admitted FD_CLOEXEC descriptor is refused (-EBADF, no replacement).  When
+ * disabled (default), a CLOEXEC admitted fd is honoured through a bounded
+ * internal dup (fexecve parity): the image is read from a private high fd that
+ * is closed before guest code resumes, so the dup never leaks into the guest.
+ * Returns 0, or -1 for a value other than 0/1. */
+int wemu_um_set_fd_cloexec_refuse(int refuse);
+
 /* 1 when the execveat(dirfd, flags) SHAPE is inside the bounded model:
  * AT_FDCWD + no flags (CWD-relative path), an fd >= 0 + no flags
  * (dirfd-relative path), or an fd >= 0 + AT_EMPTY_PATH (execute the fd

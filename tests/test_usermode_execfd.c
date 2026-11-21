@@ -13,6 +13,12 @@
  *    (guest-visible -EBADF, byte-exact vs host), an unsupported flag bit
  *    (-EINVAL, byte-exact vs host), and the AT_FDCWD+AT_EMPTY_PATH old form
  *    (-EINVAL) all leave the image intact (execs==0, denied>0).
+ * 5. fail-closed dev/ino fallback when kcmp is unavailable (forced off for the
+ *    gate): an unchanged admitted fd still execs byte-exact; a close+reopen
+ *    onto a different inode still refuses (wrong OFD).
+ * 6. bounded fexecve parity for FD_CLOEXEC admitted fds: NEW path honours the
+ *    internal dup (byte-exact, exit 42) and a guest fd census proves the dup
+ *    does not leak; the OLD all-refuse path is kept as a negative control.
  * License: WaefreBeorn Umbrella License v3.0. */
 #define _GNU_SOURCE
 #include "wemu_usermode.h"
@@ -212,8 +218,10 @@ static void test_fd_reuse(void) {
            (unsigned long long)r.denied);
 }
 
-/* O_CLOEXEC fd on fexecve: the host honours it (internal dup), WEMU's bounded
- * model refuses it (no internal-dup model) — fail closed, no replacement. */
+/* O_CLOEXEC fd on fexecve: the host honours it via an internal dup.  The NEW
+ * bounded path now does too (a private high fd, closed before guest code runs)
+ * — byte-exact vs host.  The fd_cloexec_refuse switch reproduces the OLD
+ * all-refuse path as a negative control (-EBADF, no replacement). */
 static void test_cloexec(void) {
     char a0[] = GUEST_BIN;
     char *av[] = { a0, (char *)"cloexec", (char *)GUEST_BIN, NULL };
@@ -224,26 +232,124 @@ static void test_cloexec(void) {
         memcmp(oracle.b, WANT, oracle.n) != 0)
         FAIL("cloexec: host oracle exit=%d out=[%s]\n", he, oracle.b);
 
+    /* Number-only OLD path still admits it (byte-exact). */
     if (wemu_um_set_fd_ofd_check_enabled(0) != 0)
         FAIL("cloexec: set_fd_ofd_check_enabled(0)\n");
     WemuUmResult oldr;
     int rc = wemu_um_run_elf(GUEST_BIN, av, GUEST_ENV, &oldr);
     if (rc != WEMU_UM_OK || oldr.exit_code != 42 || oldr.execs != 1 ||
         oldr.denied != 0 || strcmp(oldr.out, WANT) != 0)
-        FAIL("cloexec OLD path: status=%s exit=%d execs=%u out=[%s]\n",
+        FAIL("cloexec number-only path: status=%s exit=%d execs=%u out=[%s]\n",
              wemu_um_status_name(rc), oldr.exit_code, oldr.execs, oldr.out);
 
-    if (wemu_um_set_fd_ofd_check_enabled(1) != 0)
-        FAIL("cloexec: set_fd_ofd_check_enabled(1)\n");
+    /* NEW hardened path: OFD check on, fexecve internal-dup honoured. */
+    if (wemu_um_set_fd_ofd_check_enabled(1) != 0 ||
+        wemu_um_set_fd_cloexec_refuse(0) != 0)
+        FAIL("cloexec: enable hardened fexecve path\n");
     WemuUmResult r;
     rc = wemu_um_run_elf(GUEST_BIN, av, GUEST_ENV, &r);
-    if (rc != WEMU_UM_OK || r.exit_code != 18 || r.execs != 0 ||
-        r.denied == 0 || strcmp(r.out, "CLOEXEC-RC=-9\n") != 0)
-        FAIL("cloexec NEW path: status=%s exit=%d execs=%u denied=%llu out=[%s]\n",
-             wemu_um_status_name(rc), r.exit_code, r.execs,
+    if (rc != WEMU_UM_OK || r.exit_code != 42 || r.execs != 1 ||
+        r.denied != 0 || strcmp(r.out, WANT) != 0)
+        FAIL("cloexec NEW path: status=%s exit=%d execs=%u denied=%llu "
+             "out=[%s]\n", wemu_um_status_name(rc), r.exit_code, r.execs,
              (unsigned long long)r.denied, r.out);
-    printf("ok: NEGATIVE CONTROL O_CLOEXEC fd -> -EBADF, denied=%llu, "
-           "no replacement (OLD path byte-exact)\n", (unsigned long long)r.denied);
+    check_exact("cloexec", r.out, r.out_len, oracle.b, oracle.n);
+
+    /* NEGATIVE CONTROL: OLD all-refuse path reproduces the prior -EBADF. */
+    if (wemu_um_set_fd_cloexec_refuse(1) != 0)
+        FAIL("cloexec: set_fd_cloexec_refuse(1)\n");
+    WemuUmResult rejr;
+    rc = wemu_um_run_elf(GUEST_BIN, av, GUEST_ENV, &rejr);
+    if (rc != WEMU_UM_OK || rejr.exit_code != 18 || rejr.execs != 0 ||
+        rejr.denied == 0 || strcmp(rejr.out, "CLOEXEC-RC=-9\n") != 0)
+        FAIL("cloexec OLD all-refuse: status=%s exit=%d execs=%u denied=%llu "
+             "out=[%s]\n", wemu_um_status_name(rc), rejr.exit_code,
+             rejr.execs, (unsigned long long)rejr.denied, rejr.out);
+    if (wemu_um_set_fd_cloexec_refuse(0) != 0)
+        FAIL("cloexec: restore fd_cloexec_refuse(0)\n");
+    printf("ok: O_CLOEXEC admitted fd — NEW fexecve dup byte-exact (exit 42); "
+           "OLD all-refuse -> -EBADF, no replacement\n");
+}
+
+/* dev/ino fallback when kcmp is unavailable.  Forcing kcmp off (-ENOSYS)
+ * exercises the fallback deterministically: an admitted fd whose identity is
+ * UNCHANGED still execs byte-exact, while a close+reopen that reuses the fd
+ * NUMBER onto a DIFFERENT inode (wrong OFD) is still refused. */
+static void test_kcmp_fallback(void) {
+    char a0[] = GUEST_BIN;
+    char *av_empty[] = { a0, (char *)"empty", (char *)GUEST_BIN, NULL };
+
+    Cap oracle;
+    int he = host_exec(av_empty, &oracle);
+    if (he != 42 || oracle.n != strlen(WANT) ||
+        memcmp(oracle.b, WANT, oracle.n) != 0)
+        FAIL("kcmp-fallback: host oracle exit=%d out=[%s]\n", he, oracle.b);
+
+    if (wemu_um_set_fd_kcmp_forced_off(1) != 0)
+        FAIL("kcmp-fallback: set_fd_kcmp_forced_off(1)\n");
+
+    /* Same admitted fd: dev/ino matches the captured identity -> exec. */
+    WemuUmResult r;
+    int rc = wemu_um_run_elf(GUEST_BIN, av_empty, GUEST_ENV, &r);
+    if (rc != WEMU_UM_OK || r.exit_code != 42 || r.execs != 1 ||
+        r.denied != 0 || strcmp(r.out, WANT) != 0)
+        FAIL("kcmp-fallback same fd: status=%s exit=%d execs=%u denied=%llu "
+             "out=[%s]\n", wemu_um_status_name(rc), r.exit_code, r.execs,
+             (unsigned long long)r.denied, r.out);
+    check_exact("fb-same", r.out, r.out_len, oracle.b, oracle.n);
+
+    /* Wrong OFD (different inode via close+reuse): must still refuse. */
+    char *av_reuse[] = { a0, (char *)"reuse", (char *)GUEST_BIN,
+                         (char *)"tests/pie_hello", NULL };
+    rc = wemu_um_run_elf(GUEST_BIN, av_reuse, GUEST_ENV, &r);
+    if (rc != WEMU_UM_OK || r.exit_code != 16 || r.execs != 0 ||
+        r.denied == 0 || strcmp(r.out, "REUSE-RC=-9\n") != 0)
+        FAIL("kcmp-fallback wrong OFD: status=%s exit=%d execs=%u denied=%llu "
+             "out=[%s]\n", wemu_um_status_name(rc), r.exit_code, r.execs,
+             (unsigned long long)r.denied, r.out);
+
+    if (wemu_um_set_fd_kcmp_forced_off(0) != 0)
+        FAIL("kcmp-fallback: restore fd_kcmp_forced_off(0)\n");
+    printf("ok: kcmp-forced-off dev/ino fallback — same-fd exec byte-exact; "
+           "wrong-OFD (different inode) refused\n");
+}
+
+/* Extract the FDCOUNT=N line printed by the env-gated guest fd census. */
+static int fd_census(const char *out, size_t n) {
+    const char *p = out;
+    size_t left = n;
+    while (left >= 8 && memcmp(p, "FDCOUNT=", 8) != 0) { p++; left--; }
+    if (left < 8) return -1;
+    int v = 0;
+    for (const char *q = p + 8; *q >= '0' && *q <= '9'; q++) v = v * 10 + (*q - '0');
+    return v;
+}
+
+/* Non-leak control: the bounded fexecve internal dup must be private.  With
+ * an fd census enabled in the new image, a plain admitted-fd exec and a
+ * CLOEXEC admitted-fd exec must expose the SAME number of open fds.  A dup
+ * left open by the CLOEXEC path would add one and fail this comparison. */
+static void test_cloexec_no_leak(void) {
+    char a0[] = GUEST_BIN;
+    char *env[] = { (char *)"PATH=/usr/bin:/bin",
+                    (char *)"WEMU_FD_CENSUS=1", NULL };
+    char *av_empty[] = { a0, (char *)"empty", (char *)GUEST_BIN, NULL };
+    char *av_clo[]   = { a0, (char *)"cloexec", (char *)GUEST_BIN, NULL };
+    WemuUmResult plain, clo;
+    int rc = wemu_um_run_elf(GUEST_BIN, av_empty, env, &plain);
+    if (rc != WEMU_UM_OK || plain.exit_code != 42 || plain.execs != 1)
+        FAIL("fd-census plain: status=%s exit=%d execs=%u out=[%s]\n",
+             wemu_um_status_name(rc), plain.exit_code, plain.execs, plain.out);
+    rc = wemu_um_run_elf(GUEST_BIN, av_clo, env, &clo);
+    if (rc != WEMU_UM_OK || clo.exit_code != 42 || clo.execs != 1)
+        FAIL("fd-census cloexec: status=%s exit=%d execs=%u out=[%s]\n",
+             wemu_um_status_name(rc), clo.exit_code, clo.execs, clo.out);
+    int cp = fd_census(plain.out, plain.out_len);
+    int cc = fd_census(clo.out, clo.out_len);
+    if (cp < 0 || cc < 0 || cp != cc)
+        FAIL("fexecve internal dup leaks into guest: plain=%d cloexec=%d\n", cp, cc);
+    printf("ok: fexecve CLOEXEC internal dup does not leak into guest "
+           "(fd census %d == %d)\n", cp, cc);
 }
 
 int main(void) {
@@ -272,8 +378,13 @@ int main(void) {
      * OFD check, byte-exact vs host with the old number-only path. */
     test_fd_reuse();
 
-    /* O_CLOEXEC fd on fexecve: refused by the bounded model. */
+    /* O_CLOEXEC fd on fexecve: NEW path honours the bounded internal dup. */
     test_cloexec();
+    test_cloexec_no_leak();
+
+    /* kcmp forced off: dev/ino fallback admits the same fd, still refuses a
+     * wrong OFD (close+reopen onto a different inode). */
+    test_kcmp_fallback();
 
     char *av_bf[] = { empty, (char *)"badflags", (char *)GUEST_BIN, NULL };
     test_negative_host_exact("badflags", av_bf, "BADFLAGS-RC=-22\n", 11);
@@ -293,6 +404,7 @@ int main(void) {
            (unsigned long long)r.denied);
 
     printf("WEMU BOUNDED EXECVEAT-FD GATE PASS (admitted-fd fd-exec + "
-           "dirfd-relative byte-exact vs host; fail-closed unknown fd/flags)\n");
+           "dirfd-relative byte-exact vs host; dev/ino fallback on kcmp-off; "
+           "fexecve CLOEXEC internal-dup parity; fail-closed unknown fd/flags)\n");
     return 0;
 }

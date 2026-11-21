@@ -285,6 +285,11 @@ typedef struct {
     long    fd;        /* admitted guest fd number */
     long    held;      /* supervisor dup of the admitted OFD (CLOEXEC) */
     uint8_t cloexec;   /* guest fd had FD_CLOEXEC set at admission */
+    /* Stable identity captured at admission for the fail-closed fallback
+     * when kcmp(KCMP_FILE) is unavailable (-ENOSYS/-EPERM).  Raw kernel
+     * stat layout puts st_dev at byte 0 and st_ino at byte 8. */
+    uint64_t dev;
+    uint64_t ino;
 } UmAdmittedFd;
 
 static struct {
@@ -331,8 +336,14 @@ static struct {
     int pkey_mode;               /* WEMU_UM_PKEY_AUTO or FORCE_FALLBACK */
     int thread_exec_enabled;     /* bounded execve from a CLONE_THREAD guest */
     int fd_ofd_check_enabled;    /* bind admitted fds to their OFD (kcmp) */
+    /* Negative-control knobs for the fd-identity differential gates.  Both
+     * default to the hardened behaviour; the gate flips them to reproduce the
+     * OLD refusal path and the kernel-without-kcmp fallback path. */
+    int fd_kcmp_forced_off;      /* 1 = pretend kcmp is unavailable (-ENOSYS) */
+    int fd_cloexec_refuse;       /* 1 = OLD path: refuse every CLOEXEC fd */
 } g_cfg = { .enabled = 1, .pkey_mode = WEMU_UM_PKEY_AUTO,
-            .thread_exec_enabled = 1, .fd_ofd_check_enabled = 1 };
+            .thread_exec_enabled = 1, .fd_ofd_check_enabled = 1,
+            .fd_kcmp_forced_off = 0, .fd_cloexec_refuse = 0 };
 
 /* CPU-enforced protection-key state, built in the forked guest child before
  * the first guest instruction.  PKRU is per-thread: the supervisor (parent)
@@ -368,6 +379,8 @@ void wemu_um_reset_isolation(void) {
     g_cfg.pkey_mode = WEMU_UM_PKEY_AUTO;
     g_cfg.thread_exec_enabled = 1;
     g_cfg.fd_ofd_check_enabled = 1;
+    g_cfg.fd_kcmp_forced_off = 0;
+    g_cfg.fd_cloexec_refuse = 0;
 }
 
 int wemu_um_set_isolation_enabled(int enabled) {
@@ -385,6 +398,18 @@ int wemu_um_set_thread_exec_enabled(int enabled) {
 int wemu_um_set_fd_ofd_check_enabled(int enabled) {
     if (enabled != 0 && enabled != 1) return -1;
     g_cfg.fd_ofd_check_enabled = enabled;
+    return 0;
+}
+
+int wemu_um_set_fd_kcmp_forced_off(int forced_off) {
+    if (forced_off != 0 && forced_off != 1) return -1;
+    g_cfg.fd_kcmp_forced_off = forced_off;
+    return 0;
+}
+
+int wemu_um_set_fd_cloexec_refuse(int refuse) {
+    if (refuse != 0 && refuse != 1) return -1;
+    g_cfg.fd_cloexec_refuse = refuse;
     return 0;
 }
 
@@ -780,6 +805,23 @@ static long um_raw_kcmp(long pid, long a, long b) {
                        "d"((long)UM_KCMP_FILE), "r"(r10), "r"(r8)
                      : "rcx", "r11", "memory");
     return ret;
+}
+
+/* Raw fstat for the dev/ino fallback.  This runs from the SIGSYS handler
+ * (guest %fs), so it must not use glibc's fstat wrapper.  The x86-64 kernel
+ * stat layout has st_dev at offset 0 and st_ino at offset 8 (both 64-bit);
+ * the kernel writes the whole 144-byte struct, so provide a full buffer.
+ * Returns 0 and the identity on success, -1 on any fstat error. */
+static int um_raw_fstat_devino(long fd, uint64_t *dev, uint64_t *ino) {
+    unsigned long kstat[18];          /* 144 bytes: x86-64 kernel struct stat */
+    long ret;
+    __asm__ volatile("syscall" : "=a"(ret)
+                     : "a"(5L /* SYS_fstat */), "D"(fd), "S"(kstat)
+                     : "rcx", "r11", "memory");
+    if (ret < 0) return -1;
+    *dev = (uint64_t)kstat[0];
+    *ino = (uint64_t)kstat[1];
+    return 0;
 }
 
 /* A CLONE_THREAD guest's stack is a static array INSIDE the image window that
@@ -1212,15 +1254,38 @@ static void um_fd_admit(long fd) {
     e->fd = fd;
     e->held = held;
     e->cloexec = (uint8_t)(flags >= 0 && (flags & UM_FD_CLOEXEC) != 0);
+    /* Capture the stable identity now, for the fallback used when kcmp is
+     * unavailable.  If fstat fails here, leave dev/ino as sentinels so the
+     * fallback fails closed (never compares two zero identities as equal). */
+    if (um_raw_fstat_devino(fd, &e->dev, &e->ino) != 0) {
+        e->dev = 0;
+        e->ino = 0;
+    }
 }
 
 /* 1 when the guest fd still describes the EXACT admitted open-file-description.
  * kcmp(KCMP_FILE)==0 proves a shared struct file; a close+reopen (or dup2 onto
  * the number) yields >0, and a closed fd / unavailable kcmp yields -errno.
- * Only 0 passes, so every failure mode fails closed. */
+ * Only a positive proof admits: every failure mode fails closed.
+ *
+ * When kcmp is unavailable (-ENOSYS, e.g. no CONFIG_CHECKPOINT_RESTORE, or
+ * -EPERM, e.g. seccomp-blocked), fall back to a fail-closed dev/ino identity
+ * check against the values captured at admission.  dev/ino is a WEAKER proof
+ * than OFD identity (a close+reopen of the very same inode is indistinguishable)
+ * but still refuses a number rebound to a DIFFERENT file — the wrong-OFD
+ * negative control.  Any fstat error or identity mismatch refuses. */
 static int um_fd_ofd_ok(const UmAdmittedFd *e) {
     long pid = (long)um_raw0(39 /* SYS_getpid */);
-    return um_raw_kcmp(pid, e->fd, e->held) == 0;
+    long k = g_cfg.fd_kcmp_forced_off ? -ENOSYS : um_raw_kcmp(pid, e->fd, e->held);
+    if (k == 0) return 1;                        /* kcmp: same struct file */
+    if (k > 0) return 0;                         /* kcmp: different OFD */
+    if (k != -ENOSYS && k != -EPERM) return 0;   /* other error: fail closed */
+
+    /* kcmp unavailable: fail-closed dev/ino fallback. */
+    uint64_t dev = 0, ino = 0;
+    if (um_raw_fstat_devino(e->fd, &dev, &ino) != 0) return 0;
+    if (e->dev == 0 && e->ino == 0) return 0;    /* no captured identity */
+    return dev == e->dev && ino == e->ino;
 }
 
 /* execveat SHAPE predicate (pure; no runtime fd state).  1 when (dirfd,flags)
@@ -1282,11 +1347,13 @@ static int um_exec_check(uint64_t nr, const uint64_t a[6], UmExecArgs *ea) {
         if (!e) return 2;                        /* never admitted */
         if (g_cfg.fd_ofd_check_enabled) {
             if (!um_fd_ofd_ok(e)) return 2;      /* close+reopen/dup2: OFD changed */
-            /* The kernel closes FD_CLOEXEC descriptors across exec.  The
-             * bounded model does not reproduce fexecve's internal-dup
-             * exception, so a CLOEXEC fd fails closed rather than leaving a
-             * stale trusted OFD binding alive past the (emulated) exec. */
-            if (e->cloexec) return 2;
+            /* The kernel closes FD_CLOEXEC descriptors across exec, but
+             * fexecve's internal-dup exception keeps an admitted CLOEXEC fd
+             * usable: um_exec_continue reads it through a private high fd and
+             * closes that dup before guest code resumes, so it never leaks.
+             * The fd_cloexec_refuse switch reproduces the OLD all-refuse path
+             * as a negative control. */
+            if (e->cloexec && g_cfg.fd_cloexec_refuse) return 2;
         }
     }
     if (!ea->pathp || !ea->argvp) return 3;
@@ -2042,6 +2109,26 @@ static void um_exec_continue(void) {
         !um_exec_vec(g_exec.envpp, g_exec.envp, UM_EXEC_MAX_NARG))
         um_child_fail(shared, WEMU_UM_ERR_FAULT);
 
+    /* fexecve parity for an admitted FD_CLOEXEC descriptor: glibc's fexecve()
+     * internally dups a CLOEXEC fd before exec so the descriptor survives
+     * long enough to load the image, then closes the dup.  We do the bounded
+     * equivalent here in HOST context: a PRIVATE dup placed above the guest
+     * fd range (>= UM_ADMITTED_FD_MIN, so guest code can never name it) is
+     * used only to read the image and is closed before guest code resumes.
+     * The guest's own fd number is untouched and no new guest-visible fd
+     * appears.  A dup failure fails closed (no image replacement). */
+    long read_dirfd = g_exec.dirfd;
+    int cloexec_dup = -1;
+    if (!g_cfg.fd_cloexec_refuse && g_exec.dirfd >= 0) {
+        const UmAdmittedFd *e = um_fd_lookup(g_exec.dirfd);
+        if (e && e->cloexec) {
+            cloexec_dup = fcntl((int)g_exec.dirfd, F_DUPFD_CLOEXEC,
+                                UM_ADMITTED_FD_MIN);
+            if (cloexec_dup < 0) um_child_fail(shared, WEMU_UM_ERR_INTERNAL);
+            read_dirfd = cloexec_dup;
+        }
+    }
+
     /* Resolve the exec target through a bounded #! chain.  Each hop rewrites
      * argv as [interp, i_arg?, script, argv[1]...] (Linux binfmt_script), then
      * re-reads the interpreter: a chain of scripts is followed at most
@@ -2059,7 +2146,7 @@ static void um_exec_continue(void) {
          * path, or the admitted fd itself).  Deeper hops are #! interpreters,
          * always plain paths resolved like a normal execve. */
         file = depth == 0
-            ? um_read_target(g_exec.path, g_exec.dirfd, g_exec.empty_path, &file_len)
+            ? um_read_target(g_exec.path, read_dirfd, g_exec.empty_path, &file_len)
             : um_read_file(cur_path, &file_len);
         if (!file) um_child_fail(shared, WEMU_UM_ERR_FORMAT);
         UmShebang sh;
@@ -2067,7 +2154,7 @@ static void um_exec_continue(void) {
         if (sp < 0) { free(file); um_child_fail(shared, WEMU_UM_ERR_SCRIPT); }
         if (sp == 0) {                         /* plain ELF candidate */
             int rc = depth == 0
-                ? um_load_from(g_exec.path, g_exec.dirfd, g_exec.empty_path, &im)
+                ? um_load_from(g_exec.path, read_dirfd, g_exec.empty_path, &im)
                 : um_load(cur_path, &im);
             free(file);
             if (rc == -2) um_child_fail(shared, WEMU_UM_ERR_RANGE);
@@ -2101,6 +2188,7 @@ static void um_exec_continue(void) {
         cur_path = interp;
     }
     if (!loaded) um_child_fail(shared, WEMU_UM_ERR_SCRIPT);
+    if (cloexec_dup >= 0) close(cloexec_dup);  /* private fexecve dup: no leak */
 
     uint8_t *stack_mem;
     uint64_t lo = 0, hi = 0;
