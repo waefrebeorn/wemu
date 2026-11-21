@@ -84,7 +84,24 @@ untrusted-guest sandbox. Nothing here is enabled implicitly by `wemu_cpu_run`.
   FS/FILES/SYSVSEM/SETTLS/TID extras and no exit signal — and nothing else;
   namespace/vfork/exit-signal thread requests return `-EINVAL`.  `clone3`
   stays fork-only: any pidfd/tid/tls/stack knob or nonzero flags is refused.
-  `execve` and pidfd-bearing `clone3` remain unlisted.
+  `execve` is now a bounded image replacement (see below); pidfd-bearing
+  `clone3` remains unlisted.
+- **Bounded execve**: `execve`/`execveat` are listed and routed to a dedicated
+  handler.  The SIGSYS handler only checks the path/vector pointers and
+  saves the three guest pointers; it refuses unsupported `execveat` flags
+  (`AT_EMPTY_PATH`, fd-relative), bad pointers, a non-root/forked/threaded
+  guest, and an exhausted budget with `-EINVAL`/`-EBUSY` and `denied++`.
+  On the accepted path it rewrites the SigSYS ucontext to resume on the
+  ORIGINAL host stack, restores the HOST `%fs` (so the loader's malloc/stdio
+  use host TLS), copies bounded strings/vectors (`<=64` entries, `<=256`
+  bytes each, 16 KiB store), and loads a new validated static `ET_EXEC`/
+  `ET_DYN` image.  A `PT_INTERP` target refuses with `WEMU_UM_ERR_INTERP`;
+  a malformed/missing target with `WEMU_UM_ERR_FORMAT`.  The old image and
+  old stack are unmapped, every per-run counter/signal/heap/mmap/thread
+  state is reset, a new additive seccomp trap window is installed for the
+  new image, and `setcontext()` enters its `e_entry`.  `execs` is monotonic
+  and capped at `WEMU_UM_MAX_EXECS` (4).  `test_usermode_exec` is the
+  differential gate: a real self-exec chain is byte-exact vs host `execve`.
 - **Bounded thread group**: at most `WEMU_UM_MAX_THREADS - 1` shared-VM host
   threads per run, counted in the shared result page.  Exhaustion returns
   `-EAGAIN` and increments `denied`.  Thread state is a fixed slot table
@@ -170,5 +187,10 @@ table entry against the kernel's `asm/unistd_64.h`.
   static-PIE shared-VM CLONE_THREAD fixture (two TLS-distinguished host
   threads, exact output + negative clone flag), and `tests/sandbox_probe` for
   the four sandbox differentials (RWX mmap, mprotect, out-of-range pointer,
-  brk). LTP, `pthread_create`, `execve`/vfork sharing, clone3 pidfds and guest
-  signal masks are not yet modelled.
+  brk). LTP, `pthread_create`, vfork sharing, clone3 pidfds and guest
+  signal masks are not yet modelled. `execve` only replaces static
+  ET_EXEC/ET_DYN images: PT_INTERP (ld.so), fd-relative `execveat`, exec from
+  a forked child or a process with live shared-VM threads, dynamic loaders,
+  and ELF interpreter/fd scripts are refused. Seccomp windows accumulate
+  across execs (bounded to `WEMU_UM_MAX_EXECS`), and XMM/x87 state is not
+  reset across a replacement.

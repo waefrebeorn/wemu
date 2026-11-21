@@ -13,7 +13,7 @@ TESTS = test_isa test_avx test_paging test_machine test_string test_cpuid \
         test_exceptions test_isa_atomic_fence test_idt test_priv test_faults \
         test_segments test_cpl test_iret test_tss test_task_switch \
         test_task_gates test_ldt test_call_gate_priv test_task_gpr \
-        test_usermode_native
+        test_usermode_native test_usermode_exec
 
 all: libwemu.a
 
@@ -21,7 +21,8 @@ PIE_STATIC = tests/pie_hello tests/pie_signal tests/pie_nohandler tests/pie_unli
 PIE_DYN    = tests/pie_dynamic
 FORK_FIX   = tests/fork_clone
 THREAD_FIX = tests/threaded_guest
-PIE_BINS   = $(PIE_STATIC) $(PIE_DYN) $(FORK_FIX) $(THREAD_FIX)
+EXEC_FIX   = tests/exec_chain
+PIE_BINS   = $(PIE_STATIC) $(PIE_DYN) $(FORK_FIX) $(THREAD_FIX) $(EXEC_FIX)
 SANDBOX_BIN = tests/sandbox_probe
 
 src/wemu_usermode.o: CFLAGS += -fno-stack-protector
@@ -43,6 +44,9 @@ test_%: tests/test_%.c libwemu.a
 test_usermode_native: tests/test_usermode_native.c libwemu.a $(PIE_BINS) $(SANDBOX_BIN)
 	$(CC) $(CFLAGS) -o $@ $< libwemu.a -lm
 
+test_usermode_exec: tests/test_usermode_exec.c libwemu.a $(EXEC_FIX) $(PIE_DYN)
+	$(CC) $(CFLAGS) -o $@ $< libwemu.a -lm
+
 # Freestanding sandbox differential guest (raw syscalls, no libc).
 tests/sandbox_probe: tests/sandbox_probe.c
 	$(CC) -static -nostdlib -no-pie -ffreestanding -fno-builtin -O2 -o $@ $<
@@ -53,6 +57,10 @@ tests/pie_%: tests/pie_%.c
 
 tests/fork_clone: tests/fork_clone.c
 	$(CC) -static-pie -O2 -o $@ $<
+
+# Self-exec differential fixture: stage 1 execve()s itself as a static PIE.
+tests/exec_chain: tests/exec_chain.c
+	$(CC) -static-pie -O2 -fno-stack-protector -o $@ $<
 
 # Guest threads run with an emulator-provided %fs base that is not glibc's
 # TCB, so no handler/body may read the TLS canary.  Keep this fixture raw.

@@ -88,6 +88,10 @@
 #define WEMU_UM_SYS_RT_SIGRETURN 15   /* not in the VSL table */
 #define WEMU_UM_SYS_SCHED_GETAFFINITY 204 /* not in the VSL table */
 #define WEMU_UM_SYS_DUP3         292 /* not in the VSL table */
+#define WEMU_UM_SYS_EXECVEAT     322 /* not in the VSL table */
+#define UM_AT_FDCWD              (-100)
+#define UM_ARCH_GET_FS           0x1003
+#define UM_ARCH_SET_FS           0x1002
 #define SIG_DFL_ 0
 #define SIG_IGN_ 1
 
@@ -144,6 +148,8 @@ static const WemuUmSyscallEntry um_table[] = {
     { VSL_SYS_VFORK,           "vfork",           WEMU_UM_DISPATCH_FORK },
     { VSL_SYS_CLONE,           "clone",           WEMU_UM_DISPATCH_CLONE },
     { VSL_SYS_CLONE3,          "clone3",          WEMU_UM_DISPATCH_CLONE3 },
+    { VSL_SYS_EXECVE,          "execve",          WEMU_UM_DISPATCH_EXECVE },
+    { WEMU_UM_SYS_EXECVEAT,    "execveat",        WEMU_UM_DISPATCH_EXECVE },
     { VSL_SYS_WAIT4,           "wait4",           WEMU_UM_DISPATCH_HOST },
     { VSL_SYS_EXIT,            "exit",            WEMU_UM_DISPATCH_EXIT },
     { VSL_SYS_EXIT_GROUP,      "exit_group",      WEMU_UM_DISPATCH_EXIT },
@@ -251,6 +257,28 @@ static struct {
     uint8_t  sig_valid[WEMU_UM_SIG_NSIG];
 } g_um;
 
+/* The guest owns %fs while our handlers run, so the image loader (malloc,
+ * stdio) must be called only after %fs is put back on the HOST's value.
+ * Captured in um_child_run before the guest first runs. */
+static uint64_t g_host_fs;
+
+/* Bounded, host-owned copy of a guest exec request.  The SIGSYS handler only
+ * saves the three guest pointers; the strings are copied in host context
+ * (host %fs restored) by um_exec_continue before the old image is touched. */
+#define UM_EXEC_MAX_ARG   256u
+#define UM_EXEC_MAX_NARG  64u
+#define UM_EXEC_STORE     (16u << 10)
+typedef struct {
+    uint32_t nr;
+    uint64_t pathp, argvp, envpp;
+    size_t   used;
+    char     store[UM_EXEC_STORE];
+    const char *path;
+    char    *argv[UM_EXEC_MAX_NARG + 1];
+    char    *envp[UM_EXEC_MAX_NARG + 1];
+} UmExecReq;
+static UmExecReq g_exec;
+
 /* Serialise dispatch state updates.  Released around blocking host calls so
  * a futex-waiting thread cannot freeze a peer that needs to wake it. */
 static volatile int g_dispatch_lock;
@@ -274,6 +302,9 @@ static int um_sig_registered(int sig) {
 }
 
 static void um_finish(void) __attribute__((noreturn));
+/* Bounded image replacement: entered in HOST context (host %fs restored) on
+ * the child's original stack after the SIGSYS handler rewrote RIP/RSP. */
+static void um_exec_continue(void) __attribute__((noreturn));
 
 /* Redirect sigreturn to our own stack.  siglongjmp from a signal delivered
  * on the guest stack is rejected by glibc's fortified ____longjmp_chk and
@@ -325,6 +356,30 @@ static int64_t um_raw1(long nr, long a0) {
     __asm__ volatile("syscall" : "=a"(ret) : "a"(nr), "D"(a0)
                      : "rcx", "r11", "memory");
     return (int64_t)ret;
+}
+
+/* Raw arch_prctl(ARCH_GET_FS/ARCH_SET_FS).  A glibc syscall() wrapper would
+ * write errno through %fs (guest-owned inside a handler), so use raw asm.
+ * ARCH_GET_FS takes a POINTER; ARCH_SET_FS takes a value. */
+static uint64_t um_raw_get_fs(void) {
+    uint64_t v = 0;
+    register long rsi __asm__("rsi") = (long)&v;
+    long ret;
+    __asm__ volatile("syscall" : "=a"(ret), "+m"(v)
+                     : "a"(158L /* SYS_arch_prctl */),
+                       "D"(0x1003L /* ARCH_GET_FS */), "r"(rsi)
+                     : "rcx", "r11", "memory");
+    (void)ret;
+    return v;
+}
+
+static int um_raw_set_fs(uint64_t v) {
+    long ret;
+    __asm__ volatile("syscall" : "=a"(ret)
+                     : "a"(158L /* SYS_arch_prctl */),
+                       "D"(0x1002L /* ARCH_SET_FS */), "S"((long)v)
+                     : "rcx", "r11", "memory");
+    return ret == 0 ? 0 : -1;
 }
 
 static void um_skip_syscall(greg_t *r);
@@ -667,6 +722,41 @@ static int64_t um_do_fork(UmThread *th) {
     return pid;
 }
 
+/* execveat is modelled only for AT_FDCWD with no flags: AT_EMPTY_PATH would
+ * let a guest execute a file described by a host fd, and every other flag
+ * changes path resolution.  Both are refused fail-closed. */
+int wemu_um_execveat_modeled(long dirfd, uint64_t flags) {
+    return dirfd == UM_AT_FDCWD && flags == 0;
+}
+
+/* Normalise execve / execveat register args to (path, argv, envp).  Returns 0
+ * when the syscall variant/flags are outside the bounded model. */
+static int um_exec_args(uint64_t nr, const uint64_t a[6],
+                        uint64_t *pathp, uint64_t *argvp, uint64_t *envpp) {
+    if (nr == VSL_SYS_EXECVE) {
+        *pathp = a[0]; *argvp = a[1]; *envpp = a[2];
+        return 1;
+    }
+    if (nr == WEMU_UM_SYS_EXECVEAT) {
+        if (!wemu_um_execveat_modeled((long)a[0], a[4])) return 0;
+        *pathp = a[1]; *argvp = a[2]; *envpp = a[3];
+        return 1;
+    }
+    return 0;
+}
+
+/* Handler-side gate: nothing is loaded here; just refuse obviously bad
+ * guest pointers before redirecting to host context.  The authoritative,
+ * bounded string/vector copy happens in um_exec_continue. */
+static int um_exec_args_ok(uint64_t nr, const uint64_t a[6]) {
+    uint64_t pathp, argvp, envpp;
+    if (!um_exec_args(nr, a, &pathp, &argvp, &envpp)) return 0;
+    if (!pathp || !argvp) return 0;
+    if (!um_chk_str(nr, pathp) || !um_chk(nr, argvp, (UM_EXEC_MAX_NARG + 1u) * 8u)) return 0;
+    if (envpp && !um_chk(nr, envpp, (UM_EXEC_MAX_NARG + 1u) * 8u)) return 0;
+    return 1;
+}
+
 /* Host call with the dispatch lock dropped: a guest thread blocked in
  * futex/wait4 must not freeze a peer that needs to emit the wakeup. */
 static int64_t um_host_unlocked(uint64_t nr, uint64_t a[6]) {
@@ -726,6 +816,42 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
     }
     if (e->kind == WEMU_UM_DISPATCH_SIGRETURN) {
         um_sigreturn(th, r);                  /* resumes at the saved fault RIP */
+        um_unlock();
+        return;
+    }
+
+    /* Bounded image replacement: execve / execveat.  Refuse here (the guest
+     * sees an error, no image is loaded) for unsupported variants/flags, bad
+     * guest pointers, an exhausted exec budget or live shared-VM threads. */
+    if (e->kind == WEMU_UM_DISPATCH_EXECVE) {
+        if (!um_exec_args_ok(nr, a)) {
+            um_note_denied(nr);
+            r[REG_RAX] = (greg_t)-EINVAL;
+            um_skip_syscall(r);
+            if (g_um.denied > 8) um_abort_to_finish(uc, th, UM_WHY_BUDGET);
+            um_unlock();
+            return;
+        }
+        if (th != &g_thr[0] || !th->is_root ||
+            g_um.result->execs >= WEMU_UM_MAX_EXECS ||
+            g_um.result->threads_created != 0) {
+            um_note_denied(nr);
+            r[REG_RAX] = (greg_t)-EBUSY;
+            um_skip_syscall(r);
+            if (g_um.denied > 8) um_abort_to_finish(uc, th, UM_WHY_BUDGET);
+            um_unlock();
+            return;
+        }
+        /* Save only guest pointers; strings are copied in host context where
+         * %fs is the HOST's, so malloc/stdio are safe.  Rewriting the SigSYS
+         * ucontext resumes um_exec_continue on the original host stack with
+         * correct SysV entry alignment (RSP % 16 == 8). */
+        memset(&g_exec, 0, sizeof g_exec);
+        g_exec.nr = (uint32_t)nr;
+        (void)um_exec_args(nr, a, &g_exec.pathp, &g_exec.argvp, &g_exec.envpp);
+        uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)um_exec_continue;
+        uc->uc_mcontext.gregs[REG_RSP] =
+            ((th->child_rsp - 16) & ~(greg_t)15) + 8;
         um_unlock();
         return;
     }
@@ -1186,6 +1312,127 @@ static void um_child_fail(WemuUmResult *shared, int code) {
     _exit(0);
 }
 
+/* ---- bounded execve: image replacement in host context -------------- */
+/* Copy one bounded, NUL-terminated guest string into the host-owned store.
+ * um_str_ok (already applied in the handler) guarantees the NUL is inside a
+ * registered guest range, so this read cannot leave guest memory. */
+static const char *um_exec_str(uint64_t vp, size_t max) {
+    if (!vp) return NULL;
+    if (!um_str_ok(vp)) return NULL;
+    const uint8_t *s = (const uint8_t *)(uintptr_t)vp;
+    size_t n = 0;
+    while (n < max && s[n] != 0) n++;
+    if (n >= max || g_exec.used + n + 1 > UM_EXEC_STORE) return NULL;
+    char *dst = g_exec.store + g_exec.used;
+    memcpy(dst, s, n);
+    dst[n] = 0;
+    g_exec.used += n + 1;
+    return dst;
+}
+
+/* Copy a bounded guest pointer vector (argv/envp).  A NULL vector becomes
+ * an empty vector; a missing terminator or an out-of-range string is refused. */
+static int um_exec_vec(uint64_t vp, char **out, size_t max) {
+    out[0] = NULL;
+    if (!vp) return 1;
+    uint64_t *v = (uint64_t *)(uintptr_t)vp;
+    for (size_t i = 0; i < max; i++) {
+        uint64_t sp = v[i];
+        if (!sp) return 1;
+        const char *s = um_exec_str(sp, UM_EXEC_MAX_ARG);
+        if (!s) return 0;
+        out[i] = (char *)s;
+    }
+    return 0;                                  /* no terminator within max */
+}
+
+/* Reached on sigreturn from execve's SIGSYS handler, on the child's original
+ * host stack with %fs restored to the HOST: every glibc call below (malloc,
+ * fopen, errno) touches host TLS, never the guest's.  The kernel's seccomp
+ * filter traps only guest-image RIPs, so the loader's own syscalls run for
+ * real.  On any failure the run fails closed with a WemuUmStatus. */
+static void um_exec_continue(void) {
+    WemuUmResult *shared = g_um.result;
+    if (um_raw_set_fs(g_host_fs) != 0)
+        um_child_fail(shared, WEMU_UM_ERR_INTERNAL);
+
+    g_exec.used = 0;
+    g_exec.path = um_exec_str(g_exec.pathp, UM_EXEC_MAX_ARG);
+    if (!g_exec.path ||
+        !um_exec_vec(g_exec.argvp, g_exec.argv, UM_EXEC_MAX_NARG) ||
+        !um_exec_vec(g_exec.envpp, g_exec.envp, UM_EXEC_MAX_NARG))
+        um_child_fail(shared, WEMU_UM_ERR_FAULT);
+
+    UmImage im;
+    int rc = um_load(g_exec.path, &im);
+    if (rc == -2) um_child_fail(shared, WEMU_UM_ERR_RANGE);
+    if (rc != 0) um_child_fail(shared, WEMU_UM_ERR_FORMAT);
+    if (im.has_interp) um_child_fail(shared, WEMU_UM_ERR_INTERP);
+
+    uint8_t *stack_mem;
+    uint64_t lo = 0, hi = 0;
+    uint64_t rsp = um_build_stack(g_exec.argv, g_exec.envp, &im, &stack_mem,
+                                  &lo, &hi);
+    if (!rsp) um_child_fail(shared, WEMU_UM_ERR_INTERNAL);
+    free(im.file);                             /* strings now live in g_exec */
+
+    /* Replace the current guest image: release the old image window and the
+     * old SysV stack before the new ranges become the trapped window. */
+    (void)munmap((void *)(uintptr_t)g_um.win_lo,
+                 (size_t)(g_um.win_hi - g_um.win_lo));
+    (void)munmap((void *)(uintptr_t)g_um.stack_lo,
+                 (size_t)(g_um.stack_hi - g_um.stack_lo));
+
+    /* Reset every per-run state the new image must not inherit: syscall and
+     * denial budgets, guest signal table, admitted mmap/heap ranges and the
+     * bounded thread slots.  fork/thread accounting (shared MAP_SHARED page)
+     * is reset too — the replaced image starts with a clean budget. */
+    g_um.syscalls = 0;
+    g_um.denied = 0;
+    g_um.n_mmaps = 0;
+    g_um.bad_ptrs = 0; g_um.bad_ptr_nr = 0; g_um.bad_ptr_va = 0;
+    memset(g_um.sig_handler, 0, sizeof g_um.sig_handler);
+    memset(g_um.sig_restorer, 0, sizeof g_um.sig_restorer);
+    memset(g_um.sig_flags, 0, sizeof g_um.sig_flags);
+    memset(g_um.sig_valid, 0, sizeof g_um.sig_valid);
+    shared->forks = 0;
+    shared->threads_created = 0;
+    memset(shared->denied_nrs, 0, sizeof shared->denied_nrs);
+    shared->bad_ptrs = 0; shared->bad_ptr_nr = 0; shared->bad_ptr_va = 0;
+    shared->execs++;                           /* monotonic: resets cannot reset it */
+    for (unsigned i = 1; i < WEMU_UM_MAX_THREADS; i++)
+        memset(&g_thr[i], 0, sizeof g_thr[i]);
+    UmThread *root = &g_thr[0];
+    memset(root, 0, sizeof *root);
+    root->tid = um_raw_gettid();
+    root->active = 1;
+    root->is_root = 1;
+    root->child_rsp = (greg_t)((uint64_t)__builtin_frame_address(0) & ~15ull);
+    g_boot_thr = root;
+    g_dispatch_lock = 0;
+
+    g_um.win_lo = im.lo;  g_um.win_hi = im.hi;
+    g_um.stack_lo = lo;   g_um.stack_hi = hi;
+    g_um.heap_lo = (uint64_t)(int64_t)syscall(SYS_brk, 0);
+    g_um.heap_hi = g_um.heap_lo;
+
+    /* Filters are additive: add a trap window for the NEW image.  The old
+     * window stays trapped but is unmapped, so no guest code runs there. */
+    if (um_install_filter(im.lo, im.hi) != 0)
+        um_child_fail(shared, WEMU_UM_ERR_TRAP);
+
+    ucontext_t uc;
+    if (getcontext(&uc) != 0) um_child_fail(shared, WEMU_UM_ERR_TRAP);
+    uc.uc_mcontext.gregs[REG_RSP] = (greg_t)rsp;
+    uc.uc_mcontext.gregs[REG_RIP] = (greg_t)im.entry;
+    uc.uc_mcontext.gregs[REG_EFL] = 0x202;
+    uc.uc_mcontext.gregs[REG_RDX] = 0;
+    sigemptyset(&uc.uc_sigmask);
+    (void)um_raw1(37 /* SYS_alarm */, WEMU_UM_TIMEOUT_SEC); /* wall bound resumes */
+    (void)setcontext(&uc);
+    um_finish();                               /* only on setcontext failure */
+}
+
 static void um_child_run(const char *path, char *const argv[], char *const envp[],
                          WemuUmResult *shared, int out_fd) {
     /* Guest must not read the harness's stdin, but fd 0 must stay VALID:
@@ -1234,6 +1481,9 @@ static void um_child_run(const char *path, char *const argv[], char *const envp[
      * BEFORE the trap filter is installed (host code, never trapped). */
     g_um.heap_lo = (uint64_t)(int64_t)syscall(SYS_brk, 0);
     g_um.heap_hi = g_um.heap_lo;
+    /* Save the HOST fs base: a later execve must restore it before calling
+     * the image loader (malloc/stdio/errno) in host context. */
+    g_host_fs = um_raw_get_fs();
 
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);

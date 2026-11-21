@@ -27,6 +27,7 @@ extern "C" {
 #define WEMU_UM_SIG_NSIG      32       /* bounded guest signal-number table */
 #define WEMU_UM_MAX_FORKS     8u       /* bounded guest fork/clone children/run */
 #define WEMU_UM_MAX_THREADS   8u       /* bounded shared-VM host threads/run */
+#define WEMU_UM_MAX_EXECS     4u       /* bounded image replacements/run */
 
 typedef enum {
     WEMU_UM_OK            =   0,
@@ -56,7 +57,8 @@ typedef enum {
     WEMU_UM_DISPATCH_FORK,       /* fork/vfork: bounded COW guest child */
     WEMU_UM_DISPATCH_CLONE,      /* clone: same, but flags checked first */
     WEMU_UM_DISPATCH_CLONE3,     /* clone3: clone_args flags checked first */
-    WEMU_UM_DISPATCH_BRK         /* brk: bounded heap growth, range tracked */
+    WEMU_UM_DISPATCH_BRK,        /* brk: bounded heap growth, range tracked */
+    WEMU_UM_DISPATCH_EXECVE      /* execve/execveat: bounded image replacement */
 } WemuUmDispatch;
 
 typedef struct {
@@ -74,6 +76,7 @@ typedef struct {
     uint32_t  signals_denied;    /* fail-closed signal registrations/deliveries */
     uint32_t  forks;             /* bounded COW children created this run */
     uint32_t  threads_created;   /* bounded shared-VM host threads created */
+    uint32_t  execs;             /* bounded successful guest image replacements */
     uint32_t  denied_nrs[8];     /* distinct unlisted/refused syscall numbers */
     uint32_t  bad_ptrs;          /* guest pointers refused before host dispatch */
     uint32_t  bad_ptr_nr;        /* syscall number of the last refused pointer */
@@ -107,6 +110,11 @@ int wemu_um_clone_flags_modeled(uint64_t flags);
  * TLS value is applied to the host thread by the kernel.  Any namespace or
  * unlisted flag fails closed. */
 int wemu_um_clone_thread_flags_modeled(uint64_t flags);
+
+/* 1 when the execveat(dirfd, flags) pair stays inside the bounded model:
+ * AT_FDCWD with no flags.  AT_EMPTY_PATH and every other flag/dirfd are
+ * refused fail-closed (plain execve has no flags and is always eligible). */
+int wemu_um_execveat_modeled(long dirfd, uint64_t flags);
 
 /* Introspection for the gate: the table itself and a readable status name. */
 const WemuUmSyscallEntry *wemu_um_syscall_table(size_t *count);
