@@ -89,6 +89,33 @@ static const char WANT_REFUSE3_OLD[] =
     "PIDFDGETFD-RC=-38\n"
     "CLRCLEAR-RC=-22\n";
 
+/* Bounded pidfd authority.  Mode "p" emits only booleans (byte-exact vs the
+ * native kernel): guest openat fd, minted pidfd, getfd duplicate and the
+ * whitelisted SIGCONT all succeed.  Authority OFF still lets the plain openat
+ * through but refuses every pidfd shape (old hardening). */
+static const char WANT_PIDFD_POS[] =
+    "PA-OPEN-FD-OK=1\n"
+    "PA-PIDFD-OK=1\n"
+    "PA-GETFD-OK=1\n"
+    "PA-SIGNAL-OK=1\n";
+static const char WANT_PIDFD_AUTHOFF[] =
+    "PA-OPEN-FD-OK=1\n"
+    "PA-PIDFD-OK=0\n"
+    "PA-GETFD-OK=0\n"
+    "PA-SIGNAL-OK=0\n";
+
+/* Mode "q": out-of-scope shapes with an otherwise valid minted pidfd.  The
+ * host oracle proves getfd on fd 2 and SIGWINCH are real features; WEMU refuses
+ * both with exact reasons.  With exact diagnostics OFF both are -ENOSYS. */
+static const char WANT_PIDFD_REFUSE[] =
+    "PQ-PIDFD-OK=1\n"
+    "PQ-GETFD-UNADMITTED-RC=-22\n"
+    "PQ-SIGNAL-NONWL-RC=-22\n";
+static const char WANT_PIDFD_REFUSE_OLD[] =
+    "PQ-PIDFD-OK=0\n"
+    "PQ-GETFD-UNADMITTED-RC=-38\n"
+    "PQ-SIGNAL-NONWL-RC=-38\n";
+
 /* Positive bounded fork-shaped clone3 differential: child writes, parent
  * wait4()s and emits only boolean invariants — no pid or raw status word. */
 static const char WANT_FORK[] =
@@ -269,6 +296,23 @@ static void test_policy(void) {
         wemu_um_set_exact_refuse_enabled(2) != -1 ||
         wemu_um_set_exact_refuse_enabled(1) != 0)
         FAIL("new negative-control switch validation\n");
+
+    /* Bounded pidfd authority shape predicates: flags==0 / whitelisted signal
+     * SIGCONT only; every other flag or signal fails closed.  Runtime ownership
+     * (admitted TID / minted pidfd / admitted fd) is checked by the handler. */
+    if (!wemu_um_pidfd_open_modeled(0) ||
+        wemu_um_pidfd_open_modeled(0x800u) ||          /* PIDFD_NONBLOCK */
+        wemu_um_pidfd_open_modeled(1) ||
+        !wemu_um_pidfd_getfd_modeled(0) ||
+        wemu_um_pidfd_getfd_modeled(1) ||
+        !wemu_um_pidfd_signal_modeled(18) ||           /* SIGCONT */
+        wemu_um_pidfd_signal_modeled(10) ||            /* SIGUSR1 */
+        wemu_um_pidfd_signal_modeled(28) ||            /* SIGWINCH */
+        wemu_um_pidfd_signal_modeled(0))
+        FAIL("pidfd authority shape predicate edges\n");
+    if (wemu_um_set_pidfd_authority_enabled(2) != -1 ||
+        wemu_um_set_pidfd_authority_enabled(1) != 0)
+        FAIL("pidfd authority negative-control switch validation\n");
 
     printf("ok: FAIL-CLOSED clone3 shape — bounded CLONE_THREAD only; pidfd/"
            "sigmask/namespace/exit-signal/bad-knob refused\n");
@@ -557,6 +601,115 @@ static void test_refuse3(void) {
            "CLONE_CLEAR_SIGHAND -EINVAL generic, no exact codes\n");
 }
 
+/* ---- bounded pidfd authority: positive byte-exact host differential ---- */
+static void test_pidfd_authority(void) {
+    Cap oracle;
+    int he = host_exec("p", &oracle);
+    if (he != 0) FAIL("host pidfd authority exit=%d want 0\n", he);
+    check_exact("host pidfd authority", oracle.b, oracle.n,
+                WANT_PIDFD_POS, sizeof WANT_PIDFD_POS - 1);
+
+    WemuUmResult r;
+    int rc = wemu_exec("p", &r);
+    if (rc != WEMU_UM_OK)
+        FAIL("pidfd authority status=%s out=[%s]\n", wemu_um_status_name(rc), r.out);
+    if (r.exit_code != 0) FAIL("pidfd authority exit=%d want 0\n", r.exit_code);
+    check_exact("wemu pidfd authority", r.out, r.out_len, oracle.b, oracle.n);
+    if (r.pidfd_created < 1 || r.pidfd_getfd_ok < 1 || r.pidfd_signals < 1 ||
+        r.denied != 0 || r.forks != 0 || r.threads_created != 0)
+        FAIL("pidfd authority counts: created=%u getfd=%u signals=%u "
+             "denied=%llu forks=%u threads=%u\n", r.pidfd_created,
+             r.pidfd_getfd_ok, r.pidfd_signals, (unsigned long long)r.denied,
+             r.forks, r.threads_created);
+    for (unsigned i = 0; i < WEMU_UM_N_REFUSE; i++)
+        if (r.refuses[i]) FAIL("pidfd authority positive refuse[%u]=%u\n", i, r.refuses[i]);
+    printf("        (created=%u getfd=%u signals=%u; byte-exact vs host)\n",
+           r.pidfd_created, r.pidfd_getfd_ok, r.pidfd_signals);
+    printf("ok: BOUNDED PIDFD AUTHORITY — pidfd_open/getfd/send_signal "
+           "byte-exact vs host on admitted shapes\n");
+
+    /* NEGATIVE CONTROL (authority off): the OLD hardening refuses every pidfd
+     * shape with an exact reason, so no pidfd is minted and the byte stream
+     * differs from the kernel oracle.  The plain openat still succeeds. */
+    if (wemu_um_set_pidfd_authority_enabled(0) != 0)
+        FAIL("disable pidfd authority\n");
+    WemuUmResult old;
+    rc = wemu_exec("p", &old);
+    (void)wemu_um_set_pidfd_authority_enabled(1);   /* restore default */
+    if (rc != WEMU_UM_OK || old.exit_code != 0)
+        FAIL("authority-off pidfd: status=%s exit=%d\n",
+             wemu_um_status_name(rc), old.exit_code);
+    check_exact("wemu pidfd authority old", old.out, old.out_len,
+                WANT_PIDFD_AUTHOFF, sizeof WANT_PIDFD_AUTHOFF - 1);
+    if (old.pidfd_created || old.pidfd_getfd_ok || old.pidfd_signals ||
+        old.refuses[WEMU_UM_REFUSE_PIDFD_OPEN] != 1 ||
+        old.refuses[WEMU_UM_REFUSE_PIDFD_GETFD] != 1 ||
+        old.refuses[WEMU_UM_REFUSE_PIDFD_SEND_SIGNAL] != 1)
+        FAIL("authority-off pidfd: created=%u getfd=%u signals=%u "
+             "open=%u getfd-ref=%u signal-ref=%u\n", old.pidfd_created,
+             old.pidfd_getfd_ok, old.pidfd_signals,
+             old.refuses[WEMU_UM_REFUSE_PIDFD_OPEN],
+             old.refuses[WEMU_UM_REFUSE_PIDFD_GETFD],
+             old.refuses[WEMU_UM_REFUSE_PIDFD_SEND_SIGNAL]);
+    printf("ok: NEGATIVE CONTROL (authority off) — all pidfd shapes refused, "
+           "no pidfd minted, byte stream differs from host\n");
+}
+
+/* ---- bounded pidfd authority: out-of-scope fail-closed edges ---------- */
+static void test_pidfd_fail_closed(void) {
+    Cap oracle;
+    int he = host_exec("q", &oracle);
+    if (he != 0) FAIL("host pidfd refuse exit=%d want 0\n", he);
+    long hp, hg, hs;
+    if (sscanf(oracle.b,
+               "PQ-PIDFD-OK=%ld\nPQ-GETFD-UNADMITTED-RC=%ld\n"
+               "PQ-SIGNAL-NONWL-RC=%ld\n", &hp, &hg, &hs) != 3)
+        FAIL("host pidfd refuse output unparsable: [%s]\n", oracle.b);
+    if (hp != 1 || hg <= 0 || hs != 0)
+        FAIL("host oracle changed: pfd=%ld getfd=%ld signal=%ld\n", hp, hg, hs);
+
+    WemuUmResult r;
+    int rc = wemu_exec("q", &r);
+    if (rc != WEMU_UM_OK)
+        FAIL("pidfd refuse status=%s out=[%s]\n", wemu_um_status_name(rc), r.out);
+    if (r.exit_code != 0) FAIL("pidfd refuse exit=%d want 0\n", r.exit_code);
+    check_exact("wemu pidfd refuse", r.out, r.out_len,
+                WANT_PIDFD_REFUSE, sizeof WANT_PIDFD_REFUSE - 1);
+    if (r.pidfd_created != 1 || r.pidfd_getfd_ok != 0 || r.pidfd_signals != 0 ||
+        r.refuses[WEMU_UM_REFUSE_PIDFD_GETFD] != 1 ||
+        r.refuses[WEMU_UM_REFUSE_PIDFD_SEND_SIGNAL] != 1)
+        FAIL("pidfd refuse counts: created=%u getfd=%u signals=%u "
+             "getfd-ref=%u signal-ref=%u\n", r.pidfd_created, r.pidfd_getfd_ok,
+             r.pidfd_signals, r.refuses[WEMU_UM_REFUSE_PIDFD_GETFD],
+             r.refuses[WEMU_UM_REFUSE_PIDFD_SEND_SIGNAL]);
+    printf("        (host pfd=%ld getfd=%ld signal=%ld; WEMU exact getfd/signal "
+           "refusals 1/1)\n", hp, hg, hs);
+    printf("ok: FAIL-CLOSED pidfd — unadmitted target fd and non-whitelisted "
+           "signal refused with exact reasons\n");
+
+    /* NEGATIVE CONTROL (coarse diagnostics): exact OFF reproduces the oldest
+     * path — all three pidfd syscalls are unlisted -> generic -ENOSYS. */
+    if (wemu_um_set_exact_refuse_enabled(0) != 0)
+        FAIL("disable exact diagnostics (pidfd refuse)\n");
+    WemuUmResult old;
+    rc = wemu_exec("q", &old);
+    (void)wemu_um_set_exact_refuse_enabled(1);      /* restore default */
+    if (rc != WEMU_UM_OK || old.exit_code != 0)
+        FAIL("old-path pidfd refuse: status=%s exit=%d\n",
+             wemu_um_status_name(rc), old.exit_code);
+    check_exact("wemu pidfd refuse old", old.out, old.out_len,
+                WANT_PIDFD_REFUSE_OLD, sizeof WANT_PIDFD_REFUSE_OLD - 1);
+    if (old.refuses[WEMU_UM_REFUSE_PIDFD_OPEN] != 0 ||
+        old.refuses[WEMU_UM_REFUSE_PIDFD_GETFD] != 0 ||
+        old.refuses[WEMU_UM_REFUSE_PIDFD_SEND_SIGNAL] != 0)
+        FAIL("old-path coarse pidfd: open=%u getfd=%u signal=%u\n",
+             old.refuses[WEMU_UM_REFUSE_PIDFD_OPEN],
+             old.refuses[WEMU_UM_REFUSE_PIDFD_GETFD],
+             old.refuses[WEMU_UM_REFUSE_PIDFD_SEND_SIGNAL]);
+    printf("ok: NEGATIVE CONTROL (coarse pidfd) — -ENOSYS, no exact pidfd "
+           "reasons\n");
+}
+
 /* ---- positive byte-exact differential: bounded fork-shaped clone3 ------- */
 static void test_fork_positive(void) {
     Cap oracle;
@@ -700,6 +853,8 @@ int main(void) {
     test_sigmask_virtual();
     test_fail_closed2();
     test_refuse3();
+    test_pidfd_authority();
+    test_pidfd_fail_closed();
     test_fork_positive();
     test_disp_positive();
     test_disp_fail_closed();
@@ -707,6 +862,7 @@ int main(void) {
     test_negative_old_path();
     printf("WEMU BOUNDED CLONE3-THREAD GATE PASS (host-byte-exact bounded "
            "thread + virtual per-thread masks + per-thread signal dispositions; "
+           "bounded pidfd authority byte-exact with exact fail-closed edges; "
            "pidfd/tid/cgroup/fork fail closed; exact pidfd/clear-sighand/"
            "sigaction refusals; bounded clone3 fork byte-exact; old paths refuse)\n");
     return 0;

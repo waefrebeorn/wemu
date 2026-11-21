@@ -37,6 +37,11 @@
 #define SYS_pidfd_send_signal_ 424
 #define SYS_pidfd_open_     434
 #define SYS_pidfd_getfd_    438
+#define SYS_openat_         257
+
+#define PIDFD_NONBLOCK_     0x800u
+#define SIGCONT_            18
+#define SIGWINCH_           28
 
 #define SIG_BLOCK_   0
 #define SIG_UNBLOCK_ 1
@@ -294,17 +299,68 @@ static int run_refuse2(void) {
     return 0;
 }
 
-/* ---- exact fail-closed diagnostics: pidfd_open / pidfd_getfd / CLEAR_SIGHAND ----
- * The host oracle proves each is a real kernel feature (pidfd_open on self
- * succeeds, pidfd_getfd on a bad fd is -EBADF, CLEAR_SIGHAND|SIGHAND is
- * -EINVAL); WEMU refuses all three with dedicated exact reasons. */
+/* ---- out-of-scope pidfd shapes stay refused with an exact reason ------
+ * The host oracle proves each shape is a REAL kernel feature (pidfd_open on
+ * self with PIDFD_NONBLOCK succeeds, pidfd_getfd on a bad pidfd is -EBADF);
+ * WEMU refuses both with dedicated exact reasons.  This is the SAME structural
+ * test as the original refuse3, but the pidfd_open now uses an unsupported
+ * FLAG (the plain flags==0 form is an admitted in-scope shape, tested in mode
+ * "p" below). */
 static int run_refuse3(void) {
     long me = rsys(SYS_getpid_, 0, 0, 0, 0, 0, 0);
-    emit_num("PIDFDOPEN-RC=", rsys(SYS_pidfd_open_, me, 0, 0, 0, 0, 0));
+    emit_num("PIDFDOPEN-RC=",
+             rsys(SYS_pidfd_open_, me, PIDFD_NONBLOCK_, 0, 0, 0, 0));
     emit_num("PIDFDGETFD-RC=", rsys(SYS_pidfd_getfd_, -1, -1, 0, 0, 0, 0));
     emit_num("CLRCLEAR-RC=",
              rsys(SYS_clone_, (long)(CLONE_CLEAR_SIGHAND_ | CLONE_SIGHAND_),
                   0, 0, 0, 0, 0));
+    return 0;
+}
+
+/* ---- bounded pidfd authority: positive byte-exact differential -------
+ * Every call below is an IN-SCOPE shape under WEMU's bounded authority:
+ *   pidfd_open(getpid(), 0)      -> the root TID is an admitted guest TID;
+ *   pidfd_getfd(pfd, fd, 0)      -> pfd was minted by WEMU and fd was obtained
+ *                                   by the guest's own openat;
+ *   pidfd_send_signal(pfd, SIGCONT, NULL, 0)
+ *                                -> SIGCONT is the whitelisted benign signal.
+ * WEMU dispatches each to the real host syscall, so the guest-visible booleans
+ * are byte-exact with the native kernel oracle.  Only booleans are emitted
+ * (never raw fd numbers or pids), so the two byte streams are identical. */
+static const char pa_path[] = "/etc/hostname";
+
+static int run_pidfd_authority(void) {
+    long me = rsys(SYS_getpid_, 0, 0, 0, 0, 0, 0);
+    long fd = rsys(SYS_openat_, -100 /* AT_FDCWD */, (long)pa_path,
+                   0 /* O_RDONLY */, 0, 0, 0);
+    emit_num("PA-OPEN-FD-OK=", fd > 0);
+    long pfd = rsys(SYS_pidfd_open_, me, 0, 0, 0, 0, 0);
+    emit_num("PA-PIDFD-OK=", pfd > 0);
+    long gfd = rsys(SYS_pidfd_getfd_, pfd, fd, 0, 0, 0, 0);
+    emit_num("PA-GETFD-OK=", gfd > 0);
+    long sr = rsys(SYS_pidfd_send_signal_, pfd, SIGCONT_, 0, 0, 0, 0);
+    emit_num("PA-SIGNAL-OK=", sr == 0);
+    return 0;
+}
+
+/* ---- bounded pidfd authority: out-of-scope fail-closed edge ----------
+ * Two shapes the authority must REFUSE even with a valid minted pidfd:
+ *   pidfd_getfd(pfd, 2, 0)          -> fd 2 (stderr) was never admitted by a
+ *                                      guest openat (the supervisor wired it);
+ *   pidfd_send_signal(pfd, SIGWINCH, NULL, 0)
+ *                                   -> SIGWINCH is not the whitelisted signal.
+ * The host oracle proves both are real kernel features (getfd duplicates fd 2
+ * and returns a positive fd; SIGWINCH is ignored with rc 0), while WEMU must
+ * refuse each with an exact reason and NO host dispatch.  The leading
+ * pidfd_open(getpid(),0) is an admitted shape and is byte-exact on both legs. */
+static int run_pidfd_refuse(void) {
+    long me = rsys(SYS_getpid_, 0, 0, 0, 0, 0, 0);
+    long pfd = rsys(SYS_pidfd_open_, me, 0, 0, 0, 0, 0);
+    emit_num("PQ-PIDFD-OK=", pfd > 0);
+    emit_num("PQ-GETFD-UNADMITTED-RC=",
+             rsys(SYS_pidfd_getfd_, pfd, 2, 0, 0, 0, 0));
+    emit_num("PQ-SIGNAL-NONWL-RC=",
+             rsys(SYS_pidfd_send_signal_, pfd, SIGWINCH_, 0, 0, 0, 0));
     return 0;
 }
 
@@ -468,6 +524,8 @@ int main(int argc, char **argv) {
     if (mode == 'v')      rc = run_vmask();
     else if (mode == '2') rc = run_refuse2();
     else if (mode == '3') rc = run_refuse3();
+    else if (mode == 'p') rc = run_pidfd_authority();
+    else if (mode == 'q') rc = run_pidfd_refuse();
     else if (mode == 'f') rc = run_fork();
     else if (mode == 'r') rc = run_refuse();
     else if (mode == 'd') rc = run_disp();

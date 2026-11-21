@@ -54,6 +54,17 @@
  * reason code in WemuUmResult.refuses[].  set_tid/cgroup knobs, unmodeled fork
  * shapes and pidfd_send_signal carry their own exact refuse reasons.
  *
+ * BOUNDED PIDFD AUTHORITY: pidfd_open/getfd/send_signal are no longer blanket
+ * refusals.  pidfd_open admits ONLY a TID the guest actually created (the root
+ * slot or an admitted CLONE_THREAD slot) with flags==0 and mints a real host
+ * pidfd, tracked in a bounded table; pidfd_getfd admits ONLY a WEMU-minted
+ * pidfd and a target fd in the guest's admitted fd table; pidfd_send_signal
+ * admits ONLY a WEMU-minted pidfd and a whitelisted benign signal (SIGCONT).
+ * In-scope shapes dispatch the real host syscall, so their guest-visible
+ * result is byte-exact against the kernel oracle.  Every other shape fails
+ * closed with an exact refuse reason and NO host syscall.  The per-thread
+ * signal masks/dispositions and every out-of-scope pidfd refusal are kept.
+ *
  * VIRTUAL PER-THREAD SIGNAL MASKS: rt_sigprocmask is never dispatched to the
  * host.  Each modeled thread owns a private 64-bit kernel sigset; SIG_BLOCK /
  * SIG_UNBLOCK / SIG_SETMASK and oldset are applied to that state, so a guest
@@ -110,9 +121,11 @@
 #define WEMU_UM_SYS_DUP3         292 /* not in the VSL table */
 #define WEMU_UM_SYS_EXECVEAT     322 /* not in the VSL table */
 #define WEMU_UM_SYS_KCMP         312 /* raw kcmp: open-file-description identity */
-#define WEMU_UM_SYS_PIDFD_SEND_SIGNAL 424 /* x86-64: no modeled pidfd authority */
-#define WEMU_UM_SYS_PIDFD_OPEN       434 /* x86-64: no modeled pidfd authority */
-#define WEMU_UM_SYS_PIDFD_GETFD      438 /* x86-64: no modeled pidfd authority */
+#define WEMU_UM_SYS_PIDFD_SEND_SIGNAL 424 /* pidfd_send_signal: bounded authority */
+#define WEMU_UM_SYS_PIDFD_OPEN       434 /* pidfd_open: bounded authority */
+#define WEMU_UM_SYS_PIDFD_GETFD      438 /* pidfd_getfd: bounded authority */
+#define UM_PIDFD_NONBLOCK            0x800u /* fcntl.h PIDFD_NONBLOCK (x86-64) */
+#define UM_SIGCONT                   18     /* x86-64 signal number (kernel) */
 #define UM_KCMP_FILE             0    /* linux/kcmp.h KCMP_FILE */
 #define UM_F_GETFD               1    /* fcntl(2) */
 #define UM_F_DUPFD_CLOEXEC       1030 /* fcntl.h (x86-64) */
@@ -251,6 +264,7 @@ enum { UM_WHY_EXIT = 1, UM_WHY_FAULT, UM_WHY_BUDGET, UM_WHY_ALARM, UM_WHY_BADPTR
  * pointer outside ALL of them is refused before any host syscall sees it. */
 #define UM_MAX_MMAPS  16u
 #define UM_MAX_GUEST_FDS 32u          /* bounded admitted-fd table for execveat */
+#define UM_MAX_PIDFDS 16u             /* bounded WEMU-minted pidfd table */
 #define UM_HEAP_MAX   (16u << 20)   /* max brk growth above the initial break */
 
 /* Number of general registers in mcontext_t (compile-time, no magic 23). */
@@ -347,6 +361,18 @@ typedef struct {
     uint64_t ino;
 } UmAdmittedFd;
 
+/* A pidfd WEMU minted on behalf of the guest via a bounded pidfd_open.  `pfd`
+ * is the guest-visible (== host) fd number and `tid` is the admitted guest TID
+ * it denotes.  Only a pidfd in this table may be used by pidfd_getfd /
+ * pidfd_send_signal: a raw fd number the guest never obtained from WEMU's
+ * pidfd_open is an out-of-scope shape and fails closed.  Process-wide like the
+ * fd table (CLONE_FILES shares fds), guarded by the dispatch lock. */
+typedef struct {
+    long    pfd;
+    long    tid;
+    uint8_t valid;
+} UmPidfd;
+
 static struct {
     volatile uint64_t syscalls;
     volatile uint64_t denied;
@@ -364,6 +390,9 @@ static struct {
      * (CLONE_FILES shares it), so it lives here, guarded by the dispatch lock. */
     UmAdmittedFd guest_fds[UM_MAX_GUEST_FDS];
     uint32_t n_guest_fds;
+    /* Bounded WEMU-minted pidfd table (see UmPidfd above). */
+    UmPidfd pidfds[UM_MAX_PIDFDS];
+    uint32_t n_pidfds;
     uint64_t arena_lo, arena_hi;   /* registered MAP_SHARED guest arena */
     volatile uint32_t bad_ptrs;    /* pointers refused before host dispatch */
     volatile uint32_t bad_ptr_nr;
@@ -399,11 +428,13 @@ static struct {
      * OLD refusal path and the kernel-without-kcmp fallback path. */
     int fd_kcmp_forced_off;      /* 1 = pretend kcmp is unavailable (-ENOSYS) */
     int fd_cloexec_refuse;       /* 1 = OLD path: refuse every CLOEXEC fd */
+    int pidfd_authority_enabled; /* bounded pidfd authority (OLD path off) */
 } g_cfg = { .enabled = 1, .pkey_mode = WEMU_UM_PKEY_AUTO,
             .thread_exec_enabled = 1, .clone3_thread_enabled = 1,
             .sigmask_virtual_enabled = 1, .thread_disp_enabled = 1,
             .exact_refuse_enabled = 1, .fd_ofd_check_enabled = 1,
-            .fd_kcmp_forced_off = 0, .fd_cloexec_refuse = 0 };
+            .fd_kcmp_forced_off = 0, .fd_cloexec_refuse = 0,
+            .pidfd_authority_enabled = 1 };
 
 /* CPU-enforced protection-key state, built in the forked guest child before
  * the first guest instruction.  PKRU is per-thread: the supervisor (parent)
@@ -445,6 +476,9 @@ void wemu_um_reset_isolation(void) {
     g_cfg.fd_ofd_check_enabled = 1;
     g_cfg.fd_kcmp_forced_off = 0;
     g_cfg.fd_cloexec_refuse = 0;
+    g_cfg.pidfd_authority_enabled = 1;
+    memset(&g_um.pidfds, 0, sizeof g_um.pidfds);
+    g_um.n_pidfds = 0;
 }
 
 int wemu_um_set_isolation_enabled(int enabled) {
@@ -751,6 +785,29 @@ int wemu_um_signal_modeled(int sig) { return um_sig_sync(sig); }
 
 int wemu_um_sigaction_modeled(int sig, uint64_t sigsetsize) {
     return um_sig_sync(sig) && sigsetsize == 8;
+}
+
+/* ---- bounded pidfd authority: pure shape predicates ----------------- */
+/* Runtime ownership state (admitted TID / minted pidfd / admitted fd) is
+ * checked by the handler in addition to these pure form checks. */
+int wemu_um_pidfd_open_modeled(uint64_t flags) {
+    return flags == 0;                    /* PIDFD_NONBLOCK / unlisted bits: no */
+}
+
+int wemu_um_pidfd_getfd_modeled(uint64_t flags) {
+    return flags == 0;                    /* pidfd_getfd flags must be zero */
+}
+
+int wemu_um_pidfd_signal_modeled(int sig) {
+    /* SIGCONT's default action is a no-op for a running process, so signalling
+     * a WEMU-minted pidfd with it is a bounded, byte-exact host differential. */
+    return sig == UM_SIGCONT;
+}
+
+int wemu_um_set_pidfd_authority_enabled(int enabled) {
+    if (enabled != 0 && enabled != 1) return -1;
+    g_cfg.pidfd_authority_enabled = enabled;
+    return 0;
 }
 
 /* Registered in the CALLING thread's disposition table (or the legacy shared
@@ -1622,6 +1679,110 @@ static void um_refuse_fast(ucontext_t *uc, UmThread *th, greg_t *r, uint64_t nr,
         um_abort_to_finish(uc, th, UM_WHY_BUDGET);
 }
 
+/* ---- bounded pidfd authority: runtime admission + dispatch ---------- */
+/* 1 when `tid` is a host TID WEMU actually created as a guest thread: the
+ * root slot or an admitted CLONE_THREAD slot, still active.  A guest may only
+ * mint a pidfd for a process it created; an arbitrary pid fails closed. */
+static int um_tid_admitted(long tid) {
+    if (tid <= 0) return 0;
+    for (unsigned i = 0; i < WEMU_UM_MAX_THREADS; i++)
+        if (g_thr[i].active && g_thr[i].tid == tid) return 1;
+    return 0;
+}
+
+static UmPidfd *um_pidfd_lookup(long pfd) {
+    if (pfd < 0) return NULL;
+    for (uint32_t i = 0; i < g_um.n_pidfds; i++)
+        if (g_um.pidfds[i].valid && g_um.pidfds[i].pfd == pfd)
+            return &g_um.pidfds[i];
+    return NULL;
+}
+
+static void um_pidfd_admit(long pfd, long tid) {
+    if (pfd < 0 || g_um.n_pidfds >= UM_MAX_PIDFDS) return;
+    if (um_pidfd_lookup(pfd)) return;            /* bound once: never rebind */
+    UmPidfd *e = &g_um.pidfds[g_um.n_pidfds++];
+    e->pfd = pfd; e->tid = tid; e->valid = 1;
+}
+
+/* Handle a pidfd_* syscall.  Returns 1 when handled (RAX/skip/budget done),
+ * 0 when nr is not one of the three pidfd syscalls. */
+static int um_pidfd_dispatch(ucontext_t *uc, UmThread *th, greg_t *r,
+                             uint64_t nr, uint64_t a[6]) {
+    if (nr != WEMU_UM_SYS_PIDFD_OPEN && nr != WEMU_UM_SYS_PIDFD_GETFD &&
+        nr != WEMU_UM_SYS_PIDFD_SEND_SIGNAL) return 0;
+
+    unsigned reason = nr == WEMU_UM_SYS_PIDFD_OPEN
+        ? WEMU_UM_REFUSE_PIDFD_OPEN
+        : (nr == WEMU_UM_SYS_PIDFD_GETFD
+           ? WEMU_UM_REFUSE_PIDFD_GETFD : WEMU_UM_REFUSE_PIDFD_SEND_SIGNAL);
+
+    if (!g_cfg.exact_refuse_enabled) {
+        /* OLDEST path: pidfd_* were unlisted -> generic -ENOSYS. */
+        um_lock();
+        __atomic_fetch_add(&g_um.syscalls, 1, __ATOMIC_SEQ_CST);
+        um_note_denied(nr);
+        r[REG_RAX] = (greg_t)-ENOSYS;
+        um_skip_syscall(r);
+        if (g_um.denied > 8) um_abort_to_finish(uc, th, UM_WHY_BUDGET);
+        um_unlock();
+        return 1;
+    }
+    if (!g_cfg.pidfd_authority_enabled) {
+        /* OLD hardening path: every pidfd shape refused, exact reason. */
+        um_refuse_fast(uc, th, r, nr, (int)reason, -EINVAL);
+        return 1;
+    }
+
+    /* NEW bounded authority.  Hold the lock across dispatch so the minted-
+     * pidfd / admitted-fd tables stay consistent with the host fd table; the
+     * three host syscalls here are non-blocking. */
+    um_lock();
+    __atomic_fetch_add(&g_um.syscalls, 1, __ATOMIC_SEQ_CST);
+    int in_scope = 0;
+    int64_t ret = -EINVAL;
+    if (nr == WEMU_UM_SYS_PIDFD_OPEN) {
+        if (wemu_um_pidfd_open_modeled(a[1]) && um_tid_admitted((long)a[0])) {
+            in_scope = 1;
+            ret = um_host(nr, a);
+            if (ret >= 0) {
+                um_fd_admit((long)ret);        /* pidfd is a guest-owned fd */
+                um_pidfd_admit((long)ret, (long)a[0]);
+                g_um.result->pidfd_created++;
+            }
+        }
+    } else if (nr == WEMU_UM_SYS_PIDFD_GETFD) {
+        if (wemu_um_pidfd_getfd_modeled(a[2]) &&
+            um_pidfd_lookup((long)a[0]) && um_fd_lookup((long)a[1])) {
+            in_scope = 1;
+            ret = um_host(nr, a);
+            if (ret >= 0) {
+                um_fd_admit((long)ret);        /* the duplicate is a guest fd */
+                g_um.result->pidfd_getfd_ok++;
+            }
+        }
+    } else { /* WEMU_UM_SYS_PIDFD_SEND_SIGNAL */
+        if (um_pidfd_lookup((long)a[0]) && a[2] == 0 /* info == NULL */ &&
+            a[3] == 0 /* flags */ &&
+            wemu_um_pidfd_signal_modeled((int)(int32_t)a[1])) {
+            in_scope = 1;
+            ret = um_host(nr, a);
+            if (ret == 0) g_um.result->pidfd_signals++;
+        }
+    }
+    if (!in_scope) {
+        /* Out-of-scope shape: exact fail-closed, NO host syscall dispatched. */
+        um_note_denied(nr);
+        g_um.result->refuses[reason]++;
+    }
+    r[REG_RAX] = (greg_t)ret;
+    um_skip_syscall(r);
+    if (g_um.syscalls >= WEMU_UM_MAX_SYSCALLS || g_um.denied > 8)
+        um_abort_to_finish(uc, th, UM_WHY_BUDGET);
+    um_unlock();
+    return 1;
+}
+
 /* Virtual per-thread signal mask: apply rt_sigprocmask to the CALLING
  * thread's private sigset and NEVER to the host thread mask.  Both buffers
  * were validated by um_ptr_args_ok (8 bytes each); a set touching a WEMU
@@ -1658,6 +1819,12 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
     UmThread *th = um_thread_select();
     if (!th || !th->active) _exit(200);      /* never dispatch outside a run */
 
+    /* Bounded pidfd authority: pidfd_open/getfd/send_signal are admitted only
+     * for in-scope shapes (admitted TID / minted pidfd / admitted fd, benign
+     * signal) and dispatched to the real host syscall; every other shape fails
+     * closed with an exact reason.  No host syscall runs for a refusal. */
+    if (um_pidfd_dispatch(uc, th, r, nr, a)) return;
+
     /* CLONE_CLEAR_SIGHAND asks the kernel to reset the child's signal handlers
      * to SIG_DFL.  WEMU models per-thread disposition tables inherited by copy
      * at clone, but this explicit reset knob is still unmodeled: honouring it
@@ -1690,29 +1857,6 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
      * before any host clone, with an exact reason (raw SYS_clone form). */
     if (nr == VSL_SYS_CLONE && (a[0] & UM_CLONE_PIDFD)) {
         um_refuse_fast(uc, th, r, nr, WEMU_UM_REFUSE_CLONE_PIDFD, -EINVAL);
-        return;
-    }
-
-    /* pidfd_send_signal would let a guest signal a process it never created:
-     * WEMU models no pidfd authority, so refuse with an exact reason before
-     * any host syscall.  With exact diagnostics off this falls through to the
-     * OLD generic -ENOSYS (negative control). */
-    if (g_cfg.exact_refuse_enabled && nr == WEMU_UM_SYS_PIDFD_SEND_SIGNAL) {
-        um_refuse_fast(uc, th, r, nr, WEMU_UM_REFUSE_PIDFD_SEND_SIGNAL, -EINVAL);
-        return;
-    }
-
-    /* pidfd_open(2) / pidfd_getfd(2) mint a process handle (a pidfd) or duplicate
-     * another process's fd into it.  WEMU models NO pidfd authority: there is
-     * no table of pidfds a guest obtained, so dispatching either to the host
-     * would hand it a handle to a process it never created.  Refuse before any
-     * host syscall with a dedicated reason.  With exact diagnostics off both
-     * are unlisted syscalls and keep the OLD generic -ENOSYS (negative control). */
-    if (g_cfg.exact_refuse_enabled &&
-        (nr == WEMU_UM_SYS_PIDFD_OPEN || nr == WEMU_UM_SYS_PIDFD_GETFD)) {
-        um_refuse_fast(uc, th, r, nr,
-            nr == WEMU_UM_SYS_PIDFD_OPEN ? WEMU_UM_REFUSE_PIDFD_OPEN
-                                         : WEMU_UM_REFUSE_PIDFD_GETFD, -EINVAL);
         return;
     }
 

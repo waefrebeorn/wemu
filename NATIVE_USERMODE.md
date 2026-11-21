@@ -226,21 +226,37 @@ table entry against the kernel's `asm/unistd_64.h`.
 - **Threads are raw-clone only.** `pthread_create()` from a static glibc guest
   (with its full TLS/robust-list/rseq/setxid machinery) has NOT been verified;
   the differential fixture uses raw `SYS_clone` plus `CLONE_SETTLS` and reads
-  its per-thread index from its own TLS block. `clone3` thread flags,
-  `CLONE_NEW*` namespaces, nonzero thread exit signals, pidfds, thread
-  priorities/sched attributes, `CLONE_CLEAR_SIGHAND`, pidfd authority and LTP
-  remain unmodelled. Per-thread virtual signal masks and per-thread signal
-  dispositions ARE modelled (inherited by copy at clone); cross-thread signal
-  targeting is not. `WEMU_UM_MAX_THREADS - 1` host threads per run is a hard
-  ceiling; exhaustion returns `-EAGAIN`.
+  its per-thread index from its own TLS block. Bounded `clone3` CLONE_THREAD
+  IS modelled (a real host thread inheriting the parent's virtual mask and
+  disposition table). `CLONE_NEW*` namespaces, nonzero thread exit signals,
+  `CLONE_PIDFD`, thread priorities/sched attributes and `CLONE_CLEAR_SIGHAND`
+  remain unmodelled and fail closed. Per-thread virtual signal masks and
+  per-thread signal dispositions ARE modelled (inherited by copy at clone);
+  cross-thread signal targeting is not. A bounded pidfd authority IS modelled
+  (see below). `WEMU_UM_MAX_THREADS - 1` host threads per run is a hard ceiling;
+  exhaustion returns `-EAGAIN`.
+- **Bounded pidfd authority.** `pidfd_open(tid, 0)` is admitted ONLY for a TID
+  WEMU actually created (the root slot or an admitted CLONE_THREAD slot) and
+  mints a real host pidfd tracked in a bounded table; `pidfd_getfd` is admitted
+  ONLY for a WEMU-minted pidfd and a target fd in the guest's admitted fd
+  table; `pidfd_send_signal` is admitted ONLY for a minted pidfd with the
+  whitelisted benign signal SIGCONT (`info=NULL`, `flags=0`). In-scope shapes
+  dispatch the real host syscall, so their guest-visible result is byte-exact
+  with the kernel oracle; every other shape fails closed with an exact refuse
+  reason and NO host dispatch (unsupported pidfd flags, arbitrary pids,
+  unminted pidfds, unadmitted target fds, non-whitelisted signals).
+  `wemu_um_set_pidfd_authority_enabled(0)` reproduces the old all-refuse path
+  (negative control); with exact diagnostics OFF all three are unlisted
+  (-ENOSYS).
 - A guest signal delivered to one thread uses that thread's slot (no nesting);
   cross-thread signal targeting (`tgkill`) and `CLONE_CHILD_CLEARTID`-driven
   futex wake-ups are left to the host kernel, not modelled by the dispatcher.
 - The bounded signal path delivers only signo (RSI/RDX siginfo/ucontext args
   are zero), restores general registers only (not XMM/x87 state), allows no
   nesting, and needs the guest's `SA_RESTORER` for a C handler to return.
-  Asynchronous signals (kill/tgkill/timers) and guest-owned signal masks are
-  not modelled; `rt_sigprocmask` still passes through to the host.
+  Asynchronous signal generation (kill/tgkill/timers) is not modelled;
+  `rt_sigprocmask` is virtualised from the calling thread's private mask and
+  never applied to the host thread.
 - The filter window covers ELF PT_LOAD mappings. The stack (now built inside
   the supervisor's `MAP_SHARED` guest arena when one is registered), the
   bounded brk heap and admitted guest mmaps are registered for **pointer
@@ -282,13 +298,14 @@ table entry against the kernel's `asm/unistd_64.h`.
   (MPK active), the fail-closed munmap fallback with a plain `#PF`, and the
   old-path negative control that leaks. `tools/mpk_negctl.sh` rebuilds the
   unmodified 1b09ea3 executor to show the old path has no pkey evidence and
-  leaks when isolation is off. LTP,
-  `pthread_create`, vfork sharing, clone3 pidfds and guest signal masks are
-  not yet modelled. Exec only replaces static ET_EXEC/ET_DYN images:
-  PT_INTERP (ld.so), dynamic loaders, and ELF interpreter scripts over a
-  depth bound are refused. Bounded execve from a non-root shared-VM
-  CLONE_THREAD guest IS modelled (peers quiesced, register/TLS state reset);
-  pidfd/`clone3`/sigmask thread shapes are not. Bounded fd-relative
+  leaks when isolation is off. `pthread_create`, vfork sharing and LTP are not
+  yet modelled; bounded clone3 CLONE_THREAD, pidfd authority and guest signal
+  masks/dispositions ARE modelled (see above). Exec only replaces static
+  ET_EXEC/ET_DYN images: PT_INTERP (ld.so), dynamic loaders, and ELF interpreter
+  scripts over a depth bound are refused. Bounded execve from a non-root
+  shared-VM CLONE_THREAD guest IS modelled (peers quiesced, register/TLS state
+  reset); pidfd/`clone3`/sigmask thread shapes outside the bounded forms are
+  refused. Bounded fd-relative
   `execveat` (admitted-fd AT_EMPTY_PATH and dirfd-relative path) IS modelled;
   CLOEXEC/reopen fd aliasing and AT_SYMLINK_NOFOLLOW are not. Seccomp windows
   accumulate across execs (bounded to `WEMU_UM_MAX_EXECS`), and XMM/x87 state

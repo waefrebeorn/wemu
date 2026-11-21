@@ -94,8 +94,10 @@ typedef enum {
                                              * new path switched off (old path) */
 #define WEMU_UM_REFUSE_CLONE3_SIGMASK_SIZE 7u  /* clone_args larger than v0
                                                 * (future sigmask field): -E2BIG */
-#define WEMU_UM_REFUSE_PIDFD_SEND_SIGNAL 8u  /* pidfd_send_signal: no modeled
-                                             * pidfd authority to signal */
+#define WEMU_UM_REFUSE_PIDFD_SEND_SIGNAL 8u  /* pidfd_send_signal outside the
+                                             * bounded authority (pidfd not
+                                             * minted by WEMU / signal not
+                                             * whitelisted / unsupported args) */
 #define WEMU_UM_REFUSE_CLONE3_SET_TID    9u  /* clone_args.set_tid/_size (guest
                                              * chooses a host TID) */
 #define WEMU_UM_REFUSE_CLONE3_CGROUP     10u /* clone_args.cgroup (guest picks a
@@ -104,13 +106,21 @@ typedef enum {
                                              * flags/knobs are outside the
                                              * bounded COW fork form */
 /* Hardened-path exact refuses added for the pidfd/CLEAR_SIGHAND leg.  Each is
- * returned to the guest as -EINVAL and counted in WemuUmResult.refuses[].  With
- * exact diagnostics OFF these shapes keep their OLD behaviour: pidfd_open /
- * pidfd_getfd are unlisted syscalls (generic -ENOSYS), raw-clone CLEAR_SIGHAND
- * is refused by the generic clone-flag policy, and clone3 CLEAR_SIGHAND folds
- * back into the legacy CLONE3_SIGMASK code (2). */
-#define WEMU_UM_REFUSE_PIDFD_OPEN         12u /* pidfd_open: no modeled pidfd authority */
-#define WEMU_UM_REFUSE_PIDFD_GETFD        13u /* pidfd_getfd: no modeled pidfd authority */
+ * returned to the guest as -EINVAL and counted in WemuUmResult.refuses[].  The
+ * three PIDFD_* reasons now mark shapes OUTSIDE the bounded pidfd authority
+ * (the in-scope shapes are admitted onto the real host syscall); with the
+ * authority switched OFF every pidfd shape keeps the OLD unconditional refusal.
+ * With exact diagnostics OFF these shapes keep their OLDEST behaviour:
+ * pidfd_open / pidfd_getfd / pidfd_send_signal are unlisted syscalls (generic
+ * -ENOSYS), raw-clone CLEAR_SIGHAND is refused by the generic clone-flag
+ * policy, and clone3 CLEAR_SIGHAND folds back into the legacy CLONE3_SIGMASK
+ * code (2). */
+#define WEMU_UM_REFUSE_PIDFD_OPEN         12u /* pidfd_open outside the bounded
+                                               * authority (unadmitted TID or
+                                               * unsupported flags) */
+#define WEMU_UM_REFUSE_PIDFD_GETFD        13u /* pidfd_getfd outside the bounded
+                                               * authority (unminted pidfd or
+                                               * unadmitted target fd) */
 #define WEMU_UM_REFUSE_CLONE_CLEAR_SIGHAND 14u /* CLONE_CLEAR_SIGHAND (raw clone
                                                * OR clone3): unmodeled per-thread
                                                * signal-handler reset */
@@ -147,6 +157,9 @@ typedef struct {
                                     * thread's virtual mask (NO host call) */
     uint32_t  sig_disp_registrations; /* rt_sigaction registrations recorded in
                                     * a modeled thread's disposition table */
+    uint32_t  pidfd_created;     /* pidfds minted via bounded pidfd_open */
+    uint32_t  pidfd_getfd_ok;    /* successful bounded pidfd_getfd duplications */
+    uint32_t  pidfd_signals;     /* bounded pidfd_send_signal deliveries */
     uint64_t  host_sigmask_end;  /* real host-thread mask at finish: control
                                   * evidence that no guest mask leaked to it */
     uint32_t  bad_ptrs;          /* guest pointers refused before host dispatch */
@@ -314,6 +327,33 @@ int wemu_um_execveat_modeled(long dirfd, uint64_t flags);
  * either a plain ELF candidate or a script WEMU refuses.  Pure predicate
  * (no I/O): the gate uses it to audit the fail-closed edges. */
 int wemu_um_exec_script_modeled(const char *hdr, size_t n);
+
+/* ---- bounded pidfd authority ---------------------------------------- */
+/* Pure shape predicates for the bounded pidfd authority.  Runtime ownership
+ * state (which TIDs/fds/pidfds the guest legitimately obtained) is checked by
+ * the handler IN ADDITION to these pure form checks. */
+/* pidfd_open is admitted only with flags == 0 (no PIDFD_NONBLOCK or unlisted
+ * bits) AND a TID the guest actually created (the root slot or an admitted
+ * CLONE_THREAD slot). */
+int wemu_um_pidfd_open_modeled(uint64_t flags);
+/* pidfd_getfd is admitted only with flags == 0, a WEMU-minted pidfd, and a
+ * target fd in the guest's admitted fd table. */
+int wemu_um_pidfd_getfd_modeled(uint64_t flags);
+/* pidfd_send_signal is admitted only for a WEMU-minted pidfd, info == NULL,
+ * flags == 0, and a whitelisted signal.  The whitelist is SIGCONT alone: its
+ * default action is a no-op for a running process, which makes a byte-exact
+ * host differential feasible without changing process state.  Every other
+ * signal fails closed. */
+int wemu_um_pidfd_signal_modeled(int sig);
+
+/* Negative-control switch for the bounded pidfd authority.  ON (default):
+ * in-scope pidfd_open/getfd/send_signal are dispatched to the real host
+ * syscall and tracked; out-of-scope shapes fail closed with an exact reason.
+ * OFF: the OLD path refuses EVERY pidfd syscall with its exact reason (the
+ * pre-authority hardening).  With exact diagnostics OFF the oldest generic
+ * -ENOSYS behaviour holds regardless of this switch.  Returns 0, or -1 for a
+ * value other than 0/1. */
+int wemu_um_set_pidfd_authority_enabled(int enabled);
 
 /* ---- process-per-guest address-space isolation ----------------------- */
 /* Register a supervisor-owned MAP_SHARED region as the GUEST ARENA.  The
