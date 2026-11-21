@@ -30,6 +30,16 @@ extern "C" {
 #define WEMU_UM_MAX_EXECS     4u       /* bounded image replacements/run */
 #define WEMU_UM_MAX_SCRIPT_DEPTH 4u    /* bounded #! interpreter chain/run */
 #define WEMU_UM_MAX_HOST_PAGES 8u      /* bounded host-only regions hidden/guest */
+/* Bounded virtual interval timer.  A single one-shot ITIMER_REAL is modelled,
+ * generating SIGALRM into the ARMINING thread's one pending slot at a syscall
+ * checkpoint.  True asynchronous host SIGALRM delivery is deliberately not
+ * modelled: it would collide with WEMU's own SIGALRM run bound and is not
+ * byte-exact reproducible.  A guest delay is mapped onto a bounded virtual
+ * checkpoint clock (WEMU_UM_TIMER_TICK_USEC per tick); larger delays, periodic
+ * intervals, other timer kinds and other signals fail closed. */
+#define WEMU_UM_TIMER_MAX_USEC   1000000u /* 1 s: alarm(1) admitted, >1 s refused */
+#define WEMU_UM_TIMER_TICK_USEC  1000u    /* one virtual checkpoint tick = 1 ms */
+#define WEMU_UM_TIMER_MAX_TICKS  1000u    /* MAX_USEC / TICK_USEC */
 
 /* CPU-enforced protection-key (MPK/pkeys) mode for the isolation path.
  * AUTO uses x86-64 protection keys when the host supports them and falls
@@ -77,9 +87,12 @@ typedef enum {
                                   * to an admitted sibling's private slot */
     WEMU_UM_DISPATCH_KILL,       /* kill: bounded process-directed signal
                                   * queued to the calling admitted thread */
-    WEMU_UM_DISPATCH_SIGALTSTACK /* sigaltstack: bounded per-thread alternate
+    WEMU_UM_DISPATCH_SIGALTSTACK, /* sigaltstack: bounded per-thread alternate
                                   * signal stack; SA_ONSTACK frames are placed
                                   * on it with an exact SS_ONSTACK query */
+    WEMU_UM_DISPATCH_TIMER       /* setitimer/getitimer/alarm: bounded virtual
+                                  * one-shot ITIMER_REAL generating SIGALRM
+                                  * into the arming thread's pending slot */
 } WemuUmDispatch;
 
 /* Exact fail-closed reasons.  `refuses[code]` in WemuUmResult counts how many
@@ -178,7 +191,21 @@ typedef enum {
                                               * the registered altstack at
                                               * delivery: fail closed, no
                                               * guest handler runs */
-#define WEMU_UM_N_REFUSE                 30u
+/* Bounded virtual interval timer.  Only a one-shot ITIMER_REAL delay within
+ * WEMU_UM_TIMER_MAX_USEC is admitted; every other shape fails closed with an
+ * exact reason and NEVER arms a host timer or displaces WEMU's own SIGALRM
+ * run bound.  Under coarse diagnostics these fold back to generic -ENOSYS.
+ * Codes are appended AFTER the altstack block; values are stable by symbol. */
+#define WEMU_UM_REFUSE_TIMER_WHICH       30u /* which != ITIMER_REAL */
+#define WEMU_UM_REFUSE_TIMER_VALUE       31u /* delay out of bounded range */
+#define WEMU_UM_REFUSE_TIMER_INTERVAL    32u /* periodic it_interval unmodeled */
+#define WEMU_UM_REFUSE_TIMER_PTR         33u /* bad guest itimerval pointer */
+#define WEMU_UM_REFUSE_TIMER_BUSY        34u /* target's one pending slot busy
+                                             * when the virtual timer fires */
+#define WEMU_UM_REFUSE_TIMER_TARGET      35u /* arming thread slot no longer
+                                             * active when the timer fires */
+#define WEMU_UM_REFUSE_TIMER_DISABLED    36u /* timer path off (OLD path): -ENOSYS */
+#define WEMU_UM_N_REFUSE                 37u
 
 typedef struct {
     uint32_t        nr;
@@ -257,6 +284,15 @@ typedef struct {
     uint32_t  altstack_calls;
     uint32_t  onstack_deliveries;
     uint32_t  onstack_denied;
+    /* Bounded virtual timer evidence (appended after FP fields so existing
+     * offsets are unchanged).  armed=one-shot ITIMER_REAL arming calls;
+     * ticks=virtual checkpoint clock advances; signals=SIGALRM events queued
+     * into the arming thread's pending slot; dropped=events refused because
+     * the one slot was busy or its thread was gone. */
+    uint32_t  timer_armed;
+    uint32_t  timer_ticks;
+    uint32_t  timer_signals;
+    uint32_t  timer_dropped;
 } WemuUmResult;
 
 /* Run one ELF to completion.  Both ET_EXEC (mapped at its link addresses)
@@ -316,13 +352,14 @@ int wemu_um_clone3_fork_modeled(const void *args, size_t size);
  * thread's private state instead of the host thread. */
 int wemu_um_sigprocmask_modeled(int how, uint64_t set);
 
-/* Pure shape predicate for the bounded PER-THREAD signal disposition table:
- * rt_sigaction is admitted only for a synchronous-fault signal in the modeled
- * whitelist (SIGSEGV/SIGBUS/SIGILL/SIGFPE) with the exact x86-64 kernel
- * sigaction size (8).  Every other signal or size fails closed (-EINVAL) and
- * is counted under WEMU_UM_REFUSE_SIGACTION; no host handler is ever installed
- * and no other thread's disposition table is touched.  Handler-in-image is a
- * runtime check (the image window is only known at run time). */
+/* Pure shape predicate for the bounded per-thread signal disposition table:
+ * rt_sigaction is admitted for a synchronous-fault signal in the modeled
+ * whitelist (SIGSEGV/SIGBUS/SIGILL/SIGFPE) OR the bounded timer signal
+ * (SIGALRM, generated only by a modeled ITIMER_REAL).  The exact x86-64
+ * kernel sigaction size (8) is required.  Every other signal or size fails
+ * closed (-EINVAL) and is counted under WEMU_UM_REFUSE_SIGACTION; no host
+ * handler is ever installed and no other thread's disposition table is
+ * touched.  Handler-in-image is a runtime check (image window is runtime). */
 int wemu_um_sigaction_modeled(int sig, uint64_t sigsetsize);
 
 /* Pure shape predicate for bounded tgkill: only a signal in the modeled
@@ -341,6 +378,24 @@ int wemu_um_kill_modeled(int sig);
  * unlisted syscall (-ENOSYS), counted under WEMU_UM_REFUSE_KILL_DISABLED.
  * Returns 0, or -1 for a value other than 0/1. */
 int wemu_um_set_kill_enabled(int enabled);
+
+/* ---- bounded virtual interval timer --------------------------------- */
+/* Pure shape predicate: which == ITIMER_REAL (0), a ZERO repeat interval
+ * (periodic timers are unmodeled), and a positive one-shot delay no larger
+ * than WEMU_UM_TIMER_MAX_USEC.  Runtime checks (guest buffer inside the
+ * registered image/stack/heap/mmap ranges, one pending slot free) are done in
+ * addition; this predicate has no I/O and is safe for the gate to audit. */
+int wemu_um_timer_modeled(int which, uint64_t interval_usec, uint64_t value_usec);
+/* The only signal a modelled timer may generate is SIGALRM (14), with the
+ * kernel's siginfo for a setitimer alarm (si_code=SI_KERNEL=128, si_pid/uid
+ * zero).  Any other signal fails closed. */
+int wemu_um_timer_signal_modeled(int sig);
+/* Negative-control switch for the bounded timer.  ON (default): setitimer /
+ * getitimer / alarm are dispatched into the virtual ITIMER_REAL model.
+ * OFF: the OLD path — all three are unlisted syscalls returning -ENOSYS, with
+ * no virtual timer and no exact timer refusal reasons.  Returns 0, or -1 for
+ * a value other than 0/1. */
+int wemu_um_set_timer_enabled(int enabled);
 
 /* Negative-control switch for bounded tgkill.  ON (default): tgkill is
  * dispatched into the bounded pending-signal path.  OFF: the OLD path, where

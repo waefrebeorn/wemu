@@ -45,7 +45,17 @@
  * is virtualized per thread (no host altstack is ever installed) and a handler
  * registered with SA_ONSTACK gets its frame on that altstack with an exact
  * SS_ONSTACK query and byte-exact ucontext; unsupported shapes fail closed.
- * Nested delivery, timers and a multi-slot pending queue remain unmodeled.
+ * BOUNDED VIRTUAL INTERVAL TIMER: setitimer/getitimer/alarm are intercepted
+ * into a single one-shot ITIMER_REAL virtual clock.  It NEVER touches the
+ * host's real timer (which is WEMU's own SIGALRM run bound): the guest delay
+ * is mapped onto a bounded checkpoint clock, and when the timer expires it
+ * queues ONE SIGALRM event into the ARMINING thread's per-thread pending slot,
+ * delivered at a syscall checkpoint with the kernel's setitimer siginfo
+ * (si_code=SI_KERNEL=128, si_pid=si_uid=0) byte-exact vs a host oracle.
+ * A timer that fires while that one slot is busy, a missing arming thread,
+ * periodic intervals, other which values, out-of-range delays and any timer
+ * signal other than SIGALRM fail closed with exact WEMU_UM_REFUSE_TIMER_*
+ * reasons.  True asynchronous delivery and nested delivery are not modelled.
  *
  * Bounded fork/clone: fork/vfork, clone and clone3 are dispatched in-process.
  * A fork-shaped request (CSIGNAL 0/SIGCHLD, optionally the two glibc TID
@@ -169,6 +179,10 @@ typedef struct {
     uint32_t ss_pad;
     uint64_t ss_size;
 } UmStackT;
+#define WEMU_UM_SYS_SETITIMER         38  /* bounded virtual ITIMER_REAL timer */
+#define WEMU_UM_SYS_GETITIMER         36  /* read back the virtual timer */
+#define UM_ITIMER_REAL               0    /* sys/time.h ITIMER_REAL */
+#define UM_SI_KERNEL               128    /* linux/signal.h SI_KERNEL (setitimer) */
 #define UM_SI_USER                  0    /* linux/signal.h: SI_USER (kill) */
 #define UM_KCMP_FILE             0    /* linux/kcmp.h KCMP_FILE */
 #define UM_F_GETFD               1    /* fcntl(2) */
@@ -232,6 +246,9 @@ static const WemuUmSyscallEntry um_table[] = {
     { WEMU_UM_SYS_TGKILL,      "tgkill",          WEMU_UM_DISPATCH_TGKILL },
     { WEMU_UM_SYS_KILL,        "kill",            WEMU_UM_DISPATCH_KILL },
     { WEMU_UM_SYS_SIGALTSTACK, "sigaltstack",     WEMU_UM_DISPATCH_SIGALTSTACK },
+    { WEMU_UM_SYS_SETITIMER,   "setitimer",       WEMU_UM_DISPATCH_TIMER },
+    { WEMU_UM_SYS_GETITIMER,   "getitimer",       WEMU_UM_DISPATCH_TIMER },
+    { VSL_SYS_ALARM,           "alarm",           WEMU_UM_DISPATCH_TIMER },
     { VSL_SYS_IOCTL,           "ioctl",           WEMU_UM_DISPATCH_HOST },
     { VSL_SYS_WRITEV,          "writev",          WEMU_UM_DISPATCH_HOST },
     { WEMU_UM_SYS_SENDFILE,    "sendfile",        WEMU_UM_DISPATCH_HOST },
@@ -487,6 +504,18 @@ typedef struct {
     uint8_t valid;
 } UmPidfd;
 
+/* Bounded virtual ITIMER_REAL timer.  Set/cleared and advanced under the
+ * dispatch lock; the SIGALRM it generates is queued into the ARMINING thread's
+ * one pending slot (the bounded deterministic choice for a process-directed
+ * timer signal).  `arm_checkpoint` stops the arming syscall's own checkpoint
+ * from consuming the first tick. */
+typedef struct {
+    volatile int armed;
+    uint32_t     ticks_left;
+    unsigned     target_slot;
+    uint64_t     arm_checkpoint;
+} UmVirtTimer;
+
 static struct {
     volatile uint64_t syscalls;
     volatile uint64_t denied;
@@ -507,6 +536,7 @@ static struct {
     /* Bounded WEMU-minted pidfd table (see UmPidfd above). */
     UmPidfd pidfds[UM_MAX_PIDFDS];
     uint32_t n_pidfds;
+    UmVirtTimer timer;             /* bounded one-shot ITIMER_REAL */
     uint64_t arena_lo, arena_hi;   /* registered MAP_SHARED guest arena */
     volatile uint32_t bad_ptrs;    /* pointers refused before host dispatch */
     volatile uint32_t bad_ptr_nr;
@@ -537,6 +567,7 @@ static struct {
     int thread_disp_enabled;     /* per-thread rt_sigaction disposition tables */
     int tgkill_enabled;          /* bounded cross-thread signal targeting */
     int kill_enabled;            /* bounded process-directed kill targeting */
+    int timer_enabled;           /* bounded virtual ITIMER_REAL timer */
     int fp_signal_enabled;       /* FP/XMM/x87 byte-exact signal frames (OLD path off) */
     int fp_force_unsupported;    /* test-only: force the fail-closed FP path */
     int exact_refuse_enabled;    /* dedicated refuse codes instead of coarse */
@@ -553,6 +584,7 @@ static struct {
             .thread_exec_enabled = 1, .clone3_thread_enabled = 1,
             .sigmask_virtual_enabled = 1, .thread_disp_enabled = 1,
             .tgkill_enabled = 1, .kill_enabled = 1,
+            .timer_enabled = 1,
             .fp_signal_enabled = 1, .fp_force_unsupported = 0,
             .exact_refuse_enabled = 1, .fd_ofd_check_enabled = 1,
             .fd_kcmp_forced_off = 0, .fd_cloexec_refuse = 0,
@@ -597,6 +629,7 @@ void wemu_um_reset_isolation(void) {
     g_cfg.thread_disp_enabled = 1;
     g_cfg.tgkill_enabled = 1;
     g_cfg.kill_enabled = 1;
+    g_cfg.timer_enabled = 1;
     g_cfg.fp_signal_enabled = 1;
     g_cfg.fp_force_unsupported = 0;
     g_cfg.exact_refuse_enabled = 1;
@@ -671,6 +704,11 @@ int wemu_um_sigaltstack_modeled(uint64_t ss_flags, uint64_t ss_size) {
     return ss_size >= UM_MINSIGSTKSZ && ss_size <= UM_MAXSIGSTKSZ;
 }
 
+int wemu_um_set_timer_enabled(int enabled) {
+    if (enabled != 0 && enabled != 1) return -1;
+    g_cfg.timer_enabled = enabled;
+    return 0;
+}
 int wemu_um_set_fp_signal_enabled(int enabled) {
     if (enabled != 0 && enabled != 1) return -1;
     g_cfg.fp_signal_enabled = enabled;
@@ -953,10 +991,25 @@ static int um_sig_sync(int sig) {
     return sig == SIGSEGV || sig == SIGBUS || sig == SIGILL || sig == SIGFPE;
 }
 
+/* The ONLY non-fault signal WEMU models: SIGALRM generated by a bounded
+ * ITIMER_REAL.  It can never arise from a CPU fault, so um_fault still uses
+ * um_sig_sync(); only the pending-slot delivery path uses this wider set. */
+static int um_sig_timer(int sig) { return sig == SIGALRM; }
+static int um_sig_deliverable(int sig) {
+    return um_sig_sync(sig) || um_sig_timer(sig);
+}
+
 int wemu_um_signal_modeled(int sig) { return um_sig_sync(sig); }
 
+int wemu_um_timer_signal_modeled(int sig) { return um_sig_timer(sig); }
+
+int wemu_um_timer_modeled(int which, uint64_t interval_usec, uint64_t value_usec) {
+    return which == UM_ITIMER_REAL && interval_usec == 0 &&
+           value_usec > 0 && value_usec <= WEMU_UM_TIMER_MAX_USEC;
+}
+
 int wemu_um_sigaction_modeled(int sig, uint64_t sigsetsize) {
-    return um_sig_sync(sig) && sigsetsize == 8;
+    return (um_sig_sync(sig) || um_sig_timer(sig)) && sigsetsize == 8;
 }
 
 /* ---- bounded pidfd authority: pure shape predicates ----------------- */
@@ -2231,16 +2284,24 @@ static int um_deliver_frame(UmThread *th, ucontext_t *uc, greg_t *r,
     return 0;
 }
 
-/* Consume a pending cross-thread signal at the TARGET thread's next syscall
- * checkpoint.  Mask, disposition, nesting and budget are the TARGET's own
- * state: a blocked signal stays queued (one bounded slot) until it is
- * unblocked; no handler, nesting or budget exhaustion fails closed. */
+/* Forward decl: the virtual clock is advanced at every syscall checkpoint
+ * before any pending event is consumed. */
+static void um_timer_tick(void);
+
+/* Consume a pending cross-thread OR timer-generated signal at the TARGET
+ * thread's next syscall checkpoint.  Mask, disposition, nesting and budget are
+ * the TARGET's own state: a blocked signal stays queued (one bounded slot)
+ * until it is unblocked; no handler, nesting or budget exhaustion fails
+ * closed.  SIGALRM is accepted ONLY with the kernel's setitimer si_code so an
+ * unrelated queued event cannot be mistaken for a timer signal. */
 static void um_check_pending(UmThread *th, ucontext_t *uc, greg_t *r) {
+    um_timer_tick();
     if (!__atomic_load_n(&th->pending, __ATOMIC_ACQUIRE)) return;
     UmSigEvent ev;
     memcpy(&ev, &th->pending_ev, sizeof ev);
     int signo = ev.signo;
-    if (signo <= 0 || !um_sig_sync(signo)) {
+    if (signo <= 0 || !um_sig_deliverable(signo) ||
+        (um_sig_timer(signo) && ev.code != UM_SI_KERNEL)) {
         __atomic_store_n(&th->pending, 0, __ATOMIC_RELEASE);
         th->sig_denied++;
         return;
@@ -2344,6 +2405,167 @@ static int64_t um_kill(UmThread *th, const uint64_t a[6]) {
     th->pending_ev.uid = (int)(int32_t)um_raw0(102 /* SYS_getuid */);
     __atomic_store_n(&th->pending, 1, __ATOMIC_RELEASE);
     g_um.result->kill_accepted++;
+    return 0;
+}
+
+/* ---- bounded virtual ITIMER_REAL timer ------------------------------- */
+/* x86-64 kernel layouts: struct timeval = two longs; struct itimerval = two
+ * timevals (interval, value).  Read only from guest-validated buffers. */
+typedef struct { int64_t sec, usec; } UmTimeval;
+typedef struct { UmTimeval interval, value; } UmItimerval;
+
+/* One generated timer event is refused with a named reason and no host
+ * dispatch.  With exact diagnostics OFF the same shape folds back into the
+ * coarse, generic -ENOSYS path (negative control). */
+static int64_t um_timer_refuse(UmThread *th, uint64_t nr, unsigned reason,
+                               int64_t err) {
+    th->sig_denied++;
+    if (!g_cfg.exact_refuse_enabled) {
+        um_note_denied(nr);
+        return -ENOSYS;
+    }
+    if (reason < WEMU_UM_N_REFUSE) g_um.result->refuses[reason]++;
+    return err;
+}
+
+/* Map a bounded one-shot delay to the virtual checkpoint clock.  The run is
+ * bounded by WEMU_UM_MAX_SYSCALLS/timeout, so a bounded number of ticks is
+ * the only deterministic, host-comparable representation of wall time here. */
+static uint32_t um_timer_ticks(uint64_t usec) {
+    uint64_t t = (usec + WEMU_UM_TIMER_TICK_USEC - 1u) / WEMU_UM_TIMER_TICK_USEC;
+    if (t < 1u) t = 1u;
+    if (t > WEMU_UM_TIMER_MAX_TICKS) t = WEMU_UM_TIMER_MAX_TICKS;
+    return (uint32_t)t;
+}
+
+/* Arm the single virtual timer.  Delivery target is the ARMINING thread's one
+ * pending slot: the bounded deterministic choice for a process-directed
+ * SIGALRM (a real kernel may pick any eligible thread). */
+static void um_timer_arm(UmThread *th, uint64_t value_usec) {
+    g_um.timer.armed = 1;
+    g_um.timer.ticks_left = um_timer_ticks(value_usec);
+    g_um.timer.target_slot = (unsigned)(th - g_thr);
+    g_um.timer.arm_checkpoint = g_um.syscalls;  /* never tick on the arming call */
+    g_um.result->timer_armed++;
+}
+
+/* Advance the virtual clock one syscall checkpoint.  When it reaches zero the
+ * timer is one-shot (disarmed) and ONE SIGALRM event is queued into the arming
+ * thread's slot with the kernel's setitimer siginfo.  If that one slot is busy
+ * or the thread is gone, the event is dropped fail-closed with an exact reason
+ * — there is no hidden second slot and no host signal is ever sent.  Called
+ * under the dispatch lock from um_check_pending, which delivers the event at
+ * this same checkpoint. */
+static void um_timer_tick(void) {
+    UmVirtTimer *t = &g_um.timer;
+    if (!t->armed) return;
+    if (g_um.syscalls <= t->arm_checkpoint) return;
+    g_um.result->timer_ticks++;
+    if (t->ticks_left > 1u) { t->ticks_left--; return; }
+    t->ticks_left = 0;
+    t->armed = 0;
+    if (t->target_slot >= WEMU_UM_MAX_THREADS) {
+        g_um.result->timer_dropped++;
+        if (g_cfg.exact_refuse_enabled)
+            g_um.result->refuses[WEMU_UM_REFUSE_TIMER_TARGET]++;
+        return;
+    }
+    UmThread *dst = &g_thr[t->target_slot];
+    if (!__atomic_load_n(&dst->active, __ATOMIC_ACQUIRE)) {
+        g_um.result->timer_dropped++;
+        if (g_cfg.exact_refuse_enabled)
+            g_um.result->refuses[WEMU_UM_REFUSE_TIMER_TARGET]++;
+        return;
+    }
+    if (__atomic_load_n(&dst->pending, __ATOMIC_ACQUIRE)) {
+        g_um.result->timer_dropped++;
+        if (g_cfg.exact_refuse_enabled)
+            g_um.result->refuses[WEMU_UM_REFUSE_TIMER_BUSY]++;
+        return;
+    }
+    dst->pending_ev.signo = SIGALRM;
+    dst->pending_ev.code = UM_SI_KERNEL;   /* host oracle: setitimer -> SI_KERNEL */
+    dst->pending_ev.err = 0;
+    dst->pending_ev.addr = 0;
+    dst->pending_ev.pid = 0;
+    dst->pending_ev.uid = 0;
+    __atomic_store_n(&dst->pending, 1, __ATOMIC_RELEASE);
+    g_um.result->timer_signals++;
+}
+
+/* setitimer(2) / getitimer(2) / alarm(2), all dispatched through one bounded
+ * path.  Every argument is validated before any state changes: a bad which,
+ * periodic interval, out-of-range delay, negative alarm, or a guest pointer
+ * outside the mapped ranges fails closed with an exact reason and never
+ * touches the host's real ITIMER_REAL (WEMU's SIGALRM run bound). */
+static int64_t um_timer_syscall(UmThread *th, uint64_t nr, const uint64_t a[6]) {
+    if (!g_cfg.timer_enabled) return um_timer_refuse(th, nr,
+                                  WEMU_UM_REFUSE_TIMER_DISABLED, -ENOSYS);
+
+    /* alarm(seconds): no pointers.  Only 0 (disarm) or 1 s is bounded. */
+    if (nr == VSL_SYS_ALARM) {
+        int64_t sec = (int64_t)a[0];
+        if (sec < 0 ||
+            (uint64_t)sec > WEMU_UM_TIMER_MAX_USEC / 1000000ull)
+            return um_timer_refuse(th, nr, WEMU_UM_REFUSE_TIMER_VALUE, -EINVAL);
+        uint64_t old = g_um.timer.armed
+                     ? (uint64_t)g_um.timer.ticks_left * WEMU_UM_TIMER_TICK_USEC
+                     : 0ull;
+        if (sec == 0) {
+            g_um.timer.armed = 0;
+            g_um.timer.ticks_left = 0;
+        } else {
+            um_timer_arm(th, (uint64_t)sec * 1000000ull);
+        }
+        return (int64_t)(old / 1000000ull);  /* seconds left, rounded down */
+    }
+
+    /* setitimer/getitimer: the new/old itimerval buffers must be mapped guest
+     * memory (NULL means 'absent' and is only valid for the optional oldvalue). */
+    if (!a[1] || !um_chk(nr, a[1], sizeof(UmItimerval)) ||
+        (nr == WEMU_UM_SYS_SETITIMER && a[2] &&
+         !um_chk(nr, a[2], sizeof(UmItimerval))))
+        return um_timer_refuse(th, nr, WEMU_UM_REFUSE_TIMER_PTR, -EFAULT);
+
+    if ((int64_t)a[0] != UM_ITIMER_REAL)
+        return um_timer_refuse(th, nr, WEMU_UM_REFUSE_TIMER_WHICH, -EINVAL);
+
+    uint64_t rem = g_um.timer.armed
+                 ? (uint64_t)g_um.timer.ticks_left * WEMU_UM_TIMER_TICK_USEC : 0ull;
+    if (nr == WEMU_UM_SYS_GETITIMER) {
+        UmItimerval *out = (UmItimerval *)(uintptr_t)a[1];
+        out->interval.sec = out->interval.usec = 0;
+        out->value.sec = (int64_t)(rem / 1000000ull);
+        out->value.usec = (int64_t)(rem % 1000000ull);
+        return 0;
+    }
+
+    UmItimerval nv;
+    memcpy(&nv, (const void *)(uintptr_t)a[1], sizeof nv);
+    /* A repeating interval would require a multi-slot queue and a second
+     * delivery budget; it is unmodeled and fails closed. */
+    if (nv.interval.sec != 0 || nv.interval.usec != 0)
+        return um_timer_refuse(th, nr, WEMU_UM_REFUSE_TIMER_INTERVAL, -EINVAL);
+    if (nv.value.sec < 0 || nv.value.usec < 0 ||
+        nv.value.usec >= 1000000 ||
+        (uint64_t)nv.value.sec > WEMU_UM_TIMER_MAX_USEC / 1000000ull ||
+        ((uint64_t)nv.value.sec * 1000000ull + (uint64_t)nv.value.usec) >
+            WEMU_UM_TIMER_MAX_USEC)
+        return um_timer_refuse(th, nr, WEMU_UM_REFUSE_TIMER_VALUE, -EINVAL);
+
+    if (a[2]) {
+        UmItimerval *oldp = (UmItimerval *)(uintptr_t)a[2];
+        oldp->interval.sec = oldp->interval.usec = 0;
+        oldp->value.sec = (int64_t)(rem / 1000000ull);
+        oldp->value.usec = (int64_t)(rem % 1000000ull);
+    }
+    uint64_t usec = (uint64_t)nv.value.sec * 1000000ull + (uint64_t)nv.value.usec;
+    if (usec == 0) {
+        g_um.timer.armed = 0;              /* setitimer(...,{0,0}) disarms */
+        g_um.timer.ticks_left = 0;
+    } else {
+        um_timer_arm(th, usec);
+    }
     return 0;
 }
 
@@ -2639,6 +2861,8 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
         ret = um_tgkill(th, a);
     } else if (e->kind == WEMU_UM_DISPATCH_KILL) {
         ret = um_kill(th, a);
+    } else if (e->kind == WEMU_UM_DISPATCH_TIMER) {
+        ret = um_timer_syscall(th, nr, a);
     } else if (e->kind == WEMU_UM_DISPATCH_SIGPROCMASK) {
         /* A guest that masks SIGSYS would stop trapping its own syscalls;
          * SIGALRM is the run bound and SIGUSR2 the exec-quiesce handshake.
@@ -3351,6 +3575,7 @@ static void um_exec_continue(void) {
     g_um.n_mmaps = 0;
     g_um.bad_ptrs = 0; g_um.bad_ptr_nr = 0; g_um.bad_ptr_va = 0;
     g_um.fault_code = 0; g_um.fault_pkey = -1;
+    memset(&g_um.timer, 0, sizeof g_um.timer);      /* no timer survives exec */
     memset(&g_um.shared_disp, 0, sizeof g_um.shared_disp);
     /* Per-thread tables are cleared with their slots below (all slots are
      * memset on image replacement), so no disposition survives the exec. */

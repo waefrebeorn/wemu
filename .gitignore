@@ -25,4 +25,5 @@ test_isa_atomic_fence
 /tests/exec_script
 /tests/thread_exec
 /tests/clone3_thread
+/tests/pie_timer
 /tests/wemu_script_*.scr

@@ -15,7 +15,7 @@ TESTS = test_isa test_avx test_paging test_machine test_string test_cpuid \
         test_task_gates test_ldt test_call_gate_priv test_task_gpr \
         test_usermode_native test_usermode_exec test_usermode_isolate \
         test_usermode_mpk test_usermode_exec2 test_usermode_execfd \
-        test_usermode_threadexec test_usermode_clone3
+        test_usermode_threadexec test_usermode_clone3 test_usermode_timer
 
 all: libwemu.a
 
@@ -28,7 +28,8 @@ EXEC_FIX   = tests/exec_chain
 EXEC2_FIX  = tests/script_interp tests/exec_fork tests/exec_script
 TEXEC_FIX  = tests/thread_exec
 C3_FIX     = tests/clone3_thread
-PIE_BINS   = $(PIE_STATIC) $(PIE_DYN) $(FORK_FIX) $(THREAD_FIX) $(EXEC_FIX) $(EXEC2_FIX) $(TEXEC_FIX) $(C3_FIX)
+TIMER_FIX  = tests/pie_timer
+PIE_BINS   = $(PIE_STATIC) $(PIE_DYN) $(FORK_FIX) $(THREAD_FIX) $(EXEC_FIX) $(EXEC2_FIX) $(TEXEC_FIX) $(C3_FIX) $(TIMER_FIX)
 SANDBOX_BIN = tests/sandbox_probe
 ISOLATE_BIN = tests/isolate_probe
 
@@ -64,6 +65,15 @@ test_usermode_execfd: tests/test_usermode_execfd.c libwemu.a $(EXEC_FIX) tests/p
 
 # Bounded execve-from-CLONE_THREAD differential gate (raw TLS-safe fixture).
 test_usermode_threadexec: tests/test_usermode_threadexec.c libwemu.a $(TEXEC_FIX)
+	$(CC) $(CFLAGS) -o $@ $< libwemu.a -lm
+
+# Bounded virtual-timer fixture: raw syscalls + SA_SIGINFO SIGALRM handler;
+# keep the TLS canary out so the handler is safe under the emulator's %fs.
+tests/pie_timer: tests/pie_timer.c
+	$(CC) -static-pie -O2 -fno-stack-protector -o $@ $<
+
+# Bounded virtual ITIMER_REAL -> per-thread pending-slot gate.
+test_usermode_timer: tests/test_usermode_timer.c libwemu.a $(TIMER_FIX)
 	$(CC) $(CFLAGS) -o $@ $< libwemu.a -lm
 
 # Bounded clone3 CLONE_THREAD + pidfd/sigmask fail-closed differential gate.
