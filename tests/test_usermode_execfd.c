@@ -169,6 +169,83 @@ static void test_negative_unadmitted_real_fd(void) {
            "denied=%llu, no replacement\n", (unsigned long long)r.denied);
 }
 
+/* Close+reopen fd-NUMBER reuse.  The host executes the reopened file
+ * (PIE-LOAD-BIAS-OK, exit 0).  The OLD number-only path (OFD check disabled)
+ * matches the host byte-exact; the DEFAULT path detects the changed OFD and
+ * refuses with -EBADF, leaving the image intact.  This proves the hardening
+ * actually changes behaviour rather than merely refusing everything. */
+static void test_fd_reuse(void) {
+    char a0[] = GUEST_BIN;
+    char *av[] = { a0, (char *)"reuse", (char *)GUEST_BIN,
+                   (char *)"tests/pie_hello", NULL };
+    const char *want = "PIE-LOAD-BIAS-OK\n";
+
+    Cap oracle;
+    int he = host_exec(av, &oracle);
+    if (he != 0) FAIL("fd-reuse: host oracle exit=%d want 0\n", he);
+    check_exact("host", oracle.b, oracle.n, want, strlen(want));
+
+    /* OLD path: number-only admission still execs the reopened fd. */
+    if (wemu_um_set_fd_ofd_check_enabled(0) != 0)
+        FAIL("fd-reuse: set_fd_ofd_check_enabled(0)\n");
+    WemuUmResult oldr;
+    int rc = wemu_um_run_elf(GUEST_BIN, av, GUEST_ENV, &oldr);
+    if (rc != WEMU_UM_OK || oldr.exit_code != 0 || oldr.execs != 1 ||
+        oldr.denied != 0 || strcmp(oldr.out, want) != 0)
+        FAIL("fd-reuse OLD path: status=%s exit=%d execs=%u denied=%llu out=[%s]\n",
+             wemu_um_status_name(rc), oldr.exit_code, oldr.execs,
+             (unsigned long long)oldr.denied, oldr.out);
+    check_exact("old-reuse", oldr.out, oldr.out_len, oracle.b, oracle.n);
+
+    /* NEW path (default): reused number is refused, no image replacement. */
+    if (wemu_um_set_fd_ofd_check_enabled(1) != 0)
+        FAIL("fd-reuse: set_fd_ofd_check_enabled(1)\n");
+    WemuUmResult r;
+    rc = wemu_um_run_elf(GUEST_BIN, av, GUEST_ENV, &r);
+    if (rc != WEMU_UM_OK || r.exit_code != 16 || r.execs != 0 ||
+        r.denied == 0 || strcmp(r.out, "REUSE-RC=-9\n") != 0)
+        FAIL("fd-reuse NEW path: status=%s exit=%d execs=%u denied=%llu out=[%s]\n",
+             wemu_um_status_name(rc), r.exit_code, r.execs,
+             (unsigned long long)r.denied, r.out);
+    printf("ok: NEGATIVE CONTROL reused-number fd -> -EBADF, denied=%llu, "
+           "no replacement (OLD path execs byte-exact)\n",
+           (unsigned long long)r.denied);
+}
+
+/* O_CLOEXEC fd on fexecve: the host honours it (internal dup), WEMU's bounded
+ * model refuses it (no internal-dup model) — fail closed, no replacement. */
+static void test_cloexec(void) {
+    char a0[] = GUEST_BIN;
+    char *av[] = { a0, (char *)"cloexec", (char *)GUEST_BIN, NULL };
+
+    Cap oracle;
+    int he = host_exec(av, &oracle);
+    if (he != 42 || oracle.n != strlen(WANT) ||
+        memcmp(oracle.b, WANT, oracle.n) != 0)
+        FAIL("cloexec: host oracle exit=%d out=[%s]\n", he, oracle.b);
+
+    if (wemu_um_set_fd_ofd_check_enabled(0) != 0)
+        FAIL("cloexec: set_fd_ofd_check_enabled(0)\n");
+    WemuUmResult oldr;
+    int rc = wemu_um_run_elf(GUEST_BIN, av, GUEST_ENV, &oldr);
+    if (rc != WEMU_UM_OK || oldr.exit_code != 42 || oldr.execs != 1 ||
+        oldr.denied != 0 || strcmp(oldr.out, WANT) != 0)
+        FAIL("cloexec OLD path: status=%s exit=%d execs=%u out=[%s]\n",
+             wemu_um_status_name(rc), oldr.exit_code, oldr.execs, oldr.out);
+
+    if (wemu_um_set_fd_ofd_check_enabled(1) != 0)
+        FAIL("cloexec: set_fd_ofd_check_enabled(1)\n");
+    WemuUmResult r;
+    rc = wemu_um_run_elf(GUEST_BIN, av, GUEST_ENV, &r);
+    if (rc != WEMU_UM_OK || r.exit_code != 18 || r.execs != 0 ||
+        r.denied == 0 || strcmp(r.out, "CLOEXEC-RC=-9\n") != 0)
+        FAIL("cloexec NEW path: status=%s exit=%d execs=%u denied=%llu out=[%s]\n",
+             wemu_um_status_name(rc), r.exit_code, r.execs,
+             (unsigned long long)r.denied, r.out);
+    printf("ok: NEGATIVE CONTROL O_CLOEXEC fd -> -EBADF, denied=%llu, "
+           "no replacement (OLD path byte-exact)\n", (unsigned long long)r.denied);
+}
+
 int main(void) {
     test_policy();
 
@@ -190,6 +267,13 @@ int main(void) {
 
     /* A real, valid fd the guest never opened: host execs, WEMU refuses. */
     test_negative_unadmitted_real_fd();
+
+    /* close+reopen that reuses an admitted fd NUMBER: refused with the new
+     * OFD check, byte-exact vs host with the old number-only path. */
+    test_fd_reuse();
+
+    /* O_CLOEXEC fd on fexecve: refused by the bounded model. */
+    test_cloexec();
 
     char *av_bf[] = { empty, (char *)"badflags", (char *)GUEST_BIN, NULL };
     test_negative_host_exact("badflags", av_bf, "BADFLAGS-RC=-22\n", 11);

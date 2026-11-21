@@ -84,6 +84,34 @@ int main(int argc, char **argv) {
         put_errno("REL-RC", -errno);
         return 9;
     }
+    /* NEW: an O_CLOEXEC fd passed to fexecve.  The host honours it via an
+     * internal dup; the bounded WEMU model refuses a CLOEXEC fd (no fexecve
+     * internal-dup model) with -EBADF.  With the OFD gate disabled, the old
+     * number-only path admits it (byte-exact vs host). */
+    if (argc >= 2 && strcmp(argv[1], "cloexec") == 0) {
+        int fd = (int)syscall(SYS_openat, AT_FDCWD, path, O_RDONLY | O_CLOEXEC, 0);
+        if (fd < 0) { put_errno("OPEN-RC", -errno); return 17; }
+        syscall(SYS_execveat, fd, "", nargv, nenv, AT_EMPTY_PATH);
+        put_errno("CLOEXEC-RC", -errno);
+        return 18;
+    }
+    /* NEW: close+reopen reuse of an admitted fd NUMBER.  The first open is
+     * admitted; after close, the SAME number is reopened on a DIFFERENT ELF.
+     * On the host execveat runs the reopened file (PIE-LOAD-BIAS-OK).  WEMU
+     * must refuse the reused number (-EBADF) because its open-file-description
+     * no longer matches the one bound at admission. */
+    if (argc >= 2 && strcmp(argv[1], "reuse") == 0) {
+        const char *p1 = argc >= 3 ? argv[2] : "tests/exec_chain";
+        const char *p2 = argc >= 4 ? argv[3] : "tests/pie_hello";
+        int fd = (int)syscall(SYS_openat, AT_FDCWD, p1, O_RDONLY, 0);
+        if (fd < 0) { put_errno("OPEN1-RC", -errno); return 14; }
+        syscall(SYS_close, fd);                 /* release the admitted number */
+        int fd2 = (int)syscall(SYS_openat, AT_FDCWD, p2, O_RDONLY, 0);
+        if (fd2 < 0) { put_errno("OPEN2-RC", -errno); return 15; }
+        syscall(SYS_execveat, fd2, "", nargv, nenv, AT_EMPTY_PATH);
+        put_errno("REUSE-RC", -errno);
+        return 16;
+    }
     /* NEW: an fd passed in by the harness (valid, executable on the host) but
      * NEVER opened by the guest — must be refused by the fd admission table. */
     if (argc >= 2 && strcmp(argv[1], "fdarg") == 0) {

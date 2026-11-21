@@ -56,8 +56,8 @@ test_usermode_exec: tests/test_usermode_exec.c libwemu.a $(EXEC_FIX) $(PIE_DYN)
 test_usermode_exec2: tests/test_usermode_exec2.c libwemu.a $(EXEC2_FIX) $(EXEC_FIX)
 	$(CC) $(CFLAGS) -o $@ $< libwemu.a -lm
 
-# Bounded fd-relative execveat differential gate (reuses exec_chain fixture).
-test_usermode_execfd: tests/test_usermode_execfd.c libwemu.a $(EXEC_FIX)
+# Bounded fd-relative execveat differential gate (reuses exec_chain + pie_hello fixtures).
+test_usermode_execfd: tests/test_usermode_execfd.c libwemu.a $(EXEC_FIX) tests/pie_hello
 	$(CC) $(CFLAGS) -o $@ $< libwemu.a -lm
 
 # Bounded execve-from-CLONE_THREAD differential gate (raw TLS-safe fixture).

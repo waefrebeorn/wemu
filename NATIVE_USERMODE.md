@@ -114,10 +114,20 @@ untrusted-guest sandbox. Nothing here is enabled implicitly by `wemu_cpu_run`.
   unknown/negative dirfd fail closed.  An fd-relative form additionally
   requires the fd to be in a bounded, process-wide **admitted guest fd table**
   populated only by successful guest `openat`/`dup3` — a guest cannot execute
-  a file described by a supervisor fd it never opened.  The SIGSYS handler
-  checks pointers/flags/fd admission and saves the exec source; it returns
-  `-EINVAL` for a bad form, `-EBADF` for an unadmitted fd and `-EBUSY` for an
-  exhausted budget (`denied++` throughout).  On
+  a file described by a supervisor fd it never opened.  Each admitted number
+  is bound ONCE to its **open-file-description**: the supervisor holds a CLOEXEC
+  dup of that OFD (above the guest fd range) and the exec handler verifies it
+  with raw `kcmp(KCMP_FILE, fd, held)==0`.  A guest `close` + `openat`/`dup2`
+  that reuses the number creates a NEW OFD, so the exec is refused with `-EBADF`
+  and no image replacement — even when the reopened file is the same inode,
+  and regardless of any supervisor fd that later owns the number.  A fd with
+  `FD_CLOEXEC` set at admission is also refused (the bounded model does not
+  reproduce `fexecve`'s internal-dup exception); the negative-control switch
+  `wemu_um_set_fd_ofd_check_enabled(0)` restores the OLD number-only behaviour
+  used by the differential gate.  The SIGSYS handler checks
+  pointers/flags/fd admission and saves the exec source; it returns
+  `-EINVAL` for a bad form, `-EBADF` for an unadmitted/reused/CLOEXEC fd and
+  `-EBUSY` for an exhausted budget (`denied++` throughout).  On
   the accepted path it rewrites the SigSYS ucontext to resume on the ORIGINAL
   host stack (or a FRESH host stack for a thread caller — see below),
   restores the HOST `%fs` (so the loader's malloc/stdio use host
@@ -132,7 +142,9 @@ untrusted-guest sandbox. Nothing here is enabled implicitly by `wemu_cpu_run`.
   and capped at `WEMU_UM_MAX_EXECS` (4).  Differential gates: `test_usermode_exec`
   (self-exec chain byte-exact vs host `execve`) and `test_usermode_execfd`
   (AT_EMPTY_PATH on an admitted fd and dirfd-relative path byte-exact vs host
-  `execveat`; unadmitted-supervisor-fd / unknown-fd / unsupported-flag controls).
+  `execveat`; unadmitted-supervisor-fd / unknown-fd / unsupported-flag controls,
+  plus reused-number fd and O_CLOEXEC fd refusals with the OLD path proven to
+  exec byte-exact).
 - **Bounded thread group**: at most `WEMU_UM_MAX_THREADS - 1` shared-VM host
   threads per run, counted in the shared result page.  Exhaustion returns
   `-EAGAIN` and increments `denied`.  Thread state is a fixed slot table

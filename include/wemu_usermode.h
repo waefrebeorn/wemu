@@ -157,6 +157,15 @@ int wemu_um_thread_exec_modeled(uint64_t flags);
  * Returns 0, or -1 for a value other than 0/1. */
 int wemu_um_set_thread_exec_enabled(int enabled);
 
+/* Negative-control switch for the fd-admission OFD gate.  When enabled
+ * (default), every admitted execveat fd is bound to its open-file-description
+ * with kcmp, so a guest close+reopen (or dup2 onto) an admitted number is
+ * refused; a CLOEXEC fd is also refused (the bounded model does not reproduce
+ * fexecve's internal-dup exception).  When disabled, admission is number-only
+ * — the OLD path — which the differential gate uses to prove the fix changes
+ * behaviour.  Returns 0, or -1 for a value other than 0/1. */
+int wemu_um_set_fd_ofd_check_enabled(int enabled);
+
 /* 1 when the execveat(dirfd, flags) SHAPE is inside the bounded model:
  * AT_FDCWD + no flags (CWD-relative path), an fd >= 0 + no flags
  * (dirfd-relative path), or an fd >= 0 + AT_EMPTY_PATH (execute the fd

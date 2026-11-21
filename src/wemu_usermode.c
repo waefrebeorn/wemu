@@ -89,6 +89,12 @@
 #define WEMU_UM_SYS_SCHED_GETAFFINITY 204 /* not in the VSL table */
 #define WEMU_UM_SYS_DUP3         292 /* not in the VSL table */
 #define WEMU_UM_SYS_EXECVEAT     322 /* not in the VSL table */
+#define WEMU_UM_SYS_KCMP         312 /* raw kcmp: open-file-description identity */
+#define UM_KCMP_FILE             0    /* linux/kcmp.h KCMP_FILE */
+#define UM_F_GETFD               1    /* fcntl(2) */
+#define UM_F_DUPFD_CLOEXEC       1030 /* fcntl.h (x86-64) */
+#define UM_FD_CLOEXEC            1    /* fcntl.h FD_CLOEXEC */
+#define UM_ADMITTED_FD_MIN       512  /* held OFD dups stay above guest fd numbers */
 #define UM_AT_FDCWD              (-100)
 #define UM_AT_EMPTY_PATH         0x1000u /* fcntl.h AT_EMPTY_PATH (x86-64) */
 #define UM_ARCH_GET_FS           0x1003
@@ -269,6 +275,18 @@ typedef struct {
 static UmThreadBoot g_boot;
 static volatile int g_boot_ready;    /* parent waits until the child copied it */
 
+/* An admitted guest fd is bound to the OPEN FILE DESCRIPTION that was live
+ * when the guest obtained the number (openat/dup3).  `held` is a supervisor
+ * CLOEXEC dup of that OFD, kept above the guest fd range; `fd` is the guest-
+ * visible number.  kcmp(KCMP_FILE, fd, held)==0 at exec time proves the number
+ * still describes the SAME OFD — a close+reopen (or dup2 onto the number)
+ * yields a different struct file and is refused, even for the same inode. */
+typedef struct {
+    long    fd;        /* admitted guest fd number */
+    long    held;      /* supervisor dup of the admitted OFD (CLOEXEC) */
+    uint8_t cloexec;   /* guest fd had FD_CLOEXEC set at admission */
+} UmAdmittedFd;
+
 static struct {
     volatile uint64_t syscalls;
     volatile uint64_t denied;
@@ -278,11 +296,13 @@ static struct {
     uint64_t mmap_lo[UM_MAX_MMAPS], mmap_hi[UM_MAX_MMAPS];
     uint32_t n_mmaps;
     /* Bounded guest fd table: fd numbers the guest legitimately obtained
-     * (openat/dup3).  execveat with AT_EMPTY_PATH or a dirfd-relative path is
-     * admitted ONLY for an fd in this table, so a guest cannot execute a file
-     * described by a supervisor fd it never opened.  fd state is process-wide
+     * (openat/dup3), each bound to the open-file-description live at that
+     * moment.  execveat with AT_EMPTY_PATH or a dirfd-relative path is admitted
+     * ONLY for an fd in this table whose OFD is UNCHANGED (kcmp) — a guest
+     * cannot execute a file described by a supervisor fd it never opened, nor
+     * one whose number it closed and reopened.  fd state is process-wide
      * (CLONE_FILES shares it), so it lives here, guarded by the dispatch lock. */
-    long     guest_fds[UM_MAX_GUEST_FDS];
+    UmAdmittedFd guest_fds[UM_MAX_GUEST_FDS];
     uint32_t n_guest_fds;
     uint64_t arena_lo, arena_hi;   /* registered MAP_SHARED guest arena */
     volatile uint32_t bad_ptrs;    /* pointers refused before host dispatch */
@@ -310,8 +330,9 @@ static struct {
     int enabled;
     int pkey_mode;               /* WEMU_UM_PKEY_AUTO or FORCE_FALLBACK */
     int thread_exec_enabled;     /* bounded execve from a CLONE_THREAD guest */
+    int fd_ofd_check_enabled;    /* bind admitted fds to their OFD (kcmp) */
 } g_cfg = { .enabled = 1, .pkey_mode = WEMU_UM_PKEY_AUTO,
-            .thread_exec_enabled = 1 };
+            .thread_exec_enabled = 1, .fd_ofd_check_enabled = 1 };
 
 /* CPU-enforced protection-key state, built in the forked guest child before
  * the first guest instruction.  PKRU is per-thread: the supervisor (parent)
@@ -346,6 +367,7 @@ void wemu_um_reset_isolation(void) {
     g_cfg.enabled = 1;
     g_cfg.pkey_mode = WEMU_UM_PKEY_AUTO;
     g_cfg.thread_exec_enabled = 1;
+    g_cfg.fd_ofd_check_enabled = 1;
 }
 
 int wemu_um_set_isolation_enabled(int enabled) {
@@ -357,6 +379,12 @@ int wemu_um_set_isolation_enabled(int enabled) {
 int wemu_um_set_thread_exec_enabled(int enabled) {
     if (enabled != 0 && enabled != 1) return -1;
     g_cfg.thread_exec_enabled = enabled;
+    return 0;
+}
+
+int wemu_um_set_fd_ofd_check_enabled(int enabled) {
+    if (enabled != 0 && enabled != 1) return -1;
+    g_cfg.fd_ofd_check_enabled = enabled;
     return 0;
 }
 
@@ -725,6 +753,33 @@ static int64_t um_raw3(long nr, long a0, long a1, long a2) {
                      : "a"(nr), "D"(a0), "S"(a1), "d"(a2)
                      : "rcx", "r11", "memory");
     return (int64_t)ret;
+}
+
+/* Raw fcntl(fd, cmd, arg) for fd admission from the SIGSYS handler (guest
+ * %fs): F_DUPFD_CLOEXEC holds a stable OFD handle; F_GETFD reads the guest's
+ * FD_CLOEXEC bit.  glibc's fcntl() writes errno through the guest TCB. */
+static long um_raw_fcntl(long fd, long cmd, long arg) {
+    long ret;
+    __asm__ volatile("syscall" : "=a"(ret)
+                     : "a"(72L /* SYS_fcntl */), "D"(fd), "S"(cmd), "d"(arg)
+                     : "rcx", "r11", "memory");
+    return ret;
+}
+
+/* Raw kcmp(pid,pid,KCMP_FILE,a,b) for open-file-description identity.  The
+ * caller passes pid from raw getpid() so no glibc/TLS is touched.  Kernel
+ * return: 0 = same struct file (same OFD), >0 = different OFD, -errno on
+ * error (fd closed or kcmp unavailable) — the caller treats only 0 as a
+ * match, so all failures fail closed. */
+static long um_raw_kcmp(long pid, long a, long b) {
+    register long r10 __asm__("r10") = a;
+    register long r8  __asm__("r8")  = b;
+    long ret;
+    __asm__ volatile("syscall" : "=a"(ret)
+                     : "a"((long)WEMU_UM_SYS_KCMP), "D"(pid), "S"(pid),
+                       "d"((long)UM_KCMP_FILE), "r"(r10), "r"(r8)
+                     : "rcx", "r11", "memory");
+    return ret;
 }
 
 /* A CLONE_THREAD guest's stack is a static array INSIDE the image window that
@@ -1131,20 +1186,41 @@ static int64_t um_do_fork(UmThread *th) {
 /* ---- bounded guest fd table for execveat ---------------------------- */
 /* openat/dup3 results the guest legitimately obtained are recorded here; an
  * execveat that needs an fd (AT_EMPTY_PATH or a dirfd-relative path) is
- * admitted ONLY for a number in this table.  A guest cannot reference a file
- * described by a supervisor fd it never opened.  Bounded and process-wide
- * (CLONE_FILES shares fds), so it lives in g_um under the dispatch lock. */
+ * admitted ONLY for a number in this table whose OPEN FILE DESCRIPTION is
+ * still the one bound at admission.  A number is bound ONCE and never rebind:
+ * after close+reopen (or dup2 onto) the number, the new OFD differs and the
+ * exec is refused — even when the reopened file is the very same inode.  The
+ * supervisor holds a CLOEXEC dup of the admitted OFD above the guest fd range
+ * as the stable comparison handle.  A guest cannot reference a file described
+ * by a supervisor fd it never opened, nor swap a trusted number underneath
+ * the model.  Bounded and process-wide (CLONE_FILES shares fds), so it lives
+ * in g_um under the dispatch lock. */
+static const UmAdmittedFd *um_fd_lookup(long fd) {
+    if (fd < 0) return NULL;
+    for (uint32_t i = 0; i < g_um.n_guest_fds; i++)
+        if (g_um.guest_fds[i].fd == fd) return &g_um.guest_fds[i];
+    return NULL;
+}
+
 static void um_fd_admit(long fd) {
     if (fd < 0 || g_um.n_guest_fds >= UM_MAX_GUEST_FDS) return;
-    for (uint32_t i = 0; i < g_um.n_guest_fds; i++)
-        if (g_um.guest_fds[i] == fd) return;
-    g_um.guest_fds[g_um.n_guest_fds++] = fd;
+    if (um_fd_lookup(fd)) return;               /* bound once: never rebind */
+    long held = um_raw_fcntl(fd, UM_F_DUPFD_CLOEXEC, UM_ADMITTED_FD_MIN);
+    if (held < 0) return;                        /* fail closed: cannot track OFD */
+    long flags = um_raw_fcntl(fd, UM_F_GETFD, 0);
+    UmAdmittedFd *e = &g_um.guest_fds[g_um.n_guest_fds++];
+    e->fd = fd;
+    e->held = held;
+    e->cloexec = (uint8_t)(flags >= 0 && (flags & UM_FD_CLOEXEC) != 0);
 }
-static int um_fd_is_admitted(long fd) {
-    if (fd < 0) return 0;
-    for (uint32_t i = 0; i < g_um.n_guest_fds; i++)
-        if (g_um.guest_fds[i] == fd) return 1;
-    return 0;
+
+/* 1 when the guest fd still describes the EXACT admitted open-file-description.
+ * kcmp(KCMP_FILE)==0 proves a shared struct file; a close+reopen (or dup2 onto
+ * the number) yields >0, and a closed fd / unavailable kcmp yields -errno.
+ * Only 0 passes, so every failure mode fails closed. */
+static int um_fd_ofd_ok(const UmAdmittedFd *e) {
+    long pid = (long)um_raw0(39 /* SYS_getpid */);
+    return um_raw_kcmp(pid, e->fd, e->held) == 0;
 }
 
 /* execveat SHAPE predicate (pure; no runtime fd state).  1 when (dirfd,flags)
@@ -1153,7 +1229,7 @@ static int um_fd_is_admitted(long fd) {
  *   fd >= 0 + no flags           -> dirfd-relative path (fd checked at runtime)
  *   fd >= 0 + AT_EMPTY_PATH      -> execute the fd itself  (runtime-checked)
  * AT_FDCWD+AT_EMPTY_PATH (no fd), unknown/negative dirfd and ANY other flag bit
- * fail closed.  The caller pairs this with um_fd_is_admitted(). */
+ * fail closed.  The caller pairs this with the runtime OFD admission check. */
 int wemu_um_execveat_modeled(long dirfd, uint64_t flags) {
     if (flags & ~(uint64_t)UM_AT_EMPTY_PATH) return 0;
     int empty = (flags & UM_AT_EMPTY_PATH) != 0;
@@ -1196,11 +1272,23 @@ static int um_exec_args(uint64_t nr, const uint64_t a[6], UmExecArgs *ea) {
 }
 
 /* Handler-side gate.  Reason: 0 = admitted, 1 = unsupported form/flags,
- * 2 = unadmitted/bad fd, 3 = bad guest pointers.  Nothing is loaded here; the
- * authoritative bounded string/vector copy happens in um_exec_continue. */
+ * 2 = unadmitted/bad/reused fd, 3 = bad guest pointers.  Nothing is loaded
+ * here; the authoritative bounded string/vector copy happens in
+ * um_exec_continue. */
 static int um_exec_check(uint64_t nr, const uint64_t a[6], UmExecArgs *ea) {
     if (!um_exec_args(nr, a, ea)) return 1;
-    if (ea->fd_needed && !um_fd_is_admitted(ea->dirfd)) return 2;
+    if (ea->fd_needed) {
+        const UmAdmittedFd *e = um_fd_lookup(ea->dirfd);
+        if (!e) return 2;                        /* never admitted */
+        if (g_cfg.fd_ofd_check_enabled) {
+            if (!um_fd_ofd_ok(e)) return 2;      /* close+reopen/dup2: OFD changed */
+            /* The kernel closes FD_CLOEXEC descriptors across exec.  The
+             * bounded model does not reproduce fexecve's internal-dup
+             * exception, so a CLOEXEC fd fails closed rather than leaving a
+             * stale trusted OFD binding alive past the (emulated) exec. */
+            if (e->cloexec) return 2;
+        }
+    }
     if (!ea->pathp || !ea->argvp) return 3;
     if (!um_chk_str(nr, ea->pathp) ||
         !um_chk(nr, ea->argvp, (UM_EXEC_MAX_NARG + 1u) * 8u)) return 3;
