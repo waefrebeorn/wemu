@@ -25,6 +25,7 @@ extern "C" {
 #define WEMU_UM_TIMEOUT_SEC   10       /* wall-clock bound on a run */
 #define WEMU_UM_MAX_SIGNALS   16u      /* bounded guest signal deliveries/run */
 #define WEMU_UM_SIG_NSIG      32       /* bounded guest signal-number table */
+#define WEMU_UM_MAX_FORKS     8u       /* bounded guest fork/clone children/run */
 
 typedef enum {
     WEMU_UM_OK            =   0,
@@ -48,7 +49,10 @@ typedef enum {
     WEMU_UM_DISPATCH_EXEC_GUARD, /* mmap/mprotect: deny new executable maps
                                   * outside the registered guest window */
     WEMU_UM_DISPATCH_SIGACTION,  /* rt_sigaction: bounded guest signal table */
-    WEMU_UM_DISPATCH_SIGRETURN   /* rt_sigreturn: restore the saved context */
+    WEMU_UM_DISPATCH_SIGRETURN,  /* rt_sigreturn: restore the saved context */
+    WEMU_UM_DISPATCH_FORK,       /* fork/vfork: bounded COW guest child */
+    WEMU_UM_DISPATCH_CLONE,      /* clone: same, but flags checked first */
+    WEMU_UM_DISPATCH_CLONE3      /* clone3: clone_args flags checked first */
 } WemuUmDispatch;
 
 typedef struct {
@@ -64,6 +68,8 @@ typedef struct {
     uint64_t  denied;        /* unlisted syscalls refused (-ENOSYS) */
     uint32_t  signals_delivered; /* bounded guest signal deliveries */
     uint32_t  signals_denied;    /* fail-closed signal registrations/deliveries */
+    uint32_t  forks;             /* bounded COW children created this run */
+    uint32_t  denied_nrs[8];     /* distinct unlisted/refused syscall numbers */
     uint32_t  out_len;       /* bytes captured from fd 1/2, <= OUT_MAX */
     char      out[WEMU_UM_OUT_MAX]; /* NUL-terminated if out_len < OUT_MAX */
 } WemuUmResult;
@@ -81,6 +87,11 @@ int wemu_um_run_elf(const char *path, char *const argv[],
  * whitelist (SIGSEGV/SIGBUS/SIGILL/SIGFPE), 0 otherwise.  Unknown signals
  * are never registered or delivered — the path fails closed. */
 int wemu_um_signal_modeled(int sig);
+
+/* 1 when raw clone(2) flags describe a bounded fork (CSIGNAL 0/SIGCHLD,
+ * optionally CLONE_CHILD_SETTID/CLEARTID), 0 when the native path refuses
+ * them.  clone3's struct form is checked against the same policy. */
+int wemu_um_clone_flags_modeled(uint64_t flags);
 
 /* Introspection for the gate: the table itself and a readable status name. */
 const WemuUmSyscallEntry *wemu_um_syscall_table(size_t *count);

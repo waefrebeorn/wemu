@@ -19,7 +19,8 @@ all: libwemu.a
 
 PIE_STATIC = tests/pie_hello tests/pie_signal tests/pie_nohandler tests/pie_unlisted
 PIE_DYN    = tests/pie_dynamic
-PIE_BINS   = $(PIE_STATIC) $(PIE_DYN)
+FORK_FIX   = tests/fork_clone
+PIE_BINS   = $(PIE_STATIC) $(PIE_DYN) $(FORK_FIX)
 
 src/wemu_usermode.o: CFLAGS += -fno-stack-protector
 # The native user-mode signal handlers run on the guest stack after the guest
@@ -39,8 +40,11 @@ test_%: tests/test_%.c libwemu.a
 
 test_usermode_native: $(PIE_BINS)
 
-# Self-relocating static PIE (ET_DYN, no PT_INTERP).
+# Self-relocating static PIE (ET_DYN, no PT_INTERP) — also the fork/clone fixture.
 tests/pie_%: tests/pie_%.c
+	$(CC) -static-pie -O2 -o $@ $<
+
+tests/fork_clone: tests/fork_clone.c
 	$(CC) -static-pie -O2 -o $@ $<
 
 # Real dynamically linked PIE: ET_DYN WITH PT_INTERP, refused fail-closed.

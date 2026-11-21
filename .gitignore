@@ -14,3 +14,4 @@ test_isa_atomic_fence
 /tests/pie_nohandler
 /tests/pie_unlisted
 /tests/pie_dynamic
+/tests/fork_clone

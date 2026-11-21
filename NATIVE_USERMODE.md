@@ -28,7 +28,17 @@ untrusted-guest sandbox. Nothing here is enabled implicitly by `wemu_cpu_run`.
    fortified `____longjmp_chk` rejects).
 5. stdout/stderr are captured through a pipe; exit code, syscall/deny counts
    and signal delivery/deny counts come back in a `MAP_SHARED` page.
-6. **Bounded guest signal delivery**: `rt_sigaction` is intercepted into a
+6. **Bounded fork/clone**: `fork`, `vfork`, `clone` and `clone3` are handled
+   in the SIGSYS handler.  A fork-shaped request becomes a RAW `SYS_fork`,
+   giving the guest child a PRIVATE copy-on-write address space (guest image,
+   stack, TLS and `g_um` are copied by the kernel).  The child resumes after
+   the syscall with RAX=0; the parent gets the pid and `wait4` returns the
+   child's real exit status.  The fork budget is a shared atomic counter, so
+   `WEMU_UM_MAX_FORKS` bounds the whole process tree, and each child re-arms
+   its own wall-clock alarm (alarms are not inherited across fork).  Only the
+   root child publishes the result page; COW children exit with their guest
+   status so the guest parent's `wait4` sees it.
+7. **Bounded guest signal delivery**: `rt_sigaction` is intercepted into a
    small guest signal table (never passed to the host). A synchronous CPU
    fault from guest RIP (SIGSEGV/SIGBUS/SIGILL/SIGFPE) with a registered
    handler rewrites the ucontext to that handler, passing signo in RDI and
@@ -51,9 +61,24 @@ untrusted-guest sandbox. Nothing here is enabled implicitly by `wemu_cpu_run`.
   `WEMU_UM_ERR_FAULT`. Every refusal increments `signals_denied`.
 - **Fail-closed interpreter leg**: `wemu_cpu_load_elf()` still rejects
   `ET_DYN`; load-bias handling lives only in the native path.
+- **Fail-closed clone flags**: only CSIGNAL 0/`SIGCHLD`, optionally with
+  `CLONE_CHILD_SETTID`/`CLONE_CHILD_CLEARTID` (accepted but NOT applied — the
+  COW child has a private TLS and no host thread to futex-wake), are modeled.
+  `CLONE_VM`, `CLONE_FS`, `CLONE_FILES`, `CLONE_SIGHAND`, `CLONE_THREAD`,
+  `CLONE_VFORK`, `CLONE_NEW*`, `CLONE_SETTLS`, and nonzero `child_stack` all
+  return `-EINVAL` before any kernel call.  `clone3` is checked against the
+  same policy over the whole `clone_args` struct; any pidfd/tid/tls/stack knob
+  is refused.  `execve` and pidfd-bearing `clone3` remain unlisted.
+- **TLS rule for handlers**: the guest owns `%fs`, so handlers may only use
+  raw syscalls and TLS-free helpers.  Using glibc's `syscall()` wrote `errno`
+  into the guest's TLS slot; the `ENOENT=2` from a failed
+  `newfstatat("/etc/busybox.conf")` became a pointer and crashed `head`,
+  `tail`, `seq`, `expr`, `cut`, `awk`, `id`, ... before their first output.
+  `um_host()` is now an inline `syscall` instruction returning raw `-errno`.
 - **Exec guard**: guest `mmap`/`mprotect` with `PROT_EXEC` is refused unless
   the whole range lies in the registered image window.
-- 200,000-syscall budget, 10-second wall-clock alarm, 64 KiB output cap.
+- 200,000-syscall budget per process, 10-second wall-clock alarm per process,
+  64 KiB output cap, `WEMU_UM_MAX_FORKS` children per run.
 
 ## Ownership
 
@@ -69,7 +94,9 @@ table entry against the kernel's `asm/unistd_64.h`.
 - **Static ET_EXEC and self-relocating static PIE (ET_DYN, no PT_INTERP)
   guests only.** A dynamically linked PIE (`PT_INTERP`) is refused with
   `WEMU_UM_ERR_INTERP`: loading ld.so and shared objects, and the relocations
-  they need, is not modelled. No fork/threads.
+  they need, is not modelled. Bounded fork/clone is supported (below), but
+  there are no host threads: sharing flags and true vfork/exec semantics are
+  refused or approximated.
 - The bounded signal path delivers only signo (RSI/RDX siginfo/ucontext args
   are zero), restores general registers only (not XMM/x87 state), allows no
   nesting, and needs the guest's `SA_RESTORER` for a C handler to return.
@@ -80,7 +107,12 @@ table entry against the kernel's `asm/unistd_64.h`.
 - Guest pointers are host pointers (same ABI) and are not validated: a host
   syscall receives whatever address the guest supplies. Bounded execution is
   not address-space isolation.
-- Gate covers real static busybox `echo`, `uname`, `cat`, `ls` (byte-exact vs
-  host `execve` of the same binary) and real `-static-pie` guests for load
-  bias and SIGSEGV delivery; the wider ~26-applet L14 set and LTP are not yet
-  run through this path.
+- The gate runs **45** real static busybox applets (echo, uname, cat, ls,
+  true, false, head, tail, grep, sort, sed, seq, expr, wc, cut, awk, md5sum,
+  sha256sum, base64, pwd, id, test x2, date, hostname, basename, dirname, rev,
+  tac, uniq, stat, realpath, readlink, env, which, whoami, nproc, od, xxd,
+  hexdump, nl, paste, expand, fold, sh), each byte-exact against host `execve`
+  of the same binary/args/env, plus a static-PIE fork/clone fixture and PIE
+  load-bias / SIGSEGV fixtures.  LTP and applets that need `execve`/vfork
+  sharing (e.g. `timeout`), `clone3` pidfds, threads, or guest signal masks
+  are not yet modelled.
