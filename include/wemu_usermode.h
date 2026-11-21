@@ -91,7 +91,16 @@ typedef enum {
                                              * new path switched off (old path) */
 #define WEMU_UM_REFUSE_CLONE3_SIGMASK_SIZE 7u  /* clone_args larger than v0
                                                 * (future sigmask field): -E2BIG */
-#define WEMU_UM_N_REFUSE                 8u
+#define WEMU_UM_REFUSE_PIDFD_SEND_SIGNAL 8u  /* pidfd_send_signal: no modeled
+                                             * pidfd authority to signal */
+#define WEMU_UM_REFUSE_CLONE3_SET_TID    9u  /* clone_args.set_tid/_size (guest
+                                             * chooses a host TID) */
+#define WEMU_UM_REFUSE_CLONE3_CGROUP     10u /* clone_args.cgroup (guest picks a
+                                             * host cgroup fd) */
+#define WEMU_UM_REFUSE_CLONE3_FORK_SHAPE 11u /* structurally valid clone3 whose
+                                             * flags/knobs are outside the
+                                             * bounded COW fork form */
+#define WEMU_UM_N_REFUSE                 12u
 
 typedef struct {
     uint32_t        nr;
@@ -116,6 +125,10 @@ typedef struct {
                                           * (indexed by WEMU_UM_REFUSE_*) */
     uint32_t  clone3_threads;    /* bounded shared-VM host threads created via
                                     * the modeled clone3 CLONE_THREAD shape */
+    uint32_t  sigmask_virtualized; /* rt_sigprocmask calls served from the
+                                    * thread's virtual mask (NO host call) */
+    uint64_t  host_sigmask_end;  /* real host-thread mask at finish: control
+                                  * evidence that no guest mask leaked to it */
     uint32_t  bad_ptrs;          /* guest pointers refused before host dispatch */
     uint32_t  bad_ptr_nr;        /* syscall number of the last refused pointer */
     uint64_t  bad_ptr_va;        /* the refused guest pointer (host-address-shaped) */
@@ -186,11 +199,39 @@ int wemu_um_thread_exec_modeled(uint64_t flags);
  * closed.  Pure predicate: no I/O, safe for the gate to audit off-line. */
 int wemu_um_clone3_thread_modeled(const void *args, size_t size);
 
+/* 1 when a v0 `struct clone_args` describes the bounded COW fork form WEMU
+ * admits through clone3: exit_signal 0/SIGCHLD, no pidfd / set_tid / cgroup /
+ * TLS / stack knobs and no shared or unlisted flags.  Pure predicate (no I/O),
+ * so the gate audits the same rule the handler applies. */
+int wemu_um_clone3_fork_modeled(const void *args, size_t size);
+
+/* 1 when an rt_sigprocmask request is virtualizable for a modeled thread:
+ * `how` is SIG_BLOCK/SIG_UNBLOCK/SIG_SETMASK and the requested set touches
+ * none of WEMU's control signals (SIGSYS/SIGALRM/SIGUSR2).  A pure form check;
+ * the runtime also validates the guest buffers and applies the mask to the
+ * thread's private state instead of the host thread. */
+int wemu_um_sigprocmask_modeled(int how, uint64_t set);
+
 /* Negative-control switch: when disabled, a bounded clone3 CLONE_THREAD
  * request is refused with -EINVAL and no host thread is created (the OLD
  * path, where clone3 admitted only fork-shaped requests).  ON by default.
  * Returns 0, or -1 for a value other than 0/1. */
 int wemu_um_set_clone3_thread_enabled(int enabled);
+
+/* Negative-control switch for per-thread signal-mask virtualization.  ON
+ * (default): rt_sigprocmask is served from the calling thread's virtual mask
+ * and NEVER dispatched to the host — the host thread's real mask is intact.
+ * OFF: the OLD path, where a mask touching no WEMU signal is passed through to
+ * the host rt_sigprocmask (changing the host thread's real mask).  Returns 0,
+ * or -1 for a value other than 0/1. */
+int wemu_um_set_sigmask_virtual_enabled(int enabled);
+
+/* Negative-control switch for the exact fail-closed reasons.  ON (default):
+ * pidfd_send_signal, clone_args.set_tid/cgroup and unmodeled fork shapes carry
+ * dedicated WEMU_UM_REFUSE_* codes.  OFF: the OLD coarse diagnostics (-ENOSYS
+ * for pidfd_send_signal, generic CLONE3_SHAPE for the clone3 shapes).  Returns
+ * 0, or -1 for a value other than 0/1. */
+int wemu_um_set_exact_refuse_enabled(int enabled);
 
 /* Negative-control switch for the differential gate: when disabled, an
  * execve issued by a non-root shared-VM thread is refused exactly as in the

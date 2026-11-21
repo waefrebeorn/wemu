@@ -23,12 +23,20 @@
 #define _GNU_SOURCE
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #define SYS_write_          1
 #define SYS_rt_sigprocmask_ 14
 #define SYS_clone3_         435
 #define SYS_exit_           60
 #define SYS_exit_group_     231
+#define SYS_pidfd_send_signal_ 424
+
+#define SIG_BLOCK_   0
+#define SIG_UNBLOCK_ 1
+#define SIG_SETMASK_ 2
+#define SIGUSR1_     10
+#define SIGTERM_     15
 
 #define CLONE_VM_             0x00000100u
 #define CLONE_SIGHAND_        0x00000800u
@@ -38,6 +46,7 @@
 #define CLONE_CHILD_CLEARTID_ 0x00200000u
 #define CLONE_CHILD_SETTID_   0x01000000u
 #define CLONE_CLEAR_SIGHAND_  0x100000000ull
+#define CLONE_INTO_CGROUP_    0x200000000ull
 
 #define SIG_SETMASK_ 2
 #define SIGSYS_      31
@@ -170,9 +179,108 @@ static int run_refuse(void) {
     return 0;
 }
 
+/* ---- virtual per-thread signal-mask differential --------------------
+ * Both the real kernel and WEMU must present identical guest-visible mask
+ * semantics: the root blocks SIGUSR1, a bounded clone3 thread inherits it,
+ * that thread blocks SIGTERM / unblocks SIGUSR1, and the root keeps its own
+ * mask.  WEMU additionally proves it never touched the host thread mask. */
+static uint64_t vmask_buf, vmask_old;
+static volatile int vmask_done;
+static volatile long vmask_child_usr1, vmask_child_term, vmask_child_after;
+
+static long mask_bit(uint64_t m, unsigned sig) {
+    return (long)((m >> (sig - 1)) & 1u);
+}
+
+static int run_vmask(void) {
+    const uint64_t usr1 = 1ull << (SIGUSR1_ - 1);
+    const uint64_t term = 1ull << (SIGTERM_ - 1);
+
+    vmask_buf = usr1;
+    emit_num("VMASK-BLOCK-RC=",
+             rsys(SYS_rt_sigprocmask_, SIG_BLOCK_, (long)&vmask_buf,
+                  (long)&vmask_old, 8, 0, 0));
+    emit_num("VMASK-BLOCK-OLD-USR1=", mask_bit(vmask_old, SIGUSR1_));
+
+    vmask_old = 0;
+    emit_num("VMASK-QUERY-RC=",
+             rsys(SYS_rt_sigprocmask_, SIG_SETMASK_, 0, (long)&vmask_old, 8, 0, 0));
+    emit_num("VMASK-ROOT-USR1=", mask_bit(vmask_old, SIGUSR1_));
+
+    struct local_clone_args ca;
+    base_args(&ca);
+    long t = rsys(SYS_clone3_, (long)&ca, sizeof ca, 0, 0, 0, 0);
+    if (t == 0) {
+        uint64_t m = 0;
+        (void)rsys(SYS_rt_sigprocmask_, SIG_SETMASK_, 0, (long)&m, 8, 0, 0);
+        __atomic_store_n(&vmask_child_usr1, mask_bit(m, SIGUSR1_), __ATOMIC_RELAXED);
+        uint64_t s = term;
+        (void)rsys(SYS_rt_sigprocmask_, SIG_BLOCK_, (long)&s, 0, 8, 0, 0);
+        m = 0;
+        (void)rsys(SYS_rt_sigprocmask_, SIG_SETMASK_, 0, (long)&m, 8, 0, 0);
+        __atomic_store_n(&vmask_child_term, mask_bit(m, SIGTERM_), __ATOMIC_RELAXED);
+        s = usr1;
+        (void)rsys(SYS_rt_sigprocmask_, SIG_UNBLOCK_, (long)&s, 0, 8, 0, 0);
+        m = 0;
+        (void)rsys(SYS_rt_sigprocmask_, SIG_SETMASK_, 0, (long)&m, 8, 0, 0);
+        __atomic_store_n(&vmask_child_after, mask_bit(m, SIGUSR1_), __ATOMIC_RELAXED);
+        __atomic_store_n(&vmask_done, 1, __ATOMIC_RELEASE);
+        (void)rsys(SYS_exit_, 0, 0, 0, 0, 0, 0);
+        __builtin_unreachable();
+    }
+    if (t < 0) { emit(refused, sizeof refused - 1); return 7; }
+    while (!__atomic_load_n(&vmask_done, __ATOMIC_ACQUIRE)) { }
+    emit_num("VMASK-CHILD-USR1=", __atomic_load_n(&vmask_child_usr1, __ATOMIC_RELAXED));
+    emit_num("VMASK-CHILD-TERM=", __atomic_load_n(&vmask_child_term, __ATOMIC_RELAXED));
+    emit_num("VMASK-CHILD-AFTER=", __atomic_load_n(&vmask_child_after, __ATOMIC_RELAXED));
+    vmask_old = 0;
+    (void)rsys(SYS_rt_sigprocmask_, SIG_SETMASK_, 0, (long)&vmask_old, 8, 0, 0);
+    emit_num("VMASK-PARENT-USR1=", mask_bit(vmask_old, SIGUSR1_));
+    return 0;
+}
+
+/* ---- exact fail-closed diagnostics for the remaining extras ----------
+ * The host oracle proves every shape is a real kernel feature (none returns
+ * -ENOSYS); WEMU refuses all of them with dedicated reasons. */
+static int want_tid;
+
+static int run_refuse2(void) {
+    struct local_clone_args ca;
+
+    /* pidfd_send_signal on a bad fd: host -EBADF, WEMU -EINVAL + exact reason. */
+    emit_num("PIDSIG-RC=", rsys(SYS_pidfd_send_signal_, -1, 0, 0, 0, 0, 0));
+
+    /* clone_args.set_tid / set_tid_size on a fork shape. */
+    want_tid = 12345;
+    memset(&ca, 0, sizeof ca);
+    ca.set_tid = (uint64_t)&want_tid;
+    ca.set_tid_size = 1;
+    emit_num("SETTID-RC=", spawn(&ca, sizeof ca));
+
+    /* clone_args.cgroup with CLONE_INTO_CGROUP on a fork shape: the kernel
+     * validates the fd; WEMU refuses before any process exists. */
+    memset(&ca, 0, sizeof ca);
+    ca.flags = CLONE_INTO_CGROUP_;
+    ca.cgroup = 1234;
+    emit_num("CGROUP-RC=", spawn(&ca, sizeof ca));
+
+    /* A structurally valid clone3 fork shape outside the bounded form:
+     * CLONE_VM without THREAD/SIGHAND would hand the child our address space. */
+    memset(&ca, 0, sizeof ca);
+    ca.flags = CLONE_VM_;
+    ca.exit_signal = 17;                 /* SIGCHLD */
+    emit_num("FORKSHAPE-RC=", spawn(&ca, sizeof ca));
+
+    return 0;
+}
+
 int main(int argc, char **argv) {
-    int refuse = argc >= 2 && argv[1][0] == 'r';
-    int rc = refuse ? run_refuse() : run_ok();
+    char mode = (argc >= 2 && argv[1][0]) ? argv[1][0] : 'o';
+    int rc;
+    if (mode == 'v')      rc = run_vmask();
+    else if (mode == '2') rc = run_refuse2();
+    else if (mode == 'r') rc = run_refuse();
+    else                  rc = run_ok();
     (void)rsys(SYS_exit_group_, rc, 0, 0, 0, 0, 0);
     return rc;
 }

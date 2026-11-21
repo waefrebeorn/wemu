@@ -51,9 +51,18 @@
  * fields are translated to the equivalent raw SYS_clone arguments and the
  * bounded thread path above creates the host thread.  clone3 requests that
  * are not this shape or the bounded fork shape fail closed with an exact
- * reason code in WemuUmResult.refuses[].  Per-thread signal masks remain
- * unmodeled: CLONE_CLEAR_SIGHAND is refused, and rt_sigprocmask may not mask
- * SIGSYS/SIGALRM/SIGUSR2 (WEMU's control signals).
+ * reason code in WemuUmResult.refuses[].  set_tid/cgroup knobs, unmodeled fork
+ * shapes and pidfd_send_signal carry their own exact refuse reasons.
+ *
+ * VIRTUAL PER-THREAD SIGNAL MASKS: rt_sigprocmask is never dispatched to the
+ * host.  Each modeled thread owns a private 64-bit kernel sigset; SIG_BLOCK /
+ * SIG_UNBLOCK / SIG_SETMASK and oldset are applied to that state, so a guest
+ * can mask ordinary signals without ever changing the host thread's real mask
+ * (which would silently block WEMU's SIGSYS trap, ALRM bound or USR2 quiesce).
+ * A set touching a WEMU control signal still fails closed with an exact reason.
+ * A new CLONE_THREAD inherits its parent's virtual mask.  The OLD pass-through
+ * path and the coarse fail-closed diagnostics are kept behind negative-control
+ * switches for the differential gates.
  *
  * TLS rule: the guest owns %fs while our handlers run (it sets it with
  * arch_prctl).  Every syscall/invocation from a handler is therefore a RAW
@@ -101,6 +110,7 @@
 #define WEMU_UM_SYS_DUP3         292 /* not in the VSL table */
 #define WEMU_UM_SYS_EXECVEAT     322 /* not in the VSL table */
 #define WEMU_UM_SYS_KCMP         312 /* raw kcmp: open-file-description identity */
+#define WEMU_UM_SYS_PIDFD_SEND_SIGNAL 424 /* x86-64: no modeled pidfd authority */
 #define UM_KCMP_FILE             0    /* linux/kcmp.h KCMP_FILE */
 #define UM_F_GETFD               1    /* fcntl(2) */
 #define UM_F_DUPFD_CLOEXEC       1030 /* fcntl.h (x86-64) */
@@ -112,6 +122,15 @@
 #define UM_ARCH_SET_FS           0x1002
 #define SIG_DFL_ 0
 #define SIG_IGN_ 1
+/* Kernel sigset bit (signal N -> bit N-1).  A guest may never mask WEMU's
+ * control signals: SIGSYS traps its syscalls, SIGALRM bounds the run and
+ * SIGUSR2 quiesces peers during an exec from a thread. */
+#define UM_WEMU_SIGMASK ((1ull << (SIGSYS - 1)) | (1ull << (SIGALRM - 1)) | \
+                         (1ull << (SIGUSR2 - 1)))
+/* x86-64 rt_sigprocmask `how` values. */
+#define UM_SIG_BLOCK    0
+#define UM_SIG_UNBLOCK  1
+#define UM_SIG_SETMASK  2
 
 /* x86-64 raw pkey syscalls (absent from some libc header sets).  Kept with
  * the WEMU_UM_SYS_ prefix so a future VSL addition is visible, not silently
@@ -272,6 +291,10 @@ typedef struct {
     volatile uint32_t sig_denied;
     uint64_t clone_flags;            /* raw flags used to create this thread */
     uint8_t  modeled_thread;         /* 1 = admitted CLONE_THREAD shape */
+    /* Private guest signal mask (kernel sigset, 64 bits).  Never applied to
+     * the host thread: SIGSYS/ALRM/USR2 stay dispatchable while the guest
+     * thinks it has blocked an ordinary signal. */
+    uint64_t sig_mask;
 } UmThread;
 
 #define UM_SHAPE_THREAD 1u
@@ -284,6 +307,7 @@ typedef struct {
     ucontext_t *uc;                  /* parent's SIGSYS ucontext (shared VM) */
     uint64_t child_stack;            /* guest-provided stack top */
     int slot;
+    uint64_t child_sigmask;          /* inherited virtual signal mask */
 } UmThreadBoot;
 static UmThreadBoot g_boot;
 static volatile int g_boot_ready;    /* parent waits until the child copied it */
@@ -349,6 +373,8 @@ static struct {
     int pkey_mode;               /* WEMU_UM_PKEY_AUTO or FORCE_FALLBACK */
     int thread_exec_enabled;     /* bounded execve from a CLONE_THREAD guest */
     int clone3_thread_enabled;   /* bounded CLONE_THREAD via clone3 (old-path control) */
+    int sigmask_virtual_enabled; /* guest masks stay in per-thread state */
+    int exact_refuse_enabled;    /* dedicated refuse codes instead of coarse */
     int fd_ofd_check_enabled;    /* bind admitted fds to their OFD (kcmp) */
     /* Negative-control knobs for the fd-identity differential gates.  Both
      * default to the hardened behaviour; the gate flips them to reproduce the
@@ -357,6 +383,7 @@ static struct {
     int fd_cloexec_refuse;       /* 1 = OLD path: refuse every CLOEXEC fd */
 } g_cfg = { .enabled = 1, .pkey_mode = WEMU_UM_PKEY_AUTO,
             .thread_exec_enabled = 1, .clone3_thread_enabled = 1,
+            .sigmask_virtual_enabled = 1, .exact_refuse_enabled = 1,
             .fd_ofd_check_enabled = 1,
             .fd_kcmp_forced_off = 0, .fd_cloexec_refuse = 0 };
 
@@ -394,6 +421,8 @@ void wemu_um_reset_isolation(void) {
     g_cfg.pkey_mode = WEMU_UM_PKEY_AUTO;
     g_cfg.thread_exec_enabled = 1;
     g_cfg.clone3_thread_enabled = 1;
+    g_cfg.sigmask_virtual_enabled = 1;
+    g_cfg.exact_refuse_enabled = 1;
     g_cfg.fd_ofd_check_enabled = 1;
     g_cfg.fd_kcmp_forced_off = 0;
     g_cfg.fd_cloexec_refuse = 0;
@@ -414,6 +443,18 @@ int wemu_um_set_thread_exec_enabled(int enabled) {
 int wemu_um_set_clone3_thread_enabled(int enabled) {
     if (enabled != 0 && enabled != 1) return -1;
     g_cfg.clone3_thread_enabled = enabled;
+    return 0;
+}
+
+int wemu_um_set_sigmask_virtual_enabled(int enabled) {
+    if (enabled != 0 && enabled != 1) return -1;
+    g_cfg.sigmask_virtual_enabled = enabled;
+    return 0;
+}
+
+int wemu_um_set_exact_refuse_enabled(int enabled) {
+    if (enabled != 0 && enabled != 1) return -1;
+    g_cfg.exact_refuse_enabled = enabled;
     return 0;
 }
 
@@ -959,13 +1000,17 @@ static void um_thread_child_bootstrap(void) {
     r[REG_RAX] = 0;                         /* clone child return value */
     r[REG_RSP] = (greg_t)b.child_stack;
     sigemptyset(&cu.uc_sigmask);            /* guest signal mask (empty) */
+    th->sig_mask = b.child_sigmask;         /* inherit the parent's virtual mask */
     setcontext(&cu);                        /* enters the guest child thread */
     _exit(127);                             /* setcontext failed: fail closed */
 }
 
 /* Parent edge: bounded slot, template state, raw clone with the guest's own
- * flags (honouring CLONE_SETTLS).  Returns the child tid to the guest. */
-static int64_t um_thread_clone(const uint64_t a[6], ucontext_t *uc) {
+ * flags (honouring CLONE_SETTLS).  The new thread inherits the caller's
+ * virtual signal mask, just as the kernel would inherit a real one.  Returns
+ * the child tid to the guest. */
+static int64_t um_thread_clone(const uint64_t a[6], ucontext_t *uc,
+                               uint64_t parent_sigmask) {
     uint32_t used = __atomic_fetch_add(&g_um.result->threads_created, 1,
                                        __ATOMIC_SEQ_CST);
     if (used >= WEMU_UM_MAX_THREADS - 1u) {
@@ -991,6 +1036,7 @@ static int64_t um_thread_clone(const uint64_t a[6], ucontext_t *uc) {
     g_boot.uc = uc;
     g_boot.child_stack = a[1];
     g_boot.slot = slot;
+    g_boot.child_sigmask = parent_sigmask;
     int64_t pid = um_raw_clone(a[0], a[1], a[2], a[3], a[4]);
     if (pid == 0) um_thread_child_bootstrap();   /* never returns */
     while (!__atomic_load_n(&g_boot_ready, __ATOMIC_ACQUIRE)) { }
@@ -1246,6 +1292,19 @@ int wemu_um_clone3_thread_modeled(const void *args, size_t size) {
     return um_clone3_thread_shape(&ca, size);
 }
 
+int wemu_um_clone3_fork_modeled(const void *args, size_t size) {
+    UmCloneArgs ca;
+    if (!args || size < sizeof ca) return 0;
+    memcpy(&ca, args, sizeof ca);
+    return um_clone3_fork_ok(&ca, size);
+}
+
+int wemu_um_sigprocmask_modeled(int how, uint64_t set) {
+    if (how != UM_SIG_BLOCK && how != UM_SIG_UNBLOCK && how != UM_SIG_SETMASK)
+        return 0;
+    return (set & UM_WEMU_SIGMASK) == 0;
+}
+
 /* Classify a clone3 syscall: 1 = bounded CLONE_THREAD (new path), 0 = bounded
  * fork (old path), -1 = fail closed with *reason = a WEMU_UM_REFUSE_* code.
  * The guest struct is read through the mapped-range check before it is
@@ -1272,8 +1331,26 @@ static int um_clone3_classify(const uint64_t a[6], UmCloneArgs *ca, int *reason)
         *reason = WEMU_UM_REFUSE_CLONE3_SIGMASK;
         return -1;
     }
+    /* set_tid / cgroup hand the guest authority over host TIDs and cgroups.
+     * With exact diagnostics on they get their own reasons; the old coarse
+     * path folded them into CLONE3_SHAPE (negative control). */
+    if (g_cfg.exact_refuse_enabled) {
+        if (ca->set_tid || ca->set_tid_size) {
+            *reason = WEMU_UM_REFUSE_CLONE3_SET_TID;
+            return -1;
+        }
+        if (ca->cgroup) {
+            *reason = WEMU_UM_REFUSE_CLONE3_CGROUP;
+            return -1;
+        }
+    }
     if (um_clone3_thread_shape(ca, a[1])) return 1;
     if (um_clone3_fork_ok(ca, a[1])) return 0;
+    /* A well-formed v0 struct that is neither bounded shape is an unmodeled
+     * fork form (shared VM without THREAD, namespaces, odd exit signal, stray
+     * TLS/stack/TID knobs...).  Give it an exact reason distinct from a bad
+     * pointer or a truncated struct. */
+    if (g_cfg.exact_refuse_enabled) *reason = WEMU_UM_REFUSE_CLONE3_FORK_SHAPE;
     return -1;
 }
 
@@ -1297,11 +1374,13 @@ static int64_t um_do_fork(UmThread *th) {
          * a COW child reports status via wait4, never the shared result. */
         UmThread *c = &g_thr[0];
         greg_t saved_rsp = th->child_rsp;
+        uint64_t inherited_mask = th->sig_mask;   /* fork inherits the mask */
         memset(c, 0, sizeof *c);
         c->tid = um_raw_gettid();
         c->active = 1;
         c->is_root = 0;
         c->child_rsp = saved_rsp;
+        c->sig_mask = inherited_mask;
         g_boot_thr = c;
         (void)um_raw1(37 /* SYS_alarm */, WEMU_UM_TIMEOUT_SEC);
         /* alarm timers are NOT inherited across fork */
@@ -1473,6 +1552,30 @@ static void um_refuse_fast(ucontext_t *uc, UmThread *th, greg_t *r, uint64_t nr,
         um_abort_to_finish(uc, th, UM_WHY_BUDGET);
 }
 
+/* Virtual per-thread signal mask: apply rt_sigprocmask to the CALLING
+ * thread's private sigset and NEVER to the host thread mask.  Both buffers
+ * were validated by um_ptr_args_ok (8 bytes each); a set touching a WEMU
+ * control signal was refused before this call.  Returns the Linux return
+ * value (0 / -EINVAL), so guest-visible semantics match a real kernel. */
+static int64_t um_sigprocmask_virtual(UmThread *th, const uint64_t a[6]) {
+    uint64_t how = a[0], setp = a[1], oldp = a[2], n = a[3];
+    if (n != 8) return -EINVAL;
+    if (how != UM_SIG_BLOCK && how != UM_SIG_UNBLOCK && how != UM_SIG_SETMASK)
+        return -EINVAL;
+    uint64_t set = 0;
+    if (setp) memcpy(&set, (const void *)(uintptr_t)setp, 8);
+    if (!wemu_um_sigprocmask_modeled((int)how, set)) return -EINVAL;
+    uint64_t old = th->sig_mask;
+    if (setp) {
+        if (how == UM_SIG_BLOCK)         th->sig_mask = old |  set;
+        else if (how == UM_SIG_UNBLOCK)  th->sig_mask = old & ~set;
+        else /* SIG_SETMASK */           th->sig_mask = set;
+    }
+    if (oldp) memcpy((void *)(uintptr_t)oldp, &old, 8);
+    __atomic_fetch_add(&g_um.result->sigmask_virtualized, 1, __ATOMIC_SEQ_CST);
+    return 0;
+}
+
 static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
     (void)sig;
     ucontext_t *uc = (ucontext_t *)ucv;
@@ -1489,7 +1592,7 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
      * lock: the new host thread resumes in the handler on the guest stack and
      * setcontext()s straight into guest code. */
     if (nr == VSL_SYS_CLONE && wemu_um_clone_thread_flags_modeled(a[0])) {
-        int64_t pid = um_thread_clone(a, uc);
+        int64_t pid = um_thread_clone(a, uc, th->sig_mask);
         __atomic_fetch_add(&g_um.syscalls, 1, __ATOMIC_SEQ_CST);
         r[REG_RAX] = (greg_t)pid;
         um_skip_syscall(r);
@@ -1504,6 +1607,15 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
      * before any host clone, with an exact reason (raw SYS_clone form). */
     if (nr == VSL_SYS_CLONE && (a[0] & UM_CLONE_PIDFD)) {
         um_refuse_fast(uc, th, r, nr, WEMU_UM_REFUSE_CLONE_PIDFD, -EINVAL);
+        return;
+    }
+
+    /* pidfd_send_signal would let a guest signal a process it never created:
+     * WEMU models no pidfd authority, so refuse with an exact reason before
+     * any host syscall.  With exact diagnostics off this falls through to the
+     * OLD generic -ENOSYS (negative control). */
+    if (g_cfg.exact_refuse_enabled && nr == WEMU_UM_SYS_PIDFD_SEND_SIGNAL) {
+        um_refuse_fast(uc, th, r, nr, WEMU_UM_REFUSE_PIDFD_SEND_SIGNAL, -EINVAL);
         return;
     }
 
@@ -1541,7 +1653,7 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
              * starts the child at stack + stack_size (the top of the stack). */
             uint64_t na[6] = { ca.flags, ca.stack + ca.stack_size,
                                ca.parent_tid, ca.child_tid, ca.tls, 0 };
-            int64_t pid = um_thread_clone(na, uc);
+            int64_t pid = um_thread_clone(na, uc, th->sig_mask);
             __atomic_fetch_add(&g_um.syscalls, 1, __ATOMIC_SEQ_CST);
             if (pid > 0)
                 __atomic_fetch_add(&g_um.result->clone3_threads, 1,
@@ -1725,19 +1837,16 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
     if (e->kind == WEMU_UM_DISPATCH_SIGACTION) {
         ret = um_sigaction(th, a);
     } else if (e->kind == WEMU_UM_DISPATCH_SIGPROCMASK) {
-        /* Per-thread signal masks are unmodeled: a guest host thread that
-         * masks SIGSYS would stop trapping its own syscalls, one that masks
-         * SIGALRM would disable the run bound, and one that masks SIGUSR2
-         * would hang the exec quiesce handshake.  Read the kernel sigset and
-         * refuse (before any host call) when it touches a WEMU signal.  An
-         * empty set / a pure query (set == NULL) still passes through. */
+        /* A guest that masks SIGSYS would stop trapping its own syscalls;
+         * SIGALRM is the run bound and SIGUSR2 the exec-quiesce handshake.
+         * Fail closed (before any host call) when the set touches a WEMU
+         * signal.  Otherwise serve rt_sigprocmask from the calling thread's
+         * PRIVATE mask: the host thread's real mask is never changed.  The
+         * OLD pass-through path is the negative-control switch. */
         uint64_t setmask = 0;
         if (a[1] && a[3] == 8)
             memcpy(&setmask, (const void *)(uintptr_t)a[1], 8);
-        const uint64_t wemu_signals =
-            (1ull << (SIGSYS - 1)) | (1ull << (SIGALRM - 1)) |
-            (1ull << (SIGUSR2 - 1));
-        if (setmask & wemu_signals) {
+        if (setmask & UM_WEMU_SIGMASK) {
             um_note_denied(nr);
             g_um.result->refuses[WEMU_UM_REFUSE_SIGPROCMASK]++;
             r[REG_RAX] = (greg_t)-EINVAL;
@@ -1746,7 +1855,10 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
             um_unlock();
             return;
         }
-        ret = um_host_unlocked(nr, a);
+        if (g_cfg.sigmask_virtual_enabled)
+            ret = um_sigprocmask_virtual(th, a);
+        else
+            ret = um_host_unlocked(nr, a);       /* OLD path: changes host mask */
     } else if (e->kind == WEMU_UM_DISPATCH_EXEC_GUARD) {
         /* mmap(addr,len,prot,flags,..) / mprotect(addr,len,prot): a guest may
          * only make executable memory inside the registered image window,
@@ -2192,6 +2304,21 @@ static void um_finish(void) {
         _exit(code);
     }
     (void)um_raw1(37 /* SYS_alarm */, 0);
+    /* Control evidence for the virtualization differential gate: capture the
+     * REAL host-thread mask with a raw rt_sigprocmask query (RIP is in host
+     * context here, so it cannot re-trap).  With virtualization ON a guest's
+     * blocked signal is absent from this real mask — the direct evidence that
+     * no guest mask was ever applied to the host thread. */
+    {
+        uint64_t hm = 0;
+        long hmrc;
+        register long r10 __asm__("r10") = 8L;
+        __asm__ volatile("syscall" : "=a"(hmrc)
+            : "a"(14L /* SYS_rt_sigprocmask */), "D"(2L /* SIG_SETMASK */),
+              "S"(0L), "d"((long)&hm), "r"(r10)
+            : "rcx", "r11", "memory");
+        if (hmrc == 0) shared->host_sigmask_end = hm;
+    }
     shared->syscalls = g_um.syscalls;
     shared->denied = g_um.denied;
     uint32_t delivered = 0, denied_sig = 0;
