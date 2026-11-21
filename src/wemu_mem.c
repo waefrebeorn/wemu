@@ -32,10 +32,15 @@ int wemu_gpa_write(WemuCpu *cpu, uint64_t gpa, const void *src, size_t len) {
 #define PF_ID    0x10ull
 
 /* 4-level paging, MAXPHYADDR=52, CR4.PKE=0 (WEMU does not implement PKE):
- * bits 62:52 of a paging-structure entry are reserved; bit 63 is NX and is
- * allowed (EFER.NXE=1).  A set reserved bit faults with P=1 (the entry is
- * present) and the RSVD error bit set. */
+ * bits 62:52 of a paging-structure entry are reserved; bit 63 is XD/NX.
+ * With EFER.NXE=1 (WEMU's reset value) bit 63 is the execute-disable bit
+ * and is ENFORCED on instruction fetch (#PF, error P=1 + I/D=1); it is no
+ * longer merely parsed.  With NXE=0 bit 63 is reserved and faults with
+ * RSVD.  Other reserved bits fault with P=1 (the entry is present) and the
+ * RSVD error bit set. */
 #define PT_RESERVED_MASK 0x7FF0000000000000ull
+#define PT_XD           (1ull << 63)
+#define EFER_NXE        (1ull << 11) /* 0x800 */
 
 static uint64_t pf_code(int present, int write, int user, int fetch,
                         int reserved) {
@@ -45,12 +50,16 @@ static uint64_t pf_code(int present, int write, int user, int fetch,
 
 /* Leaf permission check.  U/S: a user access needs U=1 on the leaf.
  * W/R: a write needs RW=1; supervisor writes are checked only when
- * CR0.WP is set (SDM), user writes are always checked. */
+ * CR0.WP is set (SDM), user writes are always checked.  XD: with EFER.NXE=1
+ * an instruction fetch from a leaf with bit 63 set faults (no dedicated
+ * error-code bit: P=1 + I/D=1); with NXE=0 bit 63 is reserved and is caught
+ * by the walk's reserved-bit check, so it is not a protection fault here. */
 static int leaf_prot_fault(const WemuCpu *cpu, uint64_t ent,
-                           int is_write, int is_user) {
+                           int is_write, int is_user, int is_fetch) {
     if (is_user && !(ent & 0x4)) return 1;
     if (is_write && !(ent & 0x2) && (is_user || (cpu->cr0 & 0x10000ull)))
         return 1;
+    if (is_fetch && (cpu->efer & EFER_NXE) && (ent & PT_XD)) return 1;
     return 0;
 }
 
@@ -69,6 +78,8 @@ uint64_t wemu_translate_ex(WemuCpu *cpu, uint64_t va, int is_write,
         return 0;
     }
     uint64_t table = cpu->cr3 & 0x000ffffffffff000ull;
+    uint64_t rsvd_mask = PT_RESERVED_MASK;
+    if (!(cpu->efer & EFER_NXE)) rsvd_mask |= PT_XD; /* NXE=0: XD bit reserved */
     int shift = 39;
     for (int level = 0; level < 4; level++) {
         uint64_t idx = (va >> shift) & 0x1ff;
@@ -85,14 +96,14 @@ uint64_t wemu_translate_ex(WemuCpu *cpu, uint64_t va, int is_write,
             cpu->fault_error = pf_code(0, is_write, is_user, is_fetch, 0);
             return 0;
         }
-        if (ent & PT_RESERVED_MASK) { /* reserved bit set in a present entry */
+        if (ent & rsvd_mask) { /* reserved bit set in a present entry */
             *fault = 14;
             cpu->cr2 = va;
             cpu->fault_error = pf_code(1, is_write, is_user, is_fetch, 1);
             return 0;
         }
         if ((ent & 0x80) && level < 3) { /* large page (2MiB/1GiB) */
-            if (leaf_prot_fault(cpu, ent, is_write, is_user)) {
+            if (leaf_prot_fault(cpu, ent, is_write, is_user, is_fetch)) {
                 *fault = 14;
                 cpu->cr2 = va;
                 cpu->fault_error = pf_code(1, is_write, is_user, is_fetch, 0);
@@ -102,7 +113,7 @@ uint64_t wemu_translate_ex(WemuCpu *cpu, uint64_t va, int is_write,
             return (ent & 0x000ffffffffff000ull & ~mask) | (va & mask);
         }
         if (level == 3) {
-            if (leaf_prot_fault(cpu, ent, is_write, is_user)) {
+            if (leaf_prot_fault(cpu, ent, is_write, is_user, is_fetch)) {
                 *fault = 14;
                 cpu->cr2 = va;
                 cpu->fault_error = pf_code(1, is_write, is_user, is_fetch, 0);

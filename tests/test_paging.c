@@ -1,5 +1,7 @@
 /* test_paging.c — long-mode 4-level page walk: constructed tables,
- * 4KiB + 2MiB leaves, non-present #PF with CR2, canonical check. */
+ * 4KiB + 2MiB leaves, non-present #PF with CR2, canonical check, and
+ * EFER.NXE-correct XD/NX fault enforcement (P|I/D on fetch, P|RSVD when
+ * NXE=0) on both 4KiB and 2MiB leaves. */
 #include "wemu.h"
 #include "wemu_internal.h"
 #include <stdio.h>
@@ -49,6 +51,56 @@ int main(void) {
           "2MiB leaf translation");
     wemu_cpu_enable_paging(c, 1);
 
+    /* ---- XD/NX enforcement (was bookkeeping-only before this increment) ----
+     * The WEMU reset EFER is 0xd00 (LME|LMA|NXE): bit 63 of a leaf is the
+     * execute-disable bit and MUST fault instruction fetch.  Data reads from
+     * the same page stay legal.  Verify both 4KiB and 2MiB leaves, the exact
+     * error code (P=1, I/D=1 => 0x11), and the NXE=0 reserved-bit path. */
+    uint8_t byte, fetch_buf;
+    /* 4KiB leaf PT[0] -> XD */
+    wemu_cpu_enable_paging(c, 0);
+    e = 0x2003 | (1ull << 63);
+    wemu_mem_write(c, 0x13000, &e, 8);
+    wemu_cpu_enable_paging(c, 1);
+    c->fault = 0; c->fault_error = 0; c->cr2 = 0;
+    CHECK(wemu_mem_fetch(c, 0x400000, &fetch_buf, 1) != 0, "XD 4K fetch faults");
+    CHECK(wemu_cpu_fault(c) == 14, "XD 4K -> #PF");
+    CHECK(wemu_cpu_fault_addr(c) == 0x400000, "XD 4K CR2");
+    CHECK(c->fault_error == 0x11, "XD 4K error P|I/D = 0x11");
+    c->fault = 0;
+    CHECK(wemu_mem_read(c, 0x400000, &byte, 1) == 0 && c->fault == 0,
+          "data read from XD 4K page allowed");
+    /* control: same page without XD executes */
+    wemu_cpu_enable_paging(c, 0);
+    e = 0x2003; wemu_mem_write(c, 0x13000, &e, 8);
+    wemu_cpu_enable_paging(c, 1);
+    c->fault = 0;
+    CHECK(wemu_mem_fetch(c, 0x400000, &fetch_buf, 1) == 0 && c->fault == 0,
+          "fetch from executable 4K page succeeds");
+    /* NXE=0: bit 63 is reserved -> #PF P|RSVD (0x9) even on a data read */
+    uint64_t saved_efer = c->efer;
+    c->efer &= ~(1ull << 11);
+    wemu_cpu_enable_paging(c, 0);
+    e = 0x2003 | (1ull << 63); wemu_mem_write(c, 0x13000, &e, 8);
+    wemu_cpu_enable_paging(c, 1);
+    c->fault = 0; c->fault_error = 0;
+    CHECK(wemu_mem_read(c, 0x400000, &byte, 1) != 0, "NXE=0 XD -> reserved #PF");
+    CHECK(wemu_cpu_fault(c) == 14 && c->fault_error == 0x9,
+          "NXE=0 error P|RSVD = 0x9");
+    c->efer = saved_efer;
+    /* 2MiB leaf PD[1] -> XD */
+    wemu_cpu_enable_paging(c, 0);
+    e = 0x200000 | 0x83 | (1ull << 63);
+    wemu_mem_write(c, 0x12000 + 1 * 8, &e, 8);
+    wemu_cpu_enable_paging(c, 1);
+    c->fault = 0; c->fault_error = 0;
+    CHECK(wemu_mem_fetch(c, 0x200000, &fetch_buf, 1) != 0, "XD 2M fetch faults");
+    CHECK(wemu_cpu_fault(c) == 14 && c->fault_error == 0x11,
+          "XD 2M error P|I/D = 0x11");
+    c->fault = 0;
+    CHECK(wemu_mem_read(c, 0x200000, &byte, 1) == 0 && c->fault == 0,
+          "data read from XD 2M page allowed");
+
     /* paging off: identity */
     wemu_cpu_enable_paging(c, 0);
     c->fault = 0;
@@ -56,6 +108,7 @@ int main(void) {
     wemu_cpu_destroy(c);
 
     if (fails) { printf("test_paging: %d FAILURES\n", fails); return 1; }
-    printf("test_paging: PASS (4KiB, 2MiB, #PF+CR2, identity)\n");
+    printf("test_paging: PASS (4KiB, 2MiB, #PF+CR2, identity, XD/NX fetch "
+           "fault enforcement incl. NXE=0 RSVD)\n");
     return 0;
 }
