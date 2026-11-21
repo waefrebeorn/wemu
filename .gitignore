@@ -19,3 +19,7 @@ test_isa_atomic_fence
 /tests/sandbox_probe
 /tests/exec_chain
 /tests/isolate_probe
+/tests/script_interp
+/tests/exec_fork
+/tests/exec_script
+/tests/wemu_script_*.scr

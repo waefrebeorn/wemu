@@ -14,7 +14,7 @@ TESTS = test_isa test_avx test_paging test_machine test_string test_cpuid \
         test_segments test_cpl test_iret test_tss test_task_switch \
         test_task_gates test_ldt test_call_gate_priv test_task_gpr \
         test_usermode_native test_usermode_exec test_usermode_isolate \
-        test_usermode_mpk
+        test_usermode_mpk test_usermode_exec2
 
 all: libwemu.a
 
@@ -23,7 +23,8 @@ PIE_DYN    = tests/pie_dynamic
 FORK_FIX   = tests/fork_clone
 THREAD_FIX = tests/threaded_guest
 EXEC_FIX   = tests/exec_chain
-PIE_BINS   = $(PIE_STATIC) $(PIE_DYN) $(FORK_FIX) $(THREAD_FIX) $(EXEC_FIX)
+EXEC2_FIX  = tests/script_interp tests/exec_fork tests/exec_script
+PIE_BINS   = $(PIE_STATIC) $(PIE_DYN) $(FORK_FIX) $(THREAD_FIX) $(EXEC_FIX) $(EXEC2_FIX)
 SANDBOX_BIN = tests/sandbox_probe
 ISOLATE_BIN = tests/isolate_probe
 
@@ -49,6 +50,10 @@ test_usermode_native: tests/test_usermode_native.c libwemu.a $(PIE_BINS) $(SANDB
 test_usermode_exec: tests/test_usermode_exec.c libwemu.a $(EXEC_FIX) $(PIE_DYN)
 	$(CC) $(CFLAGS) -o $@ $< libwemu.a -lm
 
+# Bounded #! script + forked-child exec differential gate.
+test_usermode_exec2: tests/test_usermode_exec2.c libwemu.a $(EXEC2_FIX) $(EXEC_FIX)
+	$(CC) $(CFLAGS) -o $@ $< libwemu.a -lm
+
 # Freestanding process-per-guest isolation differential guest (raw syscalls).
 test_usermode_isolate: tests/test_usermode_isolate.c libwemu.a $(ISOLATE_BIN)
 	$(CC) $(CFLAGS) -o $@ $< libwemu.a -lm
@@ -71,6 +76,16 @@ tests/pie_%: tests/pie_%.c
 
 tests/fork_clone: tests/fork_clone.c
 	$(CC) -static-pie -O2 -o $@ $<
+
+# #! interpreter + fork/child-exec fixtures (static PIE, no PT_INTERP).
+tests/script_interp: tests/script_interp.c
+	$(CC) -static-pie -O2 -fno-stack-protector -o $@ $<
+
+tests/exec_fork: tests/exec_fork.c
+	$(CC) -static-pie -O2 -fno-stack-protector -o $@ $<
+
+tests/exec_script: tests/exec_script.c
+	$(CC) -static-pie -O2 -fno-stack-protector -o $@ $<
 
 # Self-exec differential fixture: stage 1 execve()s itself as a static PIE.
 tests/exec_chain: tests/exec_chain.c

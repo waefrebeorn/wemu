@@ -198,6 +198,7 @@ const char *wemu_um_status_name(int s) {
     case WEMU_UM_ERR_INTERNAL: return "ERR_INTERNAL";
     case WEMU_UM_ERR_INTERP:   return "ERR_INTERP";
     case WEMU_UM_ERR_BADPTR:   return "ERR_BADPTR";
+    case WEMU_UM_ERR_SCRIPT:   return "ERR_SCRIPT";
     default:                   return "ERR_UNKNOWN";
     }
 }
@@ -479,6 +480,71 @@ typedef struct {
     char    *envp[UM_EXEC_MAX_NARG + 1];
 } UmExecReq;
 static UmExecReq g_exec;
+
+/* ---- bounded #! script dispatch -------------------------------------- */
+/* Linux binfmt_script rebuilds argv as [interp, i_arg?, script, argv[1]...].
+ * We parse only the first UM_SCRIPT_BUF bytes (the kernel's BINPRM_BUF_SIZE)
+ * and refuse a line without a terminator, an empty/overlong interpreter or an
+ * overlong optional argument — no partial or speculative dispatch. */
+#define UM_SCRIPT_BUF 256u
+
+typedef struct {
+    char interp[UM_EXEC_MAX_ARG];
+    char opt[UM_EXEC_MAX_ARG];
+    int  has_opt;
+} UmShebang;
+
+/* Per-depth rebuilt argv slots: a script hop writes slot[depth] while reading
+ * slot[depth-1] (or g_exec.argv at depth 0), so chains never alias. */
+static char *g_script_argv[WEMU_UM_MAX_SCRIPT_DEPTH + 1][UM_EXEC_MAX_NARG + 1];
+
+/* Pure parser over a bounded header buffer.  0 = not a script, 1 = a valid
+ * bounded #! line, -1 = starts with #! but malformed (fail closed). */
+static int um_parse_shebang(const char *buf, size_t n, UmShebang *sh) {
+    if (n < 2 || buf[0] != '#' || buf[1] != '!') return 0;
+    size_t cap = n < UM_SCRIPT_BUF ? n : (size_t)UM_SCRIPT_BUF;
+    size_t i = 2;
+    while (i < cap && (buf[i] == ' ' || buf[i] == '\t')) i++;
+    size_t is = i;
+    while (i < cap && buf[i] != ' ' && buf[i] != '\t' &&
+           buf[i] != '\n' && buf[i] != '\r') i++;
+    size_t il = i - is;
+    if (il == 0 || il >= UM_EXEC_MAX_ARG) return -1;
+    while (i < cap && (buf[i] == ' ' || buf[i] == '\t')) i++;
+    if (i >= cap) return -1;                   /* no terminator in window */
+    if (sh) {
+        memcpy(sh->interp, buf + is, il); sh->interp[il] = 0;
+        sh->opt[0] = 0; sh->has_opt = 0;
+    }
+    if (buf[i] == '\n' || buf[i] == '\r') return 1;
+    size_t os = i;
+    while (i < cap && buf[i] != '\n' && buf[i] != '\r') i++;
+    if (i >= cap) return -1;                   /* optional arg unterminated */
+    size_t ol = i - os;
+    if (ol == 0 || ol >= UM_EXEC_MAX_ARG) return -1;
+    if (sh) {
+        memcpy(sh->opt, buf + os, ol); sh->opt[ol] = 0; sh->has_opt = 1;
+    }
+    return 1;
+}
+
+int wemu_um_exec_script_modeled(const char *hdr, size_t n) {
+    if (!hdr) return 0;
+    UmShebang sh;
+    return um_parse_shebang(hdr, n, &sh) == 1;
+}
+
+/* Copy a host-side string (interpreter path / optional arg / script path)
+ * into the bounded, host-owned exec store so it survives image teardown. */
+static const char *um_exec_store_str(const char *s) {
+    size_t n = strlen(s);
+    if (n >= UM_EXEC_MAX_ARG || g_exec.used + n + 1 > UM_EXEC_STORE) return NULL;
+    char *d = g_exec.store + g_exec.used;
+    memcpy(d, s, n);
+    d[n] = 0;
+    g_exec.used += n + 1;
+    return d;
+}
 
 /* Serialise dispatch state updates.  Released around blocking host calls so
  * a futex-waiting thread cannot freeze a peer that needs to wake it. */
@@ -1025,7 +1091,11 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
 
     /* Bounded image replacement: execve / execveat.  Refuse here (the guest
      * sees an error, no image is loaded) for unsupported variants/flags, bad
-     * guest pointers, an exhausted exec budget or live shared-VM threads. */
+     * guest pointers, an exhausted exec budget or live shared-VM threads.
+     * A COW forked child MAY exec: only slot 0 can call execve (a shared-VM
+     * thread cannot replace the image under its peers), but a fork child is
+     * slot 0 of its own private address space — its is_root=0 is preserved
+     * across the replacement so its exit still reports through wait4. */
     if (e->kind == WEMU_UM_DISPATCH_EXECVE) {
         if (!um_exec_args_ok(nr, a)) {
             um_note_denied(nr);
@@ -1035,7 +1105,7 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
             um_unlock();
             return;
         }
-        if (th != &g_thr[0] || !th->is_root ||
+        if (th != &g_thr[0] ||
             g_um.result->execs >= WEMU_UM_MAX_EXECS ||
             g_um.result->threads_created != 0) {
             um_note_denied(nr);
@@ -1580,6 +1650,9 @@ static int um_exec_vec(uint64_t vp, char **out, size_t max) {
  * real.  On any failure the run fails closed with a WemuUmStatus. */
 static void um_exec_continue(void) {
     WemuUmResult *shared = g_um.result;
+    /* A COW forked child execs with is_root=0; preserve it so its exit is
+     * reported to the guest parent through wait4, not to the shared result. */
+    int keep_root = g_thr[0].is_root;
     if (um_raw_set_fs(g_host_fs) != 0)
         um_child_fail(shared, WEMU_UM_ERR_INTERNAL);
     /* Host context: restore the all-keys-enabled PKRU so glibc's loader
@@ -1594,15 +1667,62 @@ static void um_exec_continue(void) {
         !um_exec_vec(g_exec.envpp, g_exec.envp, UM_EXEC_MAX_NARG))
         um_child_fail(shared, WEMU_UM_ERR_FAULT);
 
+    /* Resolve the exec target through a bounded #! chain.  Each hop rewrites
+     * argv as [interp, i_arg?, script, argv[1]...] (Linux binfmt_script), then
+     * re-reads the interpreter: a chain of scripts is followed at most
+     * WEMU_UM_MAX_SCRIPT_DEPTH times.  A malformed/unterminated/overlong #!
+     * line or an exhausted chain fails closed — no interpreter is entered. */
     UmImage im;
-    int rc = um_load(g_exec.path, &im);
-    if (rc == -2) um_child_fail(shared, WEMU_UM_ERR_RANGE);
-    if (rc != 0) um_child_fail(shared, WEMU_UM_ERR_FORMAT);
-    if (im.has_interp) um_child_fail(shared, WEMU_UM_ERR_INTERP);
+    const char *cur_path = g_exec.path;
+    char **cur_argv = g_exec.argv;
+    uint8_t *file = NULL;
+    size_t file_len = 0;
+    int loaded = 0;
+
+    for (unsigned depth = 0; depth <= WEMU_UM_MAX_SCRIPT_DEPTH; depth++) {
+        file = um_read_file(cur_path, &file_len);
+        if (!file) um_child_fail(shared, WEMU_UM_ERR_FORMAT);
+        UmShebang sh;
+        int sp = um_parse_shebang((const char *)file, file_len, &sh);
+        if (sp < 0) { free(file); um_child_fail(shared, WEMU_UM_ERR_SCRIPT); }
+        if (sp == 0) {                         /* plain ELF candidate */
+            int rc = um_load(cur_path, &im);
+            free(file);
+            if (rc == -2) um_child_fail(shared, WEMU_UM_ERR_RANGE);
+            if (rc != 0) um_child_fail(shared, WEMU_UM_ERR_FORMAT);
+            if (im.has_interp) um_child_fail(shared, WEMU_UM_ERR_INTERP);
+            loaded = 1;
+            break;
+        }
+        if (depth == WEMU_UM_MAX_SCRIPT_DEPTH) { /* chain too deep: refuse */
+            free(file);
+            um_child_fail(shared, WEMU_UM_ERR_SCRIPT);
+        }
+        const char *interp = um_exec_store_str(sh.interp);
+        const char *oarg = sh.has_opt ? um_exec_store_str(sh.opt) : NULL;
+        const char *script = um_exec_store_str(cur_path);
+        if (!interp || (sh.has_opt && !oarg) || !script) {
+            free(file);
+            um_child_fail(shared, WEMU_UM_ERR_SCRIPT);
+        }
+        char **dst = g_script_argv[depth];
+        size_t j = 0;
+        dst[j++] = (char *)interp;
+        if (oarg) dst[j++] = (char *)oarg;
+        if (j >= UM_EXEC_MAX_NARG) { free(file); um_child_fail(shared, WEMU_UM_ERR_SCRIPT); }
+        dst[j++] = (char *)script;
+        for (size_t k = 1; cur_argv[k] && j < UM_EXEC_MAX_NARG; k++)
+            dst[j++] = cur_argv[k];
+        dst[j] = NULL;
+        free(file);
+        cur_argv = dst;                        /* depth d+1 reads slot d */
+        cur_path = interp;
+    }
+    if (!loaded) um_child_fail(shared, WEMU_UM_ERR_SCRIPT);
 
     uint8_t *stack_mem;
     uint64_t lo = 0, hi = 0;
-    uint64_t rsp = um_build_stack(g_exec.argv, g_exec.envp, &im, &stack_mem,
+    uint64_t rsp = um_build_stack(cur_argv, g_exec.envp, &im, &stack_mem,
                                   &lo, &hi);
     if (!rsp) um_child_fail(shared, WEMU_UM_ERR_INTERNAL);
     free(im.file);                             /* strings now live in g_exec */
@@ -1630,19 +1750,24 @@ static void um_exec_continue(void) {
     memset(g_um.sig_restorer, 0, sizeof g_um.sig_restorer);
     memset(g_um.sig_flags, 0, sizeof g_um.sig_flags);
     memset(g_um.sig_valid, 0, sizeof g_um.sig_valid);
-    shared->forks = 0;
-    shared->threads_created = 0;
-    memset(shared->denied_nrs, 0, sizeof shared->denied_nrs);
-    shared->bad_ptrs = 0; shared->bad_ptr_nr = 0; shared->bad_ptr_va = 0;
-    shared->fault_code = 0; shared->fault_pkey = -1;
-    shared->execs++;                           /* monotonic: resets cannot reset it */
+    /* A root exec resets the whole process-tree accounting (shared MAP_SHARED
+     * page).  A COW forked child must NOT clobber its parent's fork/thread
+     * counts: it only records that an image replacement happened. */
+    if (keep_root) {
+        shared->forks = 0;
+        shared->threads_created = 0;
+        memset(shared->denied_nrs, 0, sizeof shared->denied_nrs);
+        shared->bad_ptrs = 0; shared->bad_ptr_nr = 0; shared->bad_ptr_va = 0;
+        shared->fault_code = 0; shared->fault_pkey = -1;
+    }
+    __atomic_fetch_add(&shared->execs, 1, __ATOMIC_SEQ_CST);  /* monotonic: resets cannot reset it */
     for (unsigned i = 1; i < WEMU_UM_MAX_THREADS; i++)
         memset(&g_thr[i], 0, sizeof g_thr[i]);
     UmThread *root = &g_thr[0];
     memset(root, 0, sizeof *root);
     root->tid = um_raw_gettid();
     root->active = 1;
-    root->is_root = 1;
+    root->is_root = keep_root;                 /* fork child stays non-root */
     root->child_rsp = (greg_t)((uint64_t)__builtin_frame_address(0) & ~15ull);
     g_boot_thr = root;
     g_dispatch_lock = 0;

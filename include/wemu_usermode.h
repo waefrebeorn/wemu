@@ -28,6 +28,7 @@ extern "C" {
 #define WEMU_UM_MAX_FORKS     8u       /* bounded guest fork/clone children/run */
 #define WEMU_UM_MAX_THREADS   8u       /* bounded shared-VM host threads/run */
 #define WEMU_UM_MAX_EXECS     4u       /* bounded image replacements/run */
+#define WEMU_UM_MAX_SCRIPT_DEPTH 4u    /* bounded #! interpreter chain/run */
 #define WEMU_UM_MAX_HOST_PAGES 8u      /* bounded host-only regions hidden/guest */
 
 /* CPU-enforced protection-key (MPK/pkeys) mode for the isolation path.
@@ -50,8 +51,10 @@ typedef enum {
     WEMU_UM_ERR_DENIED    =  -8,   /* an unlisted syscall was attempted */
     WEMU_UM_ERR_INTERNAL  = -9,
     WEMU_UM_ERR_INTERP    = -10,   /* ET_DYN with PT_INTERP: no ld.so model */
-    WEMU_UM_ERR_BADPTR    = -11    /* guest pointer outside the mapped ranges:
+    WEMU_UM_ERR_BADPTR    = -11,   /* guest pointer outside the mapped ranges:
                                     * the host syscall was NOT dispatched */
+    WEMU_UM_ERR_SCRIPT    = -12    /* malformed/out-of-bound #! script: refused,
+                                    * no interpreter dispatched */
 } WemuUmStatus;
 
 /* Dispatch kinds.  A syscall absent from the table is NOT passed through:
@@ -143,6 +146,13 @@ int wemu_um_clone_thread_flags_modeled(uint64_t flags);
  * AT_FDCWD with no flags.  AT_EMPTY_PATH and every other flag/dirfd are
  * refused fail-closed (plain execve has no flags and is always eligible). */
 int wemu_um_execveat_modeled(long dirfd, uint64_t flags);
+
+/* 1 when the leading bytes of an exec target form a well-formed, BOUNDED
+ * #! line WEMU will dispatch: a non-empty interpreter path and a line
+ * terminator within WEMU's script-line window.  0 otherwise — the target is
+ * either a plain ELF candidate or a script WEMU refuses.  Pure predicate
+ * (no I/O): the gate uses it to audit the fail-closed edges. */
+int wemu_um_exec_script_modeled(const char *hdr, size_t n);
 
 /* ---- process-per-guest address-space isolation ----------------------- */
 /* Register a supervisor-owned MAP_SHARED region as the GUEST ARENA.  The
