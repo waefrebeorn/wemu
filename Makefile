@@ -19,7 +19,8 @@ TESTS = test_isa test_avx test_paging test_machine test_string test_cpuid \
 
 all: libwemu.a
 
-PIE_STATIC = tests/pie_hello tests/pie_signal tests/pie_nohandler tests/pie_unlisted
+PIE_STATIC = tests/pie_hello tests/pie_signal tests/pie_nohandler tests/pie_unlisted \
+             tests/pie_onstack
 PIE_DYN    = tests/pie_dynamic
 FORK_FIX   = tests/fork_clone
 THREAD_FIX = tests/threaded_guest

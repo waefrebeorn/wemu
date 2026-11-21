@@ -414,6 +414,103 @@ static void check_pie(const char *path, const char *want, unsigned want_sig) {
            r.signals_delivered);
 }
 
+/* ---- bounded SA_ONSTACK / alternate signal stack ------------------- */
+#define SS_DISABLE_  0x2u
+#define SS_ONSTACK_  0x1u
+#define SS_AUTODISARM_ 0x80000000u
+#define ONSTACK_WANT "BAD=12\nSET=0\nBEFORE=0\nBASE=1\nHANDLER=1,1 AFTER=0 OK=1\n"
+
+static void test_onstack_delivery(void) {
+    /* Pure shape predicate, audited off-line against the same rule the
+     * handler applies (no I/O, no run state). */
+    if (!wemu_um_sigaltstack_modeled(0, 65536) ||
+        !wemu_um_sigaltstack_modeled(SS_DISABLE_, 0) ||
+        wemu_um_sigaltstack_modeled(0, 1024) ||
+        wemu_um_sigaltstack_modeled(SS_ONSTACK_, 65536) ||
+        wemu_um_sigaltstack_modeled(SS_AUTODISARM_, 65536))
+        FAIL("sigaltstack shape predicate wrong\n");
+
+    /* Dispatch table entry number is audited vs the kernel header above;
+     * assert the bounded name is present here too. */
+    size_t ne = 0;
+    const WemuUmSyscallEntry *te = wemu_um_syscall_table(&ne);
+    int found = 0;
+    for (size_t i = 0; i < ne; i++)
+        if (te[i].nr == 131 && strcmp(te[i].name, "sigaltstack") == 0) found = 1;
+    if (!found) FAIL("sigaltstack(131) missing from dispatch table\n");
+
+    char *argv[] = { (char *)"tests/pie_onstack", NULL };
+    WemuUmResult r;
+    int rc = wemu_um_run_elf("tests/pie_onstack", argv, GUEST_ENV, &r);
+    if (rc != WEMU_UM_OK)
+        FAIL("onstack: status=%s out=[%s]\n", wemu_um_status_name(rc), r.out);
+    if (r.exit_code != 0 || r.signals_delivered != 1 || r.signals_denied != 0 ||
+        r.denied != 0)
+        FAIL("onstack: exit=%d sigdel=%u sigden=%u denied=%llu\n",
+             r.exit_code, r.signals_delivered, r.signals_denied,
+             (unsigned long long)r.denied);
+    if (r.onstack_deliveries != 1 || r.altstack_calls == 0)
+        FAIL("onstack: onstack_del=%u altcalls=%u want >=1/>=1\n",
+             r.onstack_deliveries, r.altstack_calls);
+    if (r.refuses[WEMU_UM_REFUSE_SIGALTSTACK_SIZE] != 1)
+        FAIL("onstack: exact SIZE refuse=%u want 1\n",
+             r.refuses[WEMU_UM_REFUSE_SIGALTSTACK_SIZE]);
+    if (r.out_len != strlen(ONSTACK_WANT) ||
+        memcmp(r.out, ONSTACK_WANT, r.out_len) != 0)
+        FAIL("onstack: out=[%s] want=[%s]\n", r.out, ONSTACK_WANT);
+    Cap oracle;
+    int he = host_exec("tests/pie_onstack", argv, &oracle);
+    if (he != 0 || oracle.n != r.out_len ||
+        memcmp(oracle.b, r.out, r.out_len) != 0)
+        FAIL("onstack: host oracle differs (exit=%d host=[%s] wemu=[%s])\n",
+             he, oracle.b, r.out);
+    print_exact("onstack", r.out, r.out_len);
+    printf("        (SS_ONSTACK + local-in-alt + ucontext uc_stack byte-exact "
+           "vs host; onstack_del=%u, exact SIZE refuse=1)\n",
+           r.onstack_deliveries);
+
+    /* NEGATIVE CONTROL 1: sigaltstack switched off.  The guest sees -ENOSYS
+     * for every query/set (exact refuse counter), no delivery is placed on an
+     * altstack, and the byte stream diverges from the host oracle. */
+    if (wemu_um_set_sigaltstack_enabled(0) != 0)
+        FAIL("cannot disable sigaltstack\n");
+    rc = wemu_um_run_elf("tests/pie_onstack", argv, GUEST_ENV, &r);
+    wemu_um_set_sigaltstack_enabled(1);
+    if (rc != WEMU_UM_OK) FAIL("onstack-neg1: status=%s\n", wemu_um_status_name(rc));
+    if (r.onstack_deliveries != 0 ||
+        r.refuses[WEMU_UM_REFUSE_SIGALTSTACK_DISABLED] == 0)
+        FAIL("onstack-neg1: onstack=%u disabled-refuse=%u\n",
+             r.onstack_deliveries,
+             r.refuses[WEMU_UM_REFUSE_SIGALTSTACK_DISABLED]);
+    if (strncmp(r.out, "BAD=38\n", 7) != 0 ||
+        strstr(r.out, "HANDLER=0,0") == NULL ||
+        strcmp(r.out, ONSTACK_WANT) == 0)
+        FAIL("onstack-neg1: control output did not diverge: [%s]\n", r.out);
+    print_exact("onstack-neg1", r.out, r.out_len);
+    printf("ok: NEGATIVE CONTROL sigaltstack OFF -> -ENOSYS (%u exact refuses), "
+           "onstack_del=0, output differs from host\n",
+           r.refuses[WEMU_UM_REFUSE_SIGALTSTACK_DISABLED]);
+
+    /* NEGATIVE CONTROL 2: SA_ONSTACK placement switched off.  sigaltstack
+     * still works (BAD/SET/BASE match), but the handler frame is placed on the
+     * interrupted stack and SS_ONSTACK is never reported: HANDLER=0,0. */
+    if (wemu_um_set_onstack_enabled(0) != 0)
+        FAIL("cannot disable onstack\n");
+    rc = wemu_um_run_elf("tests/pie_onstack", argv, GUEST_ENV, &r);
+    wemu_um_set_onstack_enabled(1);
+    if (rc != WEMU_UM_OK) FAIL("onstack-neg2: status=%s\n", wemu_um_status_name(rc));
+    if (r.onstack_deliveries != 0 || r.altstack_calls == 0)
+        FAIL("onstack-neg2: onstack=%u altcalls=%u\n",
+             r.onstack_deliveries, r.altstack_calls);
+    if (strncmp(r.out, "BAD=12\nSET=0\n", 13) != 0 ||
+        strstr(r.out, "HANDLER=0,0") == NULL ||
+        strcmp(r.out, ONSTACK_WANT) == 0)
+        FAIL("onstack-neg2: control output did not diverge: [%s]\n", r.out);
+    print_exact("onstack-neg2", r.out, r.out_len);
+    printf("ok: NEGATIVE CONTROL SA_ONSTACK OFF -> normal-stack handler "
+           "(HANDLER=0,0), onstack_del=0, output differs from host\n");
+}
+
 static void test_pie_and_signals(void) {
     int dyn = 0, interp = 0;
     uint64_t entry = 0;
@@ -437,6 +534,8 @@ static void test_pie_and_signals(void) {
     check_pie("tests/pie_signal", "PIE-SIGNAL-DELIVERED-OK\n", 1);
     printf("ok: bounded SIGSEGV -> guest handler -> SA_RESTORER sigreturn -> "
            "store retried, byte-exact vs host\n");
+
+    test_onstack_delivery();
 
     WemuUmResult r;
     int rc = wemu_um_run_elf("tests/pie_nohandler",

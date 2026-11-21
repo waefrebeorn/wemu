@@ -13,6 +13,7 @@ test_isa_atomic_fence
 /tests/pie_signal
 /tests/pie_nohandler
 /tests/pie_unlisted
+/tests/pie_onstack
 /tests/pie_dynamic
 /tests/fork_clone
 /tests/threaded_guest

@@ -41,8 +41,11 @@
  * ucontext (bounded FXSAVE/XSAVE blob in supervisor memory) and the x87/XMM
  * FXSAVE area in the synthetic ucontext; rt_sigreturn restores the whole
  * bounded blob, overlaying handler edits to the FXSAVE area.  Unsupported FP
- * shapes fail closed before any handler runs.  ALTERNATE stacks, nested
- * delivery, timers and a multi-slot pending queue remain unmodeled.
+ * shapes fail closed before any handler runs.  BOUNDED SA_ONSTACK: sigaltstack
+ * is virtualized per thread (no host altstack is ever installed) and a handler
+ * registered with SA_ONSTACK gets its frame on that altstack with an exact
+ * SS_ONSTACK query and byte-exact ucontext; unsupported shapes fail closed.
+ * Nested delivery, timers and a multi-slot pending queue remain unmodeled.
  *
  * Bounded fork/clone: fork/vfork, clone and clone3 are dispatched in-process.
  * A fork-shaped request (CSIGNAL 0/SIGCHLD, optionally the two glibc TID
@@ -149,6 +152,23 @@
 #define UM_SIGCONT                   18     /* x86-64 signal number (kernel) */
 #define WEMU_UM_SYS_TGKILL           234 /* bounded cross-thread signal target */
 #define WEMU_UM_SYS_KILL             62  /* bounded process-directed signal */
+#define WEMU_UM_SYS_SIGALTSTACK      131 /* bounded alternate signal stack */
+/* x86-64 kernel stack_t flags and bounds (asm/sigstack.h, linux/signal.h).
+ * SS_ONSTACK is only ever a QUERY result, never accepted on a set; SS_DISABLE
+ * is admitted; SS_AUTODISARM (Linux 4.7+) is unmodeled and fails closed. */
+#define UM_SS_ONSTACK                0x00000001u
+#define UM_SS_DISABLE                0x00000002u
+#define UM_SS_AUTODISARM             0x80000000u
+#define UM_SIGALTSTACK_FLAGS_ALLOWED (UM_SS_DISABLE)
+#define UM_MINSIGSTKSZ               2048u
+#define UM_MAXSIGSTKSZ               (1u << 26)
+/* Kernel x86-64 stack_t: ss_sp@0, ss_flags@8, (pad)@12, ss_size@16. */
+typedef struct {
+    uint64_t ss_sp;
+    uint32_t ss_flags;
+    uint32_t ss_pad;
+    uint64_t ss_size;
+} UmStackT;
 #define UM_SI_USER                  0    /* linux/signal.h: SI_USER (kill) */
 #define UM_KCMP_FILE             0    /* linux/kcmp.h KCMP_FILE */
 #define UM_F_GETFD               1    /* fcntl(2) */
@@ -211,6 +231,7 @@ static const WemuUmSyscallEntry um_table[] = {
     { VSL_SYS_RT_SIGPROCMASK,  "rt_sigprocmask",  WEMU_UM_DISPATCH_SIGPROCMASK },
     { WEMU_UM_SYS_TGKILL,      "tgkill",          WEMU_UM_DISPATCH_TGKILL },
     { WEMU_UM_SYS_KILL,        "kill",            WEMU_UM_DISPATCH_KILL },
+    { WEMU_UM_SYS_SIGALTSTACK, "sigaltstack",     WEMU_UM_DISPATCH_SIGALTSTACK },
     { VSL_SYS_IOCTL,           "ioctl",           WEMU_UM_DISPATCH_HOST },
     { VSL_SYS_WRITEV,          "writev",          WEMU_UM_DISPATCH_HOST },
     { WEMU_UM_SYS_SENDFILE,    "sendfile",        WEMU_UM_DISPATCH_HOST },
@@ -411,6 +432,15 @@ typedef struct {
      * event. */
     UmSigEvent pending_ev;
     volatile int pending;
+    /* Bounded per-thread alternate signal stack (sigaltstack).  The kernel
+     * does NOT inherit an altstack across clone, so new slots start at zero.
+     * `alt_onstack` is set for the duration of an SA_ONSTACK delivery so a
+     * sigaltstack QUERY inside the handler reports SS_ONSTACK exactly as the
+     * kernel does; rt_sigreturn clears it.  No host altstack is installed. */
+    uint64_t alt_sp;
+    uint64_t alt_size;
+    volatile int alt_onstack;
+    int alt_disabled;
 } UmThread;
 
 #define UM_SHAPE_THREAD 1u
@@ -517,6 +547,8 @@ static struct {
     int fd_kcmp_forced_off;      /* 1 = pretend kcmp is unavailable (-ENOSYS) */
     int fd_cloexec_refuse;       /* 1 = OLD path: refuse every CLOEXEC fd */
     int pidfd_authority_enabled; /* bounded pidfd authority (OLD path off) */
+    int sigaltstack_enabled;    /* sigaltstack virtualization (OLD path off) */
+    int onstack_enabled;        /* SA_ONSTACK frame placement (OLD path off) */
 } g_cfg = { .enabled = 1, .pkey_mode = WEMU_UM_PKEY_AUTO,
             .thread_exec_enabled = 1, .clone3_thread_enabled = 1,
             .sigmask_virtual_enabled = 1, .thread_disp_enabled = 1,
@@ -524,7 +556,8 @@ static struct {
             .fp_signal_enabled = 1, .fp_force_unsupported = 0,
             .exact_refuse_enabled = 1, .fd_ofd_check_enabled = 1,
             .fd_kcmp_forced_off = 0, .fd_cloexec_refuse = 0,
-            .pidfd_authority_enabled = 1 };
+            .pidfd_authority_enabled = 1,
+            .sigaltstack_enabled = 1, .onstack_enabled = 1 };
 
 /* CPU-enforced protection-key state, built in the forked guest child before
  * the first guest instruction.  PKRU is per-thread: the supervisor (parent)
@@ -571,6 +604,8 @@ void wemu_um_reset_isolation(void) {
     g_cfg.fd_kcmp_forced_off = 0;
     g_cfg.fd_cloexec_refuse = 0;
     g_cfg.pidfd_authority_enabled = 1;
+    g_cfg.sigaltstack_enabled = 1;
+    g_cfg.onstack_enabled = 1;
     memset(&g_um.pidfds, 0, sizeof g_um.pidfds);
     g_um.n_pidfds = 0;
 }
@@ -615,6 +650,25 @@ int wemu_um_set_kill_enabled(int enabled) {
     if (enabled != 0 && enabled != 1) return -1;
     g_cfg.kill_enabled = enabled;
     return 0;
+}
+
+int wemu_um_set_sigaltstack_enabled(int enabled) {
+    if (enabled != 0 && enabled != 1) return -1;
+    g_cfg.sigaltstack_enabled = enabled;
+    return 0;
+}
+
+int wemu_um_set_onstack_enabled(int enabled) {
+    if (enabled != 0 && enabled != 1) return -1;
+    g_cfg.onstack_enabled = enabled;
+    return 0;
+}
+
+int wemu_um_sigaltstack_modeled(uint64_t ss_flags, uint64_t ss_size) {
+    if (ss_flags & ~(uint64_t)UM_SIGALTSTACK_FLAGS_ALLOWED) return 0;
+    /* A bare SS_DISABLE request ignores ss_size; a real stack is bounded. */
+    if (ss_flags & UM_SS_DISABLE) return 1;
+    return ss_size >= UM_MINSIGSTKSZ && ss_size <= UM_MAXSIGSTKSZ;
 }
 
 int wemu_um_set_fp_signal_enabled(int enabled) {
@@ -1375,6 +1429,11 @@ static int um_ptr_args_ok(uint64_t nr, const uint64_t a[6]) {
         return um_chk(nr, a[1], 32) && um_chk(nr, a[2], 32);
     case VSL_SYS_RT_SIGPROCMASK:
         return um_chk(nr, a[1], 8) && um_chk(nr, a[2], 8);
+    case WEMU_UM_SYS_SIGALTSTACK:
+        /* Both stack_t buffers are read/written by WEMU itself; the ss_sp
+         * region is validated with an exact reason inside um_sigaltstack. */
+        return um_chk(nr, a[0], sizeof(UmStackT)) &&
+               um_chk(nr, a[1], sizeof(UmStackT));
     case VSL_SYS_PRLIMIT64:
         return um_chk(nr, a[2], 16) && um_chk(nr, a[3], 16);
     case WEMU_UM_SYS_SENDFILE:
@@ -1454,6 +1513,69 @@ static int64_t um_sigaction(UmThread *th, const uint64_t a[6]) {
     return 0;
 }
 
+/* Guest sigaltstack: virtualize the alternate signal stack in this thread.
+ * No host altstack is ever installed — that would move WEMU's own SIGSYS and
+ * fault handlers onto the guest stack and break every frame we build.  A NULL
+ * `ss` is a pure query; the QUERY result reports SS_ONSTACK while this thread
+ * is executing an SA_ONSTACK delivery (kernel parity).  A set admits only
+ * ss_flags in {0, SS_DISABLE} with a bounded, guest-mapped ss_sp/ss_size;
+ * every other shape fails closed with an exact reason and a kernel-shaped
+ * errno, without touching guest or host state. */
+static int64_t um_sigaltstack(UmThread *th, const uint64_t a[6]) {
+    uint64_t ss = a[0], oldss = a[1];
+    if (!g_cfg.sigaltstack_enabled) {
+        g_um.result->refuses[WEMU_UM_REFUSE_SIGALTSTACK_DISABLED]++;
+        return -ENOSYS;                       /* OLD path: unlisted syscall */
+    }
+    g_um.result->altstack_calls++;
+
+    /* The oldss buffer is written by WEMU itself (already pointer-checked by
+     * um_ptr_args_ok).  Report the bounded per-thread state; SS_ONSTACK is a
+     * live delivery fact, never stored on a set. */
+    if (oldss) {
+        UmStackT out;
+        memset(&out, 0, sizeof out);
+        out.ss_sp = th->alt_sp;
+        out.ss_size = th->alt_size;
+        out.ss_flags = th->alt_disabled ? UM_SS_DISABLE
+                     : (th->alt_onstack ? UM_SS_ONSTACK : 0u);
+        memcpy((void *)(uintptr_t)oldss, &out, sizeof out);
+    }
+    if (!ss) return 0;                        /* pure QUERY, nothing to set */
+
+    UmStackT req;
+    memcpy(&req, (const void *)(uintptr_t)ss, sizeof req);
+    uint32_t fl = req.ss_flags;
+    if (!wemu_um_sigaltstack_modeled(fl, req.ss_size)) {
+        g_um.result->onstack_denied++;
+        g_um.result->refuses[(fl & ~(uint64_t)UM_SIGALTSTACK_FLAGS_ALLOWED)
+                             ? WEMU_UM_REFUSE_SIGALTSTACK_FLAGS
+                             : WEMU_UM_REFUSE_SIGALTSTACK_SIZE]++;
+        return (fl & ~(uint32_t)UM_SIGALTSTACK_FLAGS_ALLOWED) ? -EINVAL
+                                                              : -ENOMEM;
+    }
+    if (fl & UM_SS_DISABLE) {
+        /* Disabling is always admitted; ss_sp/ss_size are ignored by Linux. */
+        th->alt_sp = 0;
+        th->alt_size = 0;
+        th->alt_disabled = 1;
+        return 0;
+    }
+    /* ss_sp must be non-NULL, not wrap, and wholly inside a guest-mapped
+     * range.  A supervisor-only pointer would let a guest install its handler
+     * frame over host memory, so refuse with an exact reason. */
+    if (!req.ss_sp || req.ss_sp > UINT64_MAX - req.ss_size ||
+        !um_ptr_ok(req.ss_sp, req.ss_size)) {
+        g_um.result->onstack_denied++;
+        g_um.result->refuses[WEMU_UM_REFUSE_SIGALTSTACK_RANGE]++;
+        return -EFAULT;
+    }
+    th->alt_sp = req.ss_sp;
+    th->alt_size = req.ss_size;
+    th->alt_disabled = 0;
+    return 0;
+}
+
 /* Guest rt_sigreturn: put the fault-time registers AND FP state back.  The
  * ucontext we are returning from is the SIGSYS one raised by this very
  * syscall, so the kernel resumes at the restored RIP with the restored FP
@@ -1492,6 +1614,7 @@ static void um_sigreturn(UmThread *th, ucontext_t *uc) {
     memcpy(r, th->saved_gregs, sizeof th->saved_gregs);
     th->saved_valid = 0;
     th->in_handler = 0;
+    th->alt_onstack = 0;             /* sigaltstack query is no longer on-stack */
     th->saved_fp_len = 0;
     th->saved_uc_at = 0;
     /* Deliberately no um_skip_syscall: RIP is now the faulting instruction. */
@@ -1960,6 +2083,9 @@ static int64_t um_sigprocmask_virtual(UmThread *th, const uint64_t a[6]) {
 
 /* ---- SA_SIGINFO delivery + bounded cross-thread (tgkill) targeting --- */
 #define UM_SA_SIGINFO 0x00000004u        /* kernel SA_SIGINFO in sigaction.flags */
+#define UM_SA_ONSTACK 0x08000000u        /* kernel SA_ONSTACK (asm-generic
+                                          * signal-defs.h, distinct from
+                                          * SA_SIGINFO's 0x4) */
 #define UM_SI_TKILL   (-6)               /* linux/signal.h: signal sent by tgkill */
 
 /* Build the guest signal frame.  Only the deterministic siginfo fields are
@@ -2003,19 +2129,41 @@ static int um_deliver_frame(UmThread *th, ucontext_t *uc, greg_t *r,
      * INSIDE the synthetic ucontext's __fpregs_mem (the kernel's own FXSAVE
      * slot), so no extra stack region is consumed and the kernel's gregs are
      * never disturbed. */
-    uintptr_t old = (uintptr_t)r[REG_RSP];
+    /* SA_ONSTACK: a handler that asked for the alternate stack gets its frame
+     * at the TOP of that stack, growing down — exactly where the kernel puts
+     * it.  Only the guest RIP/RSP in the trapping ucontext are rewritten: no
+     * host altstack is ever installed.  A missing/disabled altstack falls
+     * back to the interrupted stack (kernel behaviour), and an altstack we
+     * are already on is refused as a nested shape (nesting is unmodeled). */
+    int onstack = g_cfg.onstack_enabled &&
+                  (d->flags[signo] & UM_SA_ONSTACK) &&
+                  !th->alt_disabled && th->alt_size != 0 && !th->alt_onstack;
+    uintptr_t old = onstack
+        ? (uintptr_t)(th->alt_sp + th->alt_size)
+        : (uintptr_t)r[REG_RSP];
+    uintptr_t alt_lo = onstack ? (uintptr_t)th->alt_sp : 0u;
     uintptr_t uc_at = (old - sizeof(ucontext_t) - 16u) & ~(uintptr_t)15u;
     uintptr_t si_at = (uc_at - sizeof(siginfo_t)) & ~(uintptr_t)15u;
     uintptr_t entry = si_at - 8u;
-    if (entry >= old || si_at < entry ||
-        !um_ptr_ok(entry, (uint64_t)(old - entry)))
-        return -1;
+    if (entry >= old || si_at < entry || (onstack && entry < alt_lo) ||
+        !um_ptr_ok(entry, (uint64_t)(old - entry))) {
+        if (onstack) {
+            g_um.result->onstack_denied++;
+            if (g_cfg.exact_refuse_enabled)
+                g_um.result->refuses[WEMU_UM_REFUSE_SIGALTSTACK_FRAME]++;
+        }
+        return -1;                       /* fail closed: no handler runs */
+    }
 
     /* Save the interrupted registers: rt_sigreturn restores exactly these, so
      * the guest resumes where it was interrupted (fault RIP or post-syscall). */
     memcpy(th->saved_gregs, r, sizeof th->saved_gregs);
     th->saved_valid = 1;
     th->in_handler = 1;
+    th->alt_onstack = onstack;
+    if (onstack)
+        __atomic_fetch_add(&g_um.result->onstack_deliveries, 1,
+                           __ATOMIC_SEQ_CST);
     th->sig_deliveries++;
     th->saved_uc_at = uc_at;
     if (fp_len) {
@@ -2060,6 +2208,12 @@ static int um_deliver_frame(UmThread *th, ucontext_t *uc, greg_t *r,
         sigemptyset(&uctx.uc_sigmask);
         for (int s = 1; s < 32; s++)
             if ((th->sig_mask >> (s - 1)) & 1ull) sigaddset(&uctx.uc_sigmask, s);
+        if (onstack) {
+            /* The kernel describes the active alternate stack in uc_stack. */
+            uctx.uc_stack.ss_sp = (void *)(uintptr_t)th->alt_sp;
+            uctx.uc_stack.ss_size = (size_t)th->alt_size;
+            uctx.uc_stack.ss_flags = SS_ONSTACK;
+        }
         memcpy((void *)(uintptr_t)uc_at, &uctx, sizeof uctx);
         memcpy((void *)(uintptr_t)si_at, &sifo, sizeof sifo);
         r[REG_RSI] = (greg_t)si_at;
@@ -2479,6 +2633,8 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
     int64_t ret = -EPERM;
     if (e->kind == WEMU_UM_DISPATCH_SIGACTION) {
         ret = um_sigaction(th, a);
+    } else if (e->kind == WEMU_UM_DISPATCH_SIGALTSTACK) {
+        ret = um_sigaltstack(th, a);
     } else if (e->kind == WEMU_UM_DISPATCH_TGKILL) {
         ret = um_tgkill(th, a);
     } else if (e->kind == WEMU_UM_DISPATCH_KILL) {

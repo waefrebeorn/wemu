@@ -75,8 +75,11 @@ typedef enum {
     WEMU_UM_DISPATCH_EXECVE,     /* execve/execveat: bounded image replacement */
     WEMU_UM_DISPATCH_TGKILL,     /* tgkill: bounded cross-thread signal queued
                                   * to an admitted sibling's private slot */
-    WEMU_UM_DISPATCH_KILL        /* kill: bounded process-directed signal
+    WEMU_UM_DISPATCH_KILL,       /* kill: bounded process-directed signal
                                   * queued to the calling admitted thread */
+    WEMU_UM_DISPATCH_SIGALTSTACK /* sigaltstack: bounded per-thread alternate
+                                  * signal stack; SA_ONSTACK frames are placed
+                                  * on it with an exact SS_ONSTACK query */
 } WemuUmDispatch;
 
 /* Exact fail-closed reasons.  `refuses[code]` in WemuUmResult counts how many
@@ -157,7 +160,25 @@ typedef enum {
  * guest handler runs and the fault fails closed. */
 #define WEMU_UM_REFUSE_SIGFP             24u /* unsupported FP shape at signal
                                              * delivery (frame not populated) */
-#define WEMU_UM_N_REFUSE                 25u
+/* Bounded SA_ONSTACK / alternate signal stack.  sigaltstack is virtualized
+ * per thread: no host altstack is ever installed (that would move WEMU's own
+ * SIGSYS/SIGSEGV handlers onto the guest stack).  Each refusal is exact and
+ * returns a kernel-shaped errno without touching guest or host state. */
+#define WEMU_UM_REFUSE_SIGALTSTACK_DISABLED 25u /* path switched off: -ENOSYS */
+#define WEMU_UM_REFUSE_SIGALTSTACK_FLAGS 26u /* ss_flags outside {0,SS_DISABLE}:
+                                              * -EINVAL (SS_ONSTACK is a query
+                                              * result; SS_AUTODISARM is
+                                              * unmodeled) */
+#define WEMU_UM_REFUSE_SIGALTSTACK_SIZE  27u /* ss_size below MINSIGSTKSZ or
+                                              * above the bounded maximum:
+                                              * -ENOMEM */
+#define WEMU_UM_REFUSE_SIGALTSTACK_RANGE 28u /* ss_sp outside a guest-mapped
+                                              * range / wraps: -EFAULT */
+#define WEMU_UM_REFUSE_SIGALTSTACK_FRAME 29u /* SA_ONSTACK frame does not fit
+                                              * the registered altstack at
+                                              * delivery: fail closed, no
+                                              * guest handler runs */
+#define WEMU_UM_N_REFUSE                 30u
 
 typedef struct {
     uint32_t        nr;
@@ -228,6 +249,14 @@ typedef struct {
     uint32_t  fpstate_saved;
     uint32_t  fpstate_restored;
     uint32_t  fpstate_unsupported;
+    /* Bounded SA_ONSTACK evidence (appended last so existing offsets and the
+     * FP fields above are unchanged).  altstack_calls = sigaltstack syscalls
+     * served (set or query); onstack_deliveries = SA_SIGINFO/SIGSEGV frames
+     * actually placed on a guest altstack; onstack_denied = fail-closed
+     * altstack shapes that never ran a guest handler. */
+    uint32_t  altstack_calls;
+    uint32_t  onstack_deliveries;
+    uint32_t  onstack_denied;
 } WemuUmResult;
 
 /* Run one ELF to completion.  Both ET_EXEC (mapped at its link addresses)
@@ -432,6 +461,29 @@ int wemu_um_pidfd_signal_modeled(int sig);
  * -ENOSYS behaviour holds regardless of this switch.  Returns 0, or -1 for a
  * value other than 0/1. */
 int wemu_um_set_pidfd_authority_enabled(int enabled);
+
+/* ---- bounded SA_ONSTACK / alternate signal stack -------------------- */
+/* Pure shape predicate: a sigaltstack request whose ss_flags carry only the
+ * bounded bits (0 or SS_DISABLE==2) and whose ss_size is within the modeled
+ * [MINSIGSTKSZ, max] window is admitted for runtime pointer/bounds checking.
+ * SS_ONSTACK and SS_AUTODISARM are query results / unmodeled and fail closed.
+ * The gate audits this same rule off-line. */
+int wemu_um_sigaltstack_modeled(uint64_t ss_flags, uint64_t ss_size);
+
+/* Negative-control switch for sigaltstack virtualization.  ON (default): the
+ * syscall is served from per-thread VM state (no host altstack is installed).
+ * OFF: the OLD path, where sigaltstack is an unlisted syscall (-ENOSYS) with
+ * an exact WEMU_UM_REFUSE_SIGALTSTACK_DISABLED reason.  Returns 0, or -1 for a
+ * value other than 0/1. */
+int wemu_um_set_sigaltstack_enabled(int enabled);
+
+/* Negative-control switch for SA_ONSTACK frame placement.  ON (default): a
+ * modeled handler registered with SA_ONSTACK gets its frame on the thread's
+ * registered altstack, and sigaltstack queries inside it report SS_ONSTACK.
+ * OFF: the OLD path, where SA_ONSTACK is ignored and every handler frame is
+ * placed on the interrupted stack.  Returns 0, or -1 for a value other than
+ * 0/1. */
+int wemu_um_set_onstack_enabled(int enabled);
 
 /* ---- process-per-guest address-space isolation ----------------------- */
 /* Register a supervisor-owned MAP_SHARED region as the GUEST ARENA.  The
