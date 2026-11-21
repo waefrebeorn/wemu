@@ -31,8 +31,14 @@
  * thread slot; it queues ONE event in that thread's private slot (no host
  * signal is sent) and the target consumes it at its own next syscall
  * checkpoint, respecting that thread's disposition and mask.  Unmodeled
- * shapes fail closed with exact WEMU_UM_REFUSE_TGKILL_* reasons.  FP/XMM state
- * in the frame and truly asynchronous delivery remain unmodeled.
+ * shapes fail closed with exact WEMU_UM_REFUSE_TGKILL_* reasons.
+ * BOUNDED PROCESS-DIRECTED KILL: kill(guest tgid, modeled signal) is queued to
+ * the CALLING admitted thread's one pending slot (the bounded choice for a
+ * process-directed signal) and consumed at its next syscall checkpoint, with
+ * si_code=SI_USER.  Every other pid (including process-group forms) and signal
+ * fails closed with an exact WEMU_UM_REFUSE_KILL_* reason.  FP/XMM state in the
+ * frame, ALTERNATE stacks, nested delivery, timers and a multi-slot pending
+ * queue remain unmodeled.
  *
  * Bounded fork/clone: fork/vfork, clone and clone3 are dispatched in-process.
  * A fork-shaped request (CSIGNAL 0/SIGCHLD, optionally the two glibc TID
@@ -138,6 +144,8 @@
 #define UM_PIDFD_NONBLOCK            0x800u /* fcntl.h PIDFD_NONBLOCK (x86-64) */
 #define UM_SIGCONT                   18     /* x86-64 signal number (kernel) */
 #define WEMU_UM_SYS_TGKILL           234 /* bounded cross-thread signal target */
+#define WEMU_UM_SYS_KILL             62  /* bounded process-directed signal */
+#define UM_SI_USER                  0    /* linux/signal.h: SI_USER (kill) */
 #define UM_KCMP_FILE             0    /* linux/kcmp.h KCMP_FILE */
 #define UM_F_GETFD               1    /* fcntl(2) */
 #define UM_F_DUPFD_CLOEXEC       1030 /* fcntl.h (x86-64) */
@@ -198,6 +206,7 @@ static const WemuUmSyscallEntry um_table[] = {
     { WEMU_UM_SYS_RT_SIGRETURN,"rt_sigreturn",    WEMU_UM_DISPATCH_SIGRETURN },
     { VSL_SYS_RT_SIGPROCMASK,  "rt_sigprocmask",  WEMU_UM_DISPATCH_SIGPROCMASK },
     { WEMU_UM_SYS_TGKILL,      "tgkill",          WEMU_UM_DISPATCH_TGKILL },
+    { WEMU_UM_SYS_KILL,        "kill",            WEMU_UM_DISPATCH_KILL },
     { VSL_SYS_IOCTL,           "ioctl",           WEMU_UM_DISPATCH_HOST },
     { VSL_SYS_WRITEV,          "writev",          WEMU_UM_DISPATCH_HOST },
     { WEMU_UM_SYS_SENDFILE,    "sendfile",        WEMU_UM_DISPATCH_HOST },
@@ -456,6 +465,7 @@ static struct {
     int sigmask_virtual_enabled; /* guest masks stay in per-thread state */
     int thread_disp_enabled;     /* per-thread rt_sigaction disposition tables */
     int tgkill_enabled;          /* bounded cross-thread signal targeting */
+    int kill_enabled;            /* bounded process-directed kill targeting */
     int exact_refuse_enabled;    /* dedicated refuse codes instead of coarse */
     int fd_ofd_check_enabled;    /* bind admitted fds to their OFD (kcmp) */
     /* Negative-control knobs for the fd-identity differential gates.  Both
@@ -467,7 +477,7 @@ static struct {
 } g_cfg = { .enabled = 1, .pkey_mode = WEMU_UM_PKEY_AUTO,
             .thread_exec_enabled = 1, .clone3_thread_enabled = 1,
             .sigmask_virtual_enabled = 1, .thread_disp_enabled = 1,
-            .tgkill_enabled = 1,
+            .tgkill_enabled = 1, .kill_enabled = 1,
             .exact_refuse_enabled = 1, .fd_ofd_check_enabled = 1,
             .fd_kcmp_forced_off = 0, .fd_cloexec_refuse = 0,
             .pidfd_authority_enabled = 1 };
@@ -508,6 +518,8 @@ void wemu_um_reset_isolation(void) {
     g_cfg.clone3_thread_enabled = 1;
     g_cfg.sigmask_virtual_enabled = 1;
     g_cfg.thread_disp_enabled = 1;
+    g_cfg.tgkill_enabled = 1;
+    g_cfg.kill_enabled = 1;
     g_cfg.exact_refuse_enabled = 1;
     g_cfg.fd_ofd_check_enabled = 1;
     g_cfg.fd_kcmp_forced_off = 0;
@@ -550,6 +562,12 @@ int wemu_um_set_thread_disp_enabled(int enabled) {
 int wemu_um_set_tgkill_enabled(int enabled) {
     if (enabled != 0 && enabled != 1) return -1;
     g_cfg.tgkill_enabled = enabled;
+    return 0;
+}
+
+int wemu_um_set_kill_enabled(int enabled) {
+    if (enabled != 0 && enabled != 1) return -1;
+    g_cfg.kill_enabled = enabled;
     return 0;
 }
 
@@ -855,6 +873,8 @@ int wemu_um_set_pidfd_authority_enabled(int enabled) {
 /* tgkill may only carry a modeled signal.  tgid/tid admission is a runtime
  * check against the bounded thread slots, not a pure shape property. */
 int wemu_um_tgkill_modeled(int sig) { return um_sig_sync(sig); }
+
+int wemu_um_kill_modeled(int sig) { return um_sig_sync(sig); }
 
 /* Registered in the CALLING thread's disposition table (or the legacy shared
  * table on the negative-control path), never process-wide on the hardened
@@ -1861,7 +1881,8 @@ static int64_t um_sigprocmask_virtual(UmThread *th, const uint64_t a[6]) {
  * supplied (signo/code/errno plus si_addr for a fault, or si_pid/si_uid for
  * SI_TKILL); every other siginfo byte and all FP context are zero — XMM/x87
  * frame state is a documented remaining gap.  A byte-exact guest oracle can
- * read signo, code, errno, addr/pid/uid, the virtual signal mask and the saved
+ * read signo, code, errno, addr/pid/uid (SI_USER kill and SI_TKILL senders
+ * alike), the virtual signal mask and the saved
  * GPRs and get the same values on a real host and under WEMU.  Returns -1 (and
  * changes nothing) when the frame would not fit in guest-mapped memory. */
 static int um_deliver_frame(UmThread *th, greg_t *r, const UmSigEvent *ev) {
@@ -1894,7 +1915,10 @@ static int um_deliver_frame(UmThread *th, greg_t *r, const UmSigEvent *ev) {
         sifo.si_signo = ev->signo;
         sifo.si_errno = ev->err;
         sifo.si_code = ev->code;
-        if (ev->code == UM_SI_TKILL) {
+        /* Both SI_USER (kill) and SI_TKILL (tgkill) use the kernel's _kill
+         * siginfo layout: si_pid/si_uid name the sender.  CPU faults use
+         * si_addr instead. */
+        if (ev->code == UM_SI_TKILL || ev->code == UM_SI_USER) {
             sifo.si_pid = ev->pid;
             sifo.si_uid = ev->uid;
         } else {
@@ -2006,6 +2030,43 @@ static int64_t um_tgkill(UmThread *th, const uint64_t a[6]) {
     return 0;
 }
 
+/* Bounded process-directed kill(2).  Linux's kill(tgid, sig) may choose ANY
+ * eligible thread in the group; for a deterministic, byte-exact model we admit
+ * only the self-group form (pid == the guest's own tgid) and queue the event
+ * to the CALLING admitted thread's one pending slot.  PIDs <= 0 select a
+ * process group (or every process) and are unmodeled; positive pids other than
+ * our tgid name no guest thread.  No host signal is ever sent.  Unmodeled
+ * shapes fail closed with an exact reason and a kernel-shaped errno. */
+static int64_t um_kill(UmThread *th, const uint64_t a[6]) {
+    int64_t pid = (int64_t)a[0];
+    int signo = (int)a[1];   /* kill(pid, sig): RDI=pid, RSI=sig */
+    long self_tgid = um_raw0(39 /* SYS_getpid */);
+    if (pid != (int64_t)self_tgid) {
+        th->sig_denied++;
+        g_um.result->refuses[WEMU_UM_REFUSE_KILL_PID]++;
+        return pid <= 0 ? -EINVAL : -ESRCH;
+    }
+    if (!wemu_um_kill_modeled(signo)) {
+        th->sig_denied++;
+        g_um.result->refuses[WEMU_UM_REFUSE_KILL_SIG]++;
+        return -EINVAL;
+    }
+    if (__atomic_load_n(&th->pending, __ATOMIC_ACQUIRE)) {
+        th->sig_denied++;
+        g_um.result->refuses[WEMU_UM_REFUSE_KILL_BUSY]++;
+        return -EAGAIN;
+    }
+    th->pending_ev.signo = signo;
+    th->pending_ev.code = UM_SI_USER;
+    th->pending_ev.err = 0;
+    th->pending_ev.addr = 0;
+    th->pending_ev.pid = (int)(int32_t)self_tgid;
+    th->pending_ev.uid = (int)(int32_t)um_raw0(102 /* SYS_getuid */);
+    __atomic_store_n(&th->pending, 1, __ATOMIC_RELEASE);
+    g_um.result->kill_accepted++;
+    return 0;
+}
+
 static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
     (void)sig;
     ucontext_t *uc = (ucontext_t *)ucv;
@@ -2063,6 +2124,12 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
      * unlisted syscall again (the OLD behaviour, generic -ENOSYS). */
     if (nr == WEMU_UM_SYS_TGKILL && !g_cfg.tgkill_enabled) {
         um_refuse_fast(uc, th, r, nr, WEMU_UM_N_REFUSE, -ENOSYS);
+        return;
+    }
+    /* Bounded kill negative control: with the path disabled, kill is an
+     * unlisted syscall again (-ENOSYS), with an exact reason recorded. */
+    if (nr == WEMU_UM_SYS_KILL && !g_cfg.kill_enabled) {
+        um_refuse_fast(uc, th, r, nr, WEMU_UM_REFUSE_KILL_DISABLED, -ENOSYS);
         return;
     }
 
@@ -2288,6 +2355,8 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
         ret = um_sigaction(th, a);
     } else if (e->kind == WEMU_UM_DISPATCH_TGKILL) {
         ret = um_tgkill(th, a);
+    } else if (e->kind == WEMU_UM_DISPATCH_KILL) {
+        ret = um_kill(th, a);
     } else if (e->kind == WEMU_UM_DISPATCH_SIGPROCMASK) {
         /* A guest that masks SIGSYS would stop trapping its own syscalls;
          * SIGALRM is the run bound and SIGUSR2 the exec-quiesce handshake.

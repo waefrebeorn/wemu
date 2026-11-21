@@ -73,8 +73,10 @@ typedef enum {
                                   * when they touch WEMU's own signals */
     WEMU_UM_DISPATCH_BRK,        /* brk: bounded heap growth, range tracked */
     WEMU_UM_DISPATCH_EXECVE,     /* execve/execveat: bounded image replacement */
-    WEMU_UM_DISPATCH_TGKILL      /* tgkill: bounded cross-thread signal queued
+    WEMU_UM_DISPATCH_TGKILL,     /* tgkill: bounded cross-thread signal queued
                                   * to an admitted sibling's private slot */
+    WEMU_UM_DISPATCH_KILL        /* kill: bounded process-directed signal
+                                  * queued to the calling admitted thread */
 } WemuUmDispatch;
 
 /* Exact fail-closed reasons.  `refuses[code]` in WemuUmResult counts how many
@@ -139,7 +141,17 @@ typedef enum {
 #define WEMU_UM_REFUSE_TGKILL_SIG        18u /* signal outside the bounded set */
 #define WEMU_UM_REFUSE_TGKILL_BUSY       19u /* target already has a pending
                                              * signal (one bounded slot) */
-#define WEMU_UM_N_REFUSE                 20u
+/* Bounded process-directed kill: only kill(guest tgid, modeled signal) is
+ * queued, to the calling admitted thread's one pending slot.  Other pids
+ * (including every process-group form) and signals fail closed. */
+#define WEMU_UM_REFUSE_KILL_PID          20u /* pid is not the guest group's
+                                             * tgid: -ESRCH (positive unknown)
+                                             * or -EINVAL (<=0 / group form) */
+#define WEMU_UM_REFUSE_KILL_SIG          21u /* signal outside the bounded set */
+#define WEMU_UM_REFUSE_KILL_BUSY         22u /* caller's pending slot occupied */
+#define WEMU_UM_REFUSE_KILL_DISABLED     23u /* kill path switched off (OLD path
+                                             * negative control): -ENOSYS */
+#define WEMU_UM_N_REFUSE                 24u
 
 typedef struct {
     uint32_t        nr;
@@ -172,6 +184,8 @@ typedef struct {
     uint32_t  pidfd_getfd_ok;    /* successful bounded pidfd_getfd duplications */
     uint32_t  pidfd_signals;     /* bounded pidfd_send_signal deliveries */
     uint32_t  tgkill_accepted;   /* tgkill requests queued to an admitted target */
+    uint32_t  kill_accepted;     /* bounded process-directed kill requests
+                                    queued to the calling admitted thread */
     uint32_t  siginfo_deliveries;/* deliveries that populated an SA_SIGINFO
                                   * siginfo_t + ucontext frame (byte-exact
                                   * where the host's fields are deterministic) */
@@ -274,6 +288,17 @@ int wemu_um_sigaction_modeled(int sig, uint64_t sigsetsize);
  * the group's thread slots; an unmodeled signal fails closed with -EINVAL and
  * WEMU_UM_REFUSE_TGKILL_SIG. */
 int wemu_um_tgkill_modeled(int sig);
+
+/* Pure shape predicate for bounded process-directed kill: only a signal in
+ * the modeled synchronous set may be sent.  pid admission (must equal the
+ * guest thread group's tgid) and the one-slot budget are runtime checks. */
+int wemu_um_kill_modeled(int sig);
+
+/* Negative-control switch for bounded kill.  ON (default): kill is dispatched
+ * into the bounded pending-signal path.  OFF: the OLD path, where kill is an
+ * unlisted syscall (-ENOSYS), counted under WEMU_UM_REFUSE_KILL_DISABLED.
+ * Returns 0, or -1 for a value other than 0/1. */
+int wemu_um_set_kill_enabled(int enabled);
 
 /* Negative-control switch for bounded tgkill.  ON (default): tgkill is
  * dispatched into the bounded pending-signal path.  OFF: the OLD path, where

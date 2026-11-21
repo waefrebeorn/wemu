@@ -201,6 +201,35 @@ static const char WANT_TGA[] =
     "TGA-UC-RIP=1\n"
     "TGA-VALUE=305419896\n";
 
+/* Bounded process-directed kill: the self-group delivery is byte-exact vs the
+ * host (si_code=SI_USER, normalized sender pid/uid, pre-delivery mask, saved
+ * RIP).  The unknown-pid / bad-signal refusals are byte-exact kernel errnos;
+ * signal-0 checks are a documented bounded divergence (host accepts, WEMU
+ * refuses).  With the kill path disabled, the delivery mode loses its handler
+ * entirely — the negative control. */
+static const char WANT_KL[] =
+    "KL-SET-RC=0\n"
+    "KL-KILL-RC=0\n"
+    "KL-HANDLER\n"
+    "KL-SIGNO=8\n"
+    "KL-CODE=0\n"
+    "KL-ERRNO=0\n"
+    "KL-PID-EQ=1\n"
+    "KL-UID-EQ=1\n"
+    "KL-UC-MASK=0\n"
+    "KL-UC-RIP=1\n"
+    "KL-DONE\n";
+static const char WANT_KL_OLD[] =
+    "KL-SET-RC=0\n"
+    "KL-KILL-RC=-38\n"
+    "KL-DONE\n";
+static const char WANT_KLJ[] =
+    "KLJ-PID-RC=-3\n"
+    "KLJ-SIG-RC=-22\n";
+static const char WANT_KLW_WEMU[] =
+    "KLW-GROUP-RC=-22\n"
+    "KLW-SIG0-RC=-22\n";
+
 typedef struct { char b[WEMU_UM_OUT_MAX]; size_t n; } Cap;
 
 /* Independent oracle: the REAL host kernel runs the same fixture/argv. */
@@ -1016,6 +1045,100 @@ static void test_tgkill_fail_closed(void) {
            "queued, old path negative control\n");
 }
 
+/* ---- bounded process-directed kill + SA_SIGINFO differential -------- */
+static void test_kill_positive(void) {
+    Cap oracle;
+    int he = host_exec("l", &oracle);
+    if (he != 0) FAIL("host kill exit=%d want 0\n", he);
+    check_exact("host kill", oracle.b, oracle.n, WANT_KL, sizeof WANT_KL - 1);
+
+    WemuUmResult r;
+    int rc = wemu_exec("l", &r);
+    if (rc != WEMU_UM_OK || r.exit_code != 0)
+        FAIL("kill status=%s exit=%d out=[%s]\n",
+             wemu_um_status_name(rc), r.exit_code, r.out);
+    check_exact("wemu kill", r.out, r.out_len, oracle.b, oracle.n);
+    if (r.kill_accepted != 1 || r.signals_delivered != 1 ||
+        r.siginfo_deliveries != 1 || r.sig_disp_registrations != 1 ||
+        r.denied != 0)
+        FAIL("kill counts: acc=%u del=%u siginfo=%u reg=%u denied=%llu\n",
+             r.kill_accepted, r.signals_delivered, r.siginfo_deliveries,
+             r.sig_disp_registrations, (unsigned long long)r.denied);
+    for (unsigned i = 0; i < WEMU_UM_N_REFUSE; i++)
+        if (r.refuses[i]) FAIL("kill positive refuse[%u]=%u\n", i, r.refuses[i]);
+    printf("ok: BOUNDED KILL -> calling thread, SA_SIGINFO byte-exact vs host "
+           "(si_code=SI_USER, pid/uid sender, ucontext saved)\n");
+}
+
+static void test_kill_fail_closed(void) {
+    /* Pure predicate: only the four synchronous-fault signals are sendable. */
+    if (!wemu_um_kill_modeled(SIGSEGV) || !wemu_um_kill_modeled(SIGBUS) ||
+        !wemu_um_kill_modeled(SIGILL) || !wemu_um_kill_modeled(SIGFPE) ||
+        wemu_um_kill_modeled(SIGUSR1) || wemu_um_kill_modeled(0) ||
+        wemu_um_kill_modeled(-1))
+        FAIL("kill signal predicate edges\n");
+    if (wemu_um_set_kill_enabled(2) != -1 || wemu_um_set_kill_enabled(1) != 0)
+        FAIL("kill negative-control switch validation\n");
+
+    /* Unknown pid / bad signal: host and WEMU agree byte-for-byte. */
+    Cap oracle;
+    int he = host_exec("j", &oracle);
+    if (he != 0) FAIL("host kill-refuse exit=%d want 0\n", he);
+    check_exact("host kill-refuse", oracle.b, oracle.n, WANT_KLJ,
+                sizeof WANT_KLJ - 1);
+    WemuUmResult r;
+    int rc = wemu_exec("j", &r);
+    if (rc != WEMU_UM_OK || r.exit_code != 0)
+        FAIL("kill-refuse status=%s exit=%d out=[%s]\n",
+             wemu_um_status_name(rc), r.exit_code, r.out);
+    check_exact("wemu kill-refuse", r.out, r.out_len, oracle.b, oracle.n);
+    if (r.refuses[WEMU_UM_REFUSE_KILL_PID] != 1 ||
+        r.refuses[WEMU_UM_REFUSE_KILL_SIG] != 1 ||
+        r.kill_accepted != 0 || r.signals_delivered != 0)
+        FAIL("kill-refuse exact counts: pid=%u sig=%u acc=%u del=%u\n",
+             r.refuses[WEMU_UM_REFUSE_KILL_PID],
+             r.refuses[WEMU_UM_REFUSE_KILL_SIG],
+             r.kill_accepted, r.signals_delivered);
+
+    /* Signal-0 existence checks: the host proves they are real kernel forms
+     * (both return 0); WEMU refuses the process-group pid and the unmodeled
+     * signal with exact reasons. */
+    he = host_exec("w", &oracle);
+    if (he != 0 || oracle.n != sizeof "KLW-GROUP-RC=0\nKLW-SIG0-RC=0\n" - 1 ||
+        memcmp(oracle.b, "KLW-GROUP-RC=0\nKLW-SIG0-RC=0\n", oracle.n) != 0)
+        FAIL("host kill signal-0 oracle unexpected: [%s]\n", oracle.b);
+    rc = wemu_exec("w", &r);
+    if (rc != WEMU_UM_OK || r.exit_code != 0)
+        FAIL("kill-unmodeled status=%s out=[%s]\n",
+             wemu_um_status_name(rc), r.out);
+    check_exact("wemu kill-unmodeled", r.out, r.out_len, WANT_KLW_WEMU,
+                sizeof WANT_KLW_WEMU - 1);
+    if (r.refuses[WEMU_UM_REFUSE_KILL_PID] != 1 ||
+        r.refuses[WEMU_UM_REFUSE_KILL_SIG] != 1 || r.kill_accepted != 0)
+        FAIL("kill-unmodeled exact reasons missing\n");
+
+    /* NEGATIVE CONTROL: kill disabled -> -ENOSYS, no queue, no handler. */
+    if (wemu_um_set_kill_enabled(0) != 0) FAIL("disable kill\n");
+    WemuUmResult old;
+    rc = wemu_exec("l", &old);
+    (void)wemu_um_set_kill_enabled(1);       /* restore default */
+    if (rc != WEMU_UM_OK || old.exit_code != 0)
+        FAIL("old kill status=%s exit=%d\n", wemu_um_status_name(rc),
+             old.exit_code);
+    check_exact("wemu kill old", old.out, old.out_len, WANT_KL_OLD,
+                sizeof WANT_KL_OLD - 1);
+    if (old.kill_accepted != 0 || old.signals_delivered != 0 ||
+        old.refuses[WEMU_UM_REFUSE_KILL_DISABLED] != 1 || old.denied != 1)
+        FAIL("old kill denied=%llu disabled=%u acc=%u del=%u\n",
+             (unsigned long long)old.denied,
+             old.refuses[WEMU_UM_REFUSE_KILL_DISABLED],
+             old.kill_accepted, old.signals_delivered);
+    printf("        (host signal-0 returns 0; WEMU -EINVAL exact pid/sig; "
+           "old path -ENOSYS denied=1)\n");
+    printf("ok: FAIL-CLOSED kill — exact pid/signal refusals, no thread "
+           "queued, old path negative control\n");
+}
+
 static void test_sainfo_fault(void) {
     Cap oracle;
     int he = host_exec("a", &oracle);
@@ -1056,6 +1179,8 @@ int main(void) {
     test_tgkill_positive();
     test_tgkill_mask();
     test_tgkill_fail_closed();
+    test_kill_positive();
+    test_kill_fail_closed();
     test_sainfo_fault();
     printf("WEMU BOUNDED CLONE3-THREAD GATE PASS (host-byte-exact bounded "
            "thread + virtual per-thread masks + per-thread signal dispositions; "
@@ -1063,6 +1188,7 @@ int main(void) {
            "pidfd/tid/cgroup/fork fail closed; exact pidfd/clear-sighand/"
            "sigaction refusals; bounded clone3 fork byte-exact; bounded tgkill "
            "to an admitted sibling + SA_SIGINFO siginfo/ucontext byte-exact; "
-           "old paths refuse)\n");
+           "bounded process-directed kill (SI_USER) byte-exact with exact "
+           "fail-closed pid/signal edges; old paths refuse)\n");
     return 0;
 }

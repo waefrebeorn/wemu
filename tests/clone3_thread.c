@@ -42,6 +42,7 @@
 #define SYS_mprotect_       10
 #define SYS_getuid_         102
 #define SYS_tgkill_         234
+#define SYS_kill_           62
 #define SYS_pidfd_send_signal_ 424
 #define SYS_pidfd_open_     434
 #define SYS_pidfd_getfd_    438
@@ -652,6 +653,60 @@ static int run_tgkill_unmodeled(void) {
     return 0;
 }
 
+/* ---- bounded process-directed kill + SA_SIGINFO delivery -------------
+ * Mode "l": the root registers an SA_SIGINFO SIGFPE handler, BLOCKS SIGFPE,
+ * sends kill(getpid(), SIGFPE) to itself and prints the syscall result, then
+ * unblocks and reaches a syscall checkpoint.  The host delivers on unblock;
+ * WEMU queues the bounded event to the calling thread and delivers it at its
+ * next checkpoint.  Both print the same deterministic siginfo/ucontext fields
+ * (si_code=SI_USER=0, distinct from SI_TKILL=-6), by a byte-exact oracle.
+ * Mode "j": fail-closed shapes where host and WEMU agree (-ESRCH unknown pid,
+ * -EINVAL negative signal).
+ * Mode "w": two signal-0 existence checks the host accepts and WEMU refuses
+ * (process-group pid form, unmodeled signal) — a documented divergence. */
+static volatile int kl_done;
+
+static void kl_handler(int s, siginfo_t *si, void *u) {
+    (void)s;
+    emit("KL-HANDLER\n", sizeof "KL-HANDLER\n" - 1);
+    emit_tg_fields("KL-", si, u);
+    __atomic_store_n(&kl_done, 1, __ATOMIC_RELEASE);
+    /* Normal return through SA_RESTORER -> rt_sigreturn: WEMU restores the
+     * saved GPRs and resumes after the checkpoint syscall. */
+}
+
+static int run_kill(void) {
+    long me = rsys(SYS_getpid_, 0, 0, 0, 0, 0, 0);
+    uint64_t blk = 1ull << (SIGFPE_ - 1);
+    __atomic_store_n(&kl_done, 0, __ATOMIC_RELAXED);
+    emit_num("KL-SET-RC=",
+             set_siginfo_handler(SIGFPE_, (uint64_t)(uintptr_t)&kl_handler));
+    (void)rsys(SYS_rt_sigprocmask_, SIG_BLOCK_, (long)&blk, 0, 8, 0, 0);
+    long rc = rsys(SYS_kill_, (int)me, SIGFPE_, 0, 0, 0, 0);
+    emit_num("KL-KILL-RC=", rc);
+    (void)rsys(SYS_rt_sigprocmask_, SIG_UNBLOCK_, (long)&blk, 0, 8, 0, 0);
+    /* Bounded wait: with the kill path disabled (negative control) no handler
+     * ever runs, so this must not spin into WEMU's syscall budget. */
+    for (int i = 0; i < 64 && !__atomic_load_n(&kl_done, __ATOMIC_ACQUIRE); i++)
+        (void)rsys(SYS_sched_yield_, 0, 0, 0, 0, 0, 0);
+    emit("KL-DONE\n", sizeof "KL-DONE\n" - 1);
+    return 0;
+}
+
+static int run_kill_refuse(void) {
+    long me = rsys(SYS_getpid_, 0, 0, 0, 0, 0, 0);
+    emit_num("KLJ-PID-RC=", rsys(SYS_kill_, (int)(me + 12345), SIGFPE_, 0, 0, 0, 0));
+    emit_num("KLJ-SIG-RC=", rsys(SYS_kill_, (int)me, -1, 0, 0, 0, 0));
+    return 0;
+}
+
+static int run_kill_unmodeled(void) {
+    long me = rsys(SYS_getpid_, 0, 0, 0, 0, 0, 0);
+    emit_num("KLW-GROUP-RC=", rsys(SYS_kill_, 0, 0, 0, 0, 0, 0));
+    emit_num("KLW-SIG0-RC=", rsys(SYS_kill_, (int)me, 0, 0, 0, 0, 0));
+    return 0;
+}
+
 static void tga_handler(int s, siginfo_t *si, void *u) {
     (void)s;
     ucontext_t *uc = (ucontext_t *)u;
@@ -694,6 +749,9 @@ int main(int argc, char **argv) {
     else if (mode == 'm') rc = run_tgkill(1);
     else if (mode == 'k') rc = run_tgkill_refuse();
     else if (mode == 'u') rc = run_tgkill_unmodeled();
+    else if (mode == 'l') rc = run_kill();
+    else if (mode == 'j') rc = run_kill_refuse();
+    else if (mode == 'w') rc = run_kill_unmodeled();
     else if (mode == 'a') rc = run_sainfo_fault();
     else                  rc = run_ok();
     (void)rsys(SYS_exit_group_, rc, 0, 0, 0, 0, 0);

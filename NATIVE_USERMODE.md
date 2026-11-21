@@ -64,7 +64,8 @@ untrusted-guest sandbox. Nothing here is enabled implicitly by `wemu_cpu_run`.
    re-executes a fixed fault). For an `SA_SIGINFO` handler the frame also
    carries a synthetic `siginfo_t` (RSI) and `ucontext_t` (RDX) with the
    deterministic kernel fields: `si_signo`, `si_code` (`SEGV_*` for a fault,
-   `SI_TKILL` for a cross-thread signal), `si_errno`, `si_addr` or
+   `SI_TKILL` for a cross-thread signal, `SI_USER` for a process-directed
+   kill), `si_errno`, `si_addr` or
    `si_pid`/`si_uid`, the pre-delivery virtual mask and the saved GPRs. The
    frame is placed ABOVE the handler's entry RSP so the handler's own pushes
    cannot overwrite it; FP/XMM state is still zero (documented gap below).
@@ -75,6 +76,13 @@ untrusted-guest sandbox. Nothing here is enabled implicitly by `wemu_cpu_run`.
    checkpoint, using the target's own disposition table, virtual mask and
    register set. A blocked signal stays queued until unblocked. One bound
    per target; a second request while pending is refused with `-EAGAIN`.
+   A bounded process-directed `kill(pid, sig)` is admitted only when `pid`
+   equals the guest group's own tgid: it queues one `SI_USER` event to the
+   CALLING admitted thread's pending slot (the deterministic choice for a
+   process-directed signal), consumed at that thread's next syscall
+   checkpoint with that thread's disposition and virtual mask. Process-group
+   forms (`pid <= 0`) and foreign positive pids fail closed (`-EINVAL` /
+   `-ESRCH`) with exact `WEMU_UM_REFUSE_KILL_*` reasons; no host signal is sent.
    `wemu_usermode.c` is compiled without `-fstack-protector`: its handlers run
    on the guest stack with a guest-set `%fs`, so a TLS stack canary there is
    not the host's.
@@ -113,7 +121,10 @@ untrusted-guest sandbox. Nothing here is enabled implicitly by `wemu_cpu_run`.
   tgid (`-ESRCH`, or `-EINVAL` for a non-positive one), a tid that is not an
   admitted modeled thread (`-ESRCH`), an unmodeled signal (`-EINVAL`) and a
   target with a pending signal (`-EAGAIN`), each with its own exact
-  `WEMU_UM_REFUSE_TGKILL_*` code. No host signal or handler is installed.
+  `WEMU_UM_REFUSE_TGKILL_*` code. `kill` likewise refuses a foreign/process-
+  group pid (`-ESRCH` / `-EINVAL`), an unmodeled signal (`-EINVAL`) and a busy
+  caller (`-EAGAIN`) with exact `WEMU_UM_REFUSE_KILL_*` codes. No host signal
+  or handler is installed.
   A fault with no handler, outside the guest image, while already in a handler,
   or after 16 deliveries is not delivered — the run unwinds with
   `WEMU_UM_ERR_FAULT`. Every refusal increments `signals_denied`.
@@ -250,8 +261,9 @@ table entry against the kernel's `asm/unistd_64.h`.
   `CLONE_PIDFD`, thread priorities/sched attributes and `CLONE_CLEAR_SIGHAND`
   remain unmodelled and fail closed. Per-thread virtual signal masks and
   per-thread signal dispositions ARE modelled (inherited by copy at clone);
-  bounded `tgkill` to an admitted sibling IS modelled (see below), with
-  per-thread masks/dispositions respected. A bounded pidfd authority IS
+  bounded `tgkill` to an admitted sibling and bounded process-directed `kill`
+  to the calling thread ARE modelled (see below), with per-thread masks/
+  dispositions respected. A bounded pidfd authority IS
   modelled (see below). `WEMU_UM_MAX_THREADS - 1` host threads per run is a
   hard ceiling; exhaustion returns `-EAGAIN`.
 - **Bounded pidfd authority.** `pidfd_open(tid, 0)` is admitted ONLY for a TID
