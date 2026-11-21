@@ -36,9 +36,13 @@
  * the CALLING admitted thread's one pending slot (the bounded choice for a
  * process-directed signal) and consumed at its next syscall checkpoint, with
  * si_code=SI_USER.  Every other pid (including process-group forms) and signal
- * fails closed with an exact WEMU_UM_REFUSE_KILL_* reason.  FP/XMM state in the
- * frame, ALTERNATE stacks, nested delivery, timers and a multi-slot pending
- * queue remain unmodeled.
+ * fails closed with an exact WEMU_UM_REFUSE_KILL_* reason.  FP/XMM/x87 state
+ * in a delivered signal frame is preserved byte-exact from the kernel
+ * ucontext (bounded FXSAVE/XSAVE blob in supervisor memory) and the x87/XMM
+ * FXSAVE area in the synthetic ucontext; rt_sigreturn restores the whole
+ * bounded blob, overlaying handler edits to the FXSAVE area.  Unsupported FP
+ * shapes fail closed before any handler runs.  ALTERNATE stacks, nested
+ * delivery, timers and a multi-slot pending queue remain unmodeled.
  *
  * Bounded fork/clone: fork/vfork, clone and clone3 are dispatched in-process.
  * A fork-shaped request (CSIGNAL 0/SIGCHLD, optionally the two glibc TID
@@ -294,6 +298,35 @@ enum { UM_WHY_EXIT = 1, UM_WHY_FAULT, UM_WHY_BUDGET, UM_WHY_ALARM, UM_WHY_BADPTR
 #define UM_NGREG \
     (sizeof(((ucontext_t *)0)->uc_mcontext.gregs) / sizeof(greg_t))
 
+/* x86-64 kernel FP state in a signal ucontext.  `fpregs` points at the
+ * kernel-saved FXSAVE area: 512 legacy bytes hold cwd/swd/ftw/mxcsr, the
+ * eight x87 ST registers and all sixteen XMM registers.  When XSAVE is
+ * enabled the kernel writes FP_XSTATE_MAGIC1 at byte 464 and the total
+ * saved byte count (xstate_size) at byte 480; the XSAVE blob follows the
+ * legacy area.  Preserve the WHOLE kernel blob byte-exact so rt_sigreturn
+ * restores XMM/x87 (and any extended state the guest looked at) exactly as
+ * a real host would. */
+#define UM_FP_LEGACY_BYTES 512u
+#define UM_FP_MAGIC_OFF    464u
+#define UM_FP_XSIZE_OFF    480u
+#define UM_FP_MAGIC1       0x46505853u   /* FP_XSTATE_MAGIC1 */
+#define UM_FPSTATE_MAX     8192u         /* bounded host xsave area */
+
+/* Kernel-saved FP byte count, or 0 for an unsupported shape.  A missing
+ * XSAVE header means a legacy-only 512-byte frame (still fully preservable);
+ * a present header must advertise a size in [512, UM_FPSTATE_MAX]. */
+static size_t um_fpstate_len(fpregset_t fp) {
+    if (!fp) return 0;
+    const uint8_t *p = (const uint8_t *)fp;
+    uint32_t magic;
+    memcpy(&magic, p + UM_FP_MAGIC_OFF, sizeof magic);
+    if (magic != UM_FP_MAGIC1) return magic ? 0u : UM_FP_LEGACY_BYTES;
+    uint32_t xsize;
+    memcpy(&xsize, p + UM_FP_XSIZE_OFF, sizeof xsize);
+    if (xsize < UM_FP_LEGACY_BYTES || xsize > UM_FPSTATE_MAX) return 0;
+    return (size_t)xsize;
+}
+
 /* x86-64 clone flags (linux/sched.h) used by the shared-VM thread model. */
 #define UM_CLONE_VM           0x00000100ull
 #define UM_CLONE_FS           0x00000200ull
@@ -351,6 +384,14 @@ typedef struct {
     volatile int in_handler;         /* one live guest-signal delivery/thread */
     int saved_valid;
     greg_t saved_gregs[UM_NGREG];
+    /* FP/XMM/x87 state saved at delivery from the kernel ucontext and put
+     * back by rt_sigreturn.  `saved_fp` is a verbatim copy of the kernel's
+     * FXSAVE/XSAVE blob (bounded by UM_FPSTATE_MAX); `saved_uc_at` is the
+     * guest address of the synthetic ucontext we built so sigreturn can
+     * honor handler edits to uc_mcontext.fpregs. */
+    uint8_t  saved_fp[UM_FPSTATE_MAX];
+    size_t   saved_fp_len;
+    uintptr_t saved_uc_at;
     volatile uint32_t sig_deliveries;
     volatile uint32_t sig_denied;
     uint64_t clone_flags;            /* raw flags used to create this thread */
@@ -466,6 +507,8 @@ static struct {
     int thread_disp_enabled;     /* per-thread rt_sigaction disposition tables */
     int tgkill_enabled;          /* bounded cross-thread signal targeting */
     int kill_enabled;            /* bounded process-directed kill targeting */
+    int fp_signal_enabled;       /* FP/XMM/x87 byte-exact signal frames (OLD path off) */
+    int fp_force_unsupported;    /* test-only: force the fail-closed FP path */
     int exact_refuse_enabled;    /* dedicated refuse codes instead of coarse */
     int fd_ofd_check_enabled;    /* bind admitted fds to their OFD (kcmp) */
     /* Negative-control knobs for the fd-identity differential gates.  Both
@@ -478,6 +521,7 @@ static struct {
             .thread_exec_enabled = 1, .clone3_thread_enabled = 1,
             .sigmask_virtual_enabled = 1, .thread_disp_enabled = 1,
             .tgkill_enabled = 1, .kill_enabled = 1,
+            .fp_signal_enabled = 1, .fp_force_unsupported = 0,
             .exact_refuse_enabled = 1, .fd_ofd_check_enabled = 1,
             .fd_kcmp_forced_off = 0, .fd_cloexec_refuse = 0,
             .pidfd_authority_enabled = 1 };
@@ -520,6 +564,8 @@ void wemu_um_reset_isolation(void) {
     g_cfg.thread_disp_enabled = 1;
     g_cfg.tgkill_enabled = 1;
     g_cfg.kill_enabled = 1;
+    g_cfg.fp_signal_enabled = 1;
+    g_cfg.fp_force_unsupported = 0;
     g_cfg.exact_refuse_enabled = 1;
     g_cfg.fd_ofd_check_enabled = 1;
     g_cfg.fd_kcmp_forced_off = 0;
@@ -568,6 +614,18 @@ int wemu_um_set_tgkill_enabled(int enabled) {
 int wemu_um_set_kill_enabled(int enabled) {
     if (enabled != 0 && enabled != 1) return -1;
     g_cfg.kill_enabled = enabled;
+    return 0;
+}
+
+int wemu_um_set_fp_signal_enabled(int enabled) {
+    if (enabled != 0 && enabled != 1) return -1;
+    g_cfg.fp_signal_enabled = enabled;
+    return 0;
+}
+
+int wemu_um_set_fp_signal_force_unsupported(int enabled) {
+    if (enabled != 0 && enabled != 1) return -1;
+    g_cfg.fp_force_unsupported = enabled;
     return 0;
 }
 
@@ -1396,19 +1454,46 @@ static int64_t um_sigaction(UmThread *th, const uint64_t a[6]) {
     return 0;
 }
 
-/* Guest rt_sigreturn: put the fault-time registers back.  The ucontext we
- * are returning from is the SIGSYS one raised by this very syscall, so the
- * kernel resumes at the restored RIP (the faulting instruction) on sigreturn. */
-static void um_sigreturn(UmThread *th, greg_t *r) {
+/* Guest rt_sigreturn: put the fault-time registers AND FP state back.  The
+ * ucontext we are returning from is the SIGSYS one raised by this very
+ * syscall, so the kernel resumes at the restored RIP with the restored FP
+ * state.  The guest handler saw a synthetic ucontext at `saved_uc_at` whose
+ * __fpregs_mem holds the XMM/x87 FXSAVE state; honour edits the handler made
+ * there exactly as a real kernel's rt_sigreturn would, overlay them on the
+ * verbatim kernel blob we saved at delivery, and write the whole bounded blob
+ * back.  A bad destination fails closed: no partial FP write. */
+static void um_sigreturn(UmThread *th, ucontext_t *uc) {
+    greg_t *r = uc->uc_mcontext.gregs;
     if (!th->in_handler || !th->saved_valid) {
         th->sig_denied++;
         r[REG_RAX] = (greg_t)-EINVAL;
         um_skip_syscall(r);
         return;
     }
+    if (th->saved_fp_len) {
+        fpregset_t dst = uc->uc_mcontext.fpregs;
+        size_t n = th->saved_fp_len;
+        if (dst && um_fpstate_len(dst) == n) {
+            /* `saved_fp` is consumed by this sigreturn, so overlay in place
+             * instead of using an 8 KiB stack buffer in the signal handler. */
+            uint8_t *blob = th->saved_fp;
+            uintptr_t uc_at = (uintptr_t)th->saved_uc_at;
+            size_t legacy = sizeof(((ucontext_t *)0)->__fpregs_mem);
+            if (uc_at && um_ptr_ok((uint64_t)uc_at, sizeof(ucontext_t)) &&
+                legacy <= n)
+                memcpy(blob, (const void *)(uc_at +
+                       offsetof(ucontext_t, __fpregs_mem)), legacy);
+            memcpy((void *)dst, blob, n);
+            g_um.result->fpstate_restored++;
+        } else {
+            g_um.result->fpstate_unsupported++;
+        }
+    }
     memcpy(r, th->saved_gregs, sizeof th->saved_gregs);
     th->saved_valid = 0;
     th->in_handler = 0;
+    th->saved_fp_len = 0;
+    th->saved_uc_at = 0;
     /* Deliberately no um_skip_syscall: RIP is now the faulting instruction. */
 }
 
@@ -1879,21 +1964,45 @@ static int64_t um_sigprocmask_virtual(UmThread *th, const uint64_t a[6]) {
 
 /* Build the guest signal frame.  Only the deterministic siginfo fields are
  * supplied (signo/code/errno plus si_addr for a fault, or si_pid/si_uid for
- * SI_TKILL); every other siginfo byte and all FP context are zero — XMM/x87
- * frame state is a documented remaining gap.  A byte-exact guest oracle can
- * read signo, code, errno, addr/pid/uid (SI_USER kill and SI_TKILL senders
- * alike), the virtual signal mask and the saved
- * GPRs and get the same values on a real host and under WEMU.  Returns -1 (and
- * changes nothing) when the frame would not fit in guest-mapped memory. */
-static int um_deliver_frame(UmThread *th, greg_t *r, const UmSigEvent *ev) {
+ * SI_TKILL); the XMM/x87 FXSAVE area is a byte-exact copy of the kernel's
+ * saved state in the synthetic ucontext's __fpregs_mem, and the whole bounded
+ * kernel blob is held in supervisor memory for rt_sigreturn.  A byte-exact
+ * guest oracle can read signo, code, errno, addr/pid/uid (SI_USER kill and
+ * SI_TKILL senders alike), the virtual signal mask, the saved GPRs and the
+ * saved XMM/x87 registers and get the same values on a real host and under
+ * WEMU.  An unsupported FP shape fails closed (no handler runs,
+ * WEMU_UM_REFUSE_SIGFP); so does a frame that would not fit in guest-mapped
+ * memory. */
+static int um_deliver_frame(UmThread *th, ucontext_t *uc, greg_t *r,
+                            const UmSigEvent *ev) {
     UmSigDisp *d = um_disp(th);
     int signo = ev->signo;
     int sainfo = (d->flags[signo] & UM_SA_SIGINFO) != 0;
 
-    /* Linux places the frame ABOVE the handler's entry RSP: [RSP] is the
-     * restorer, and siginfo/ucontext live at higher addresses.  The handler's
-     * own pushes then grow downward into free stack and never overwrite the
-     * frame.  entry%16==8, matching a normal call's callee-entry alignment. */
+    /* The kernel-saved FP blob is the byte-exact state the interrupted guest
+     * was running with.  Hold the whole bounded blob in per-thread supervisor
+     * memory for rt_sigreturn and put its FXSAVE area in the synthetic frame,
+     * so a real host and WEMU hand the handler identical XMM/x87 values. */
+    size_t fp_len = 0;
+    if (g_cfg.fp_signal_enabled) {
+        fp_len = g_cfg.fp_force_unsupported
+               ? 0u : um_fpstate_len(uc->uc_mcontext.fpregs);
+        if (!fp_len) {
+            th->sig_denied++;
+            g_um.result->fpstate_unsupported++;
+            if (g_cfg.exact_refuse_enabled)
+                g_um.result->refuses[WEMU_UM_REFUSE_SIGFP]++;
+            return -1;                       /* fail closed: no handler runs */
+        }
+    }
+
+    /* Keep the kernel-proven frame placement: [RSP] is the restorer, and
+     * siginfo/ucontext live at higher addresses; the handler's own pushes grow
+     * downward into free stack and never overwrite the frame.  entry%16==8,
+     * matching a normal call's callee-entry alignment.  XMM/x87 state lives
+     * INSIDE the synthetic ucontext's __fpregs_mem (the kernel's own FXSAVE
+     * slot), so no extra stack region is consumed and the kernel's gregs are
+     * never disturbed. */
     uintptr_t old = (uintptr_t)r[REG_RSP];
     uintptr_t uc_at = (old - sizeof(ucontext_t) - 16u) & ~(uintptr_t)15u;
     uintptr_t si_at = (uc_at - sizeof(siginfo_t)) & ~(uintptr_t)15u;
@@ -1908,6 +2017,14 @@ static int um_deliver_frame(UmThread *th, greg_t *r, const UmSigEvent *ev) {
     th->saved_valid = 1;
     th->in_handler = 1;
     th->sig_deliveries++;
+    th->saved_uc_at = uc_at;
+    if (fp_len) {
+        memcpy(th->saved_fp, uc->uc_mcontext.fpregs, fp_len);
+        th->saved_fp_len = fp_len;
+        g_um.result->fpstate_saved++;
+    } else {
+        th->saved_fp_len = 0;                /* OLD path (negative control) */
+    }
 
     if (sainfo) {
         siginfo_t sifo;
@@ -1928,6 +2045,15 @@ static int um_deliver_frame(UmThread *th, greg_t *r, const UmSigEvent *ev) {
         memset(&uctx, 0, sizeof uctx);
         memcpy(uctx.uc_mcontext.gregs, th->saved_gregs,
                sizeof uctx.uc_mcontext.gregs);
+        if (fp_len) {
+            /* Byte-exact XMM/x87 FXSAVE state in the ucontext's own FP slot;
+             * the handler sees the same values a real kernel hands it. */
+            size_t n = fp_len < sizeof uctx.__fpregs_mem
+                     ? fp_len : sizeof uctx.__fpregs_mem;
+            memcpy(&uctx.__fpregs_mem, uc->uc_mcontext.fpregs, n);
+            uctx.uc_mcontext.fpregs = (fpregset_t)(uintptr_t)
+                (uc_at + offsetof(ucontext_t, __fpregs_mem));
+        }
         /* The kernel saves the mask that was in force BEFORE delivery into
          * uc_sigmask (it applies the handler's mask afterwards), so expose
          * the target's current virtual mask unchanged — byte-exact vs host. */
@@ -1955,7 +2081,7 @@ static int um_deliver_frame(UmThread *th, greg_t *r, const UmSigEvent *ev) {
  * checkpoint.  Mask, disposition, nesting and budget are the TARGET's own
  * state: a blocked signal stays queued (one bounded slot) until it is
  * unblocked; no handler, nesting or budget exhaustion fails closed. */
-static void um_check_pending(UmThread *th, greg_t *r) {
+static void um_check_pending(UmThread *th, ucontext_t *uc, greg_t *r) {
     if (!__atomic_load_n(&th->pending, __ATOMIC_ACQUIRE)) return;
     UmSigEvent ev;
     memcpy(&ev, &th->pending_ev, sizeof ev);
@@ -1972,7 +2098,7 @@ static void um_check_pending(UmThread *th, greg_t *r) {
         th->sig_denied++;
         return;
     }
-    if (um_deliver_frame(th, r, &ev) != 0) th->sig_denied++;
+    if (um_deliver_frame(th, uc, r, &ev) != 0) th->sig_denied++;
 }
 
 /* Bounded tgkill: the tgid must be the guest thread group's (a raw getpid in
@@ -2208,7 +2334,7 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
         return;
     }
     if (e->kind == WEMU_UM_DISPATCH_SIGRETURN) {
-        um_sigreturn(th, r);                  /* resumes at the saved fault RIP */
+        um_sigreturn(th, uc);                 /* resumes at the saved fault RIP */
         um_unlock();
         return;
     }
@@ -2453,7 +2579,7 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
         /* Cross-thread delivery happens at the TARGET's own next checkpoint,
          * after its syscall has completed: sigreturn resumes after that
          * syscall with its return value intact. */
-        um_check_pending(th, r);
+        um_check_pending(th, uc, r);
     }
     um_unlock();
 }
@@ -2497,7 +2623,7 @@ static void um_fault(int sig, siginfo_t *si, void *ucv) {
     ev.addr = si ? (uint64_t)(uintptr_t)si->si_addr : 0;
     ev.pid = 0;
     ev.uid = 0;
-    if (um_deliver_frame(th, r, &ev) != 0) {
+    if (um_deliver_frame(th, uc, r, &ev) != 0) {
         th->sig_denied++;
         um_abort_to_finish(uc, th, UM_WHY_FAULT);
     }

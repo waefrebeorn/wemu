@@ -201,6 +201,36 @@ static const char WANT_TGA[] =
     "TGA-UC-RIP=1\n"
     "TGA-VALUE=305419896\n";
 
+/* Bounded FP/XMM/x87 preservation in a delivered signal frame.  Every line
+ * is deterministic on a real host: the FXSAVE/XSAVE blob the kernel hands an
+ * SA_SIGINFO handler (cwd/mxcsr, XMM0-3, x87 ST0) and the state rt_sigreturn
+ * puts back after the handler edits the frame and clobbers live registers. */
+static const char WANT_FP[] =
+    "F-SET-RC=0\n"
+    "F-HANDLER\n"
+    "F-UC-FPREGS=1\n"
+    "F-UC-CWD=895\n"
+    "F-UC-MXCSR=8064\n"
+    "F-UC-X0-LO=16909060\n"
+    "F-UC-X0-HI=219025168\n"
+    "F-UC-X1-LO=286397204\n"
+    "F-UC-X1-HI=488513312\n"
+    "F-UC-X2-LO=555885348\n"
+    "F-UC-X2-HI=758001456\n"
+    "F-UC-X3-LO=825373492\n"
+    "F-UC-X3-HI=1027489600\n"
+    "F-UC-ST0-EXP=16383\n"
+    "F-UC-ST0-HI=32768\n"
+    "F-BACK-X0-LO=12648430\n"
+    "F-BACK-X0-HI=219025168\n"
+    "F-BACK-X1-LO=286397204\n"
+    "F-BACK-X2-LO=555885348\n"
+    "F-BACK-X3-LO=825373492\n"
+    "F-BACK-ST0-EXP=16383\n"
+    "F-BACK-ST0-HI=32768\n"
+    "F-VALUE=1592654542\n"
+    "F-DONE\n";
+
 /* Bounded process-directed kill: the self-group delivery is byte-exact vs the
  * host (si_code=SI_USER, normalized sender pid/uid, pre-delivery mask, saved
  * RIP).  The unknown-pid / bad-signal refusals are byte-exact kernel errnos;
@@ -1161,6 +1191,79 @@ static void test_sainfo_fault(void) {
            "byte-exact vs host, sigreturn re-executes the store\n");
 }
 
+/* FP/XMM/x87 state in a delivered signal frame: byte-exact vs the real host
+ * for both the handler's view of uc_mcontext.fpregs and what rt_sigreturn
+ * restores.  A negative control switches preservation off and checks that the
+ * guest-visible FP state diverges while the run still completes. */
+static void test_fp_signal_frame(void) {
+    Cap oracle;
+    int he = host_exec("F", &oracle);
+    if (he != 0) FAIL("host fp-signal exit=%d want 0\n", he);
+    check_exact("host fp-signal", oracle.b, oracle.n, WANT_FP,
+                sizeof WANT_FP - 1);
+
+    WemuUmResult r;
+    int rc = wemu_exec("F", &r);
+    if (rc != WEMU_UM_OK || r.exit_code != 0)
+        FAIL("fp-signal status=%s exit=%d out=[%s]\n",
+             wemu_um_status_name(rc), r.exit_code, r.out);
+    check_exact("wemu fp-signal", r.out, r.out_len, oracle.b, oracle.n);
+    if (r.signals_delivered != 1 || r.siginfo_deliveries != 1 ||
+        r.sig_disp_registrations != 1 || r.denied != 0 ||
+        r.fpstate_saved != 1 || r.fpstate_restored != 1 ||
+        r.fpstate_unsupported != 0 || r.refuses[WEMU_UM_REFUSE_SIGFP] != 0)
+        FAIL("fp-signal counts: del=%u siginfo=%u saved=%u restored=%u "
+             "unsupported=%u sigfp-refuse=%u denied=%llu\n",
+             r.signals_delivered, r.siginfo_deliveries, r.fpstate_saved,
+             r.fpstate_restored, r.fpstate_unsupported,
+             r.refuses[WEMU_UM_REFUSE_SIGFP], (unsigned long long)r.denied);
+
+    /* Negative control: the OLD path left FP state out of the frame and
+     * rt_sigreturn restored GPRs only.  The handler sees a NULL fpregs, its
+     * live x87/xmm clobbers are NOT undone, and no FP counter moves. */
+    if (wemu_um_set_fp_signal_enabled(0) != 0)
+        FAIL("fp_signal negative-control switch failed\n");
+    WemuUmResult old;
+    int orc = wemu_exec("F", &old);
+    wemu_um_set_fp_signal_enabled(1);        /* restore default */
+    if (orc != WEMU_UM_OK || old.exit_code != 0)
+        FAIL("fp-signal OLD path status=%s exit=%d out=[%s]\n",
+             wemu_um_status_name(orc), old.exit_code, old.out);
+    if (!strstr(old.out, "F-UC-FPREGS=0\n") ||
+        strstr(old.out, "F-UC-X0-LO=16909060\n") ||
+        !strstr(old.out, "F-BACK-X1-LO=0\n") ||
+        !strstr(old.out, "F-BACK-ST0-EXP=0\n") ||
+        old.fpstate_saved != 0 || old.fpstate_restored != 0)
+        FAIL("fp-signal negative control did not reproduce the OLD zero-FP "
+             "path: out=[%s] saved=%u restored=%u\n",
+             old.out, old.fpstate_saved, old.fpstate_restored);
+    if (old.out_len == oracle.n && memcmp(old.out, oracle.b, oracle.n) == 0)
+        FAIL("fp-signal negative control is byte-identical to the oracle: "
+             "the FP feature did no work\n");
+
+    /* Fail-closed control: an unsupported FP shape must refuse delivery with
+     * the exact WEMU_UM_REFUSE_SIGFP reason and never run a guest handler. */
+    if (wemu_um_set_fp_signal_force_unsupported(1) != 0)
+        FAIL("fp fail-closed control switch failed\n");
+    WemuUmResult fc;
+    int fcrc = wemu_exec("F", &fc);
+    wemu_um_set_fp_signal_force_unsupported(0);
+    if (fcrc != WEMU_UM_ERR_FAULT || fc.signals_delivered != 0 ||
+        strstr(fc.out, "F-HANDLER\n") ||
+        fc.fpstate_unsupported != 1 ||
+        fc.refuses[WEMU_UM_REFUSE_SIGFP] != 1 || fc.fpstate_saved != 0)
+        FAIL("fp fail-closed: status=%s delivered=%u unsupported=%u "
+             "sigfp-refuse=%u saved=%u out=[%s]\n",
+             wemu_um_status_name(fcrc), fc.signals_delivered,
+             fc.fpstate_unsupported, fc.refuses[WEMU_UM_REFUSE_SIGFP],
+             fc.fpstate_saved, fc.out);
+    printf("ok: FP FAIL-CLOSED — unsupported FP shape refuses delivery with "
+           "WEMU_UM_REFUSE_SIGFP; no handler ran\n");
+    printf("ok: FP/XMM/x87 SIGNAL FRAME — byte-exact FXSAVE/XSAVE blob in "
+           "ucontext + rt_sigreturn (xmm/x87 clobbers undone, frame edits "
+           "applied); OLD zero-FP path is the negative control\n");
+}
+
 int main(void) {
     wemu_um_reset_isolation();
     test_policy();
@@ -1182,6 +1285,7 @@ int main(void) {
     test_kill_positive();
     test_kill_fail_closed();
     test_sainfo_fault();
+    test_fp_signal_frame();
     printf("WEMU BOUNDED CLONE3-THREAD GATE PASS (host-byte-exact bounded "
            "thread + virtual per-thread masks + per-thread signal dispositions; "
            "bounded pidfd authority byte-exact with exact fail-closed edges; "
@@ -1189,6 +1293,7 @@ int main(void) {
            "sigaction refusals; bounded clone3 fork byte-exact; bounded tgkill "
            "to an admitted sibling + SA_SIGINFO siginfo/ucontext byte-exact; "
            "bounded process-directed kill (SI_USER) byte-exact with exact "
-           "fail-closed pid/signal edges; old paths refuse)\n");
+           "fail-closed pid/signal edges; byte-exact FP/XMM/x87 signal frames "
+           "with rt_sigreturn restoration; old paths refuse/leave FP zero)\n");
     return 0;
 }

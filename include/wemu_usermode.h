@@ -151,7 +151,13 @@ typedef enum {
 #define WEMU_UM_REFUSE_KILL_BUSY         22u /* caller's pending slot occupied */
 #define WEMU_UM_REFUSE_KILL_DISABLED     23u /* kill path switched off (OLD path
                                              * negative control): -ENOSYS */
-#define WEMU_UM_N_REFUSE                 24u
+/* Bounded FP/XMM/x87 signal-frame preservation.  A delivered signal whose
+ * kernel ucontext carries no usable FP state (NULL fpregs, an unrecognized
+ * xsave header, or a saved size outside our bounded buffer) is refused: no
+ * guest handler runs and the fault fails closed. */
+#define WEMU_UM_REFUSE_SIGFP             24u /* unsupported FP shape at signal
+                                             * delivery (frame not populated) */
+#define WEMU_UM_N_REFUSE                 25u
 
 typedef struct {
     uint32_t        nr;
@@ -215,6 +221,13 @@ typedef struct {
     int       fault_pkey;        /* si_pkey of a SEGV_PKUERR fault, -1 if none */
     uint32_t  out_len;       /* bytes captured from fd 1/2, <= OUT_MAX */
     char      out[WEMU_UM_OUT_MAX]; /* NUL-terminated if out_len < OUT_MAX */
+    /* Bounded FP/XMM/x87 signal-frame preservation evidence (appended after
+     * `out` so existing field offsets are unchanged).  saved=deliveries whose
+     * kernel FP blob was copied into the guest frame; restored=rt_sigreturn
+     * calls that put a saved blob back; unsupported=fail-closed shapes. */
+    uint32_t  fpstate_saved;
+    uint32_t  fpstate_restored;
+    uint32_t  fpstate_unsupported;
 } WemuUmResult;
 
 /* Run one ELF to completion.  Both ET_EXEC (mapped at its link addresses)
@@ -304,6 +317,20 @@ int wemu_um_set_kill_enabled(int enabled);
  * dispatched into the bounded pending-signal path.  OFF: the OLD path, where
  * tgkill is an unlisted syscall (-ENOSYS).  Returns 0, or -1 otherwise. */
 int wemu_um_set_tgkill_enabled(int enabled);
+
+/* Negative-control switch for FP/XMM/x87 state in delivered signal frames.
+ * ON (default): the kernel-saved FXSAVE area is copied byte-exact into the
+ * guest ucontext and the whole bounded kernel blob is restored by
+ * rt_sigreturn (honoring handler edits to the FXSAVE area).  OFF: the OLD path — the synthetic ucontext carries a
+ * NULL fpregs pointer and rt_sigreturn restores GPRs only, so guest FP state
+ * is zero/clobbered across delivery.  Returns 0, or -1 for 0/1 values. */
+int wemu_um_set_fp_signal_enabled(int enabled);
+
+/* Test-only fail-closed control: when ON, delivery treats every FP shape as
+ * unsupported even on a host whose kernel FP blob is perfectly preservable,
+ * exercising the WEMU_UM_REFUSE_SIGFP path (no guest handler runs).  OFF by
+ * default.  Returns 0, or -1 for a value other than 0/1. */
+int wemu_um_set_fp_signal_force_unsupported(int enabled);
 
 /* Negative-control switch: when disabled, a bounded clone3 CLONE_THREAD
  * request is refused with -EINVAL and no host thread is created (the OLD

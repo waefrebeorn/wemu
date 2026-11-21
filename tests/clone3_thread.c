@@ -732,6 +732,115 @@ static int run_sainfo_fault(void) {
     return 0;
 }
 
+/* ---- bounded FP/XMM/x87 preservation in signal frames ----------------
+ * Mode "F": load four known XMM patterns and x87 ST0=1.0, fault on a read-only
+ * page with an SA_SIGINFO SIGSEGV handler.  The handler reads the kernel-saved
+ * fpregs (cwd/mxcsr/XMM0-3/ST0), edits xmm0 IN THE FRAME and clobbers the LIVE
+ * xmm1 + x87 ST0, then mprotects and returns normally.  A real kernel's
+ * rt_sigreturn restores from the frame, so the interrupted code must see the
+ * frame edit in xmm0 and the original values everywhere else — byte-exact
+ * against the host.  WEMU must match, proving the whole blob was preserved. */
+typedef unsigned char xmm_bytes[16] __attribute__((aligned(16)));
+
+static const xmm_bytes fp_pat0 = {
+    0x04,0x03,0x02,0x01, 0x08,0x07,0x06,0x05,
+    0x0c,0x0b,0x0a,0x09, 0x10,0x0f,0x0e,0x0d };
+static const xmm_bytes fp_pat1 = {
+    0x14,0x13,0x12,0x11, 0x18,0x17,0x16,0x15,
+    0x1c,0x1b,0x1a,0x19, 0x20,0x1f,0x1e,0x1d };
+static const xmm_bytes fp_pat2 = {
+    0x24,0x23,0x22,0x21, 0x28,0x27,0x26,0x25,
+    0x2c,0x2b,0x2a,0x29, 0x30,0x2f,0x2e,0x2d };
+static const xmm_bytes fp_pat3 = {
+    0x34,0x33,0x32,0x31, 0x38,0x37,0x36,0x35,
+    0x3c,0x3b,0x3a,0x39, 0x40,0x3f,0x3e,0x3d };
+
+static void fp_load(int i, const xmm_bytes *p) {
+    switch (i) {
+    case 0: __asm__ volatile("movdqu %0, %%xmm0"::"m"(*p):"memory"); break;
+    case 1: __asm__ volatile("movdqu %0, %%xmm1"::"m"(*p):"memory"); break;
+    case 2: __asm__ volatile("movdqu %0, %%xmm2"::"m"(*p):"memory"); break;
+    default:__asm__ volatile("movdqu %0, %%xmm3"::"m"(*p):"memory"); break;
+    }
+}
+static void fp_store(int i, xmm_bytes *p) {
+    switch (i) {
+    case 0: __asm__ volatile("movdqu %%xmm0, %0":"=m"(*p)::"memory"); break;
+    case 1: __asm__ volatile("movdqu %%xmm1, %0":"=m"(*p)::"memory"); break;
+    case 2: __asm__ volatile("movdqu %%xmm2, %0":"=m"(*p)::"memory"); break;
+    default:__asm__ volatile("movdqu %%xmm3, %0":"=m"(*p)::"memory"); break;
+    }
+}
+static unsigned long fp_dword(const xmm_bytes *p, int idx) {
+    uint32_t v; memcpy(&v, *p + 4 * idx, 4); return (unsigned long)v;
+}
+static void fp_st0(unsigned long *exp, unsigned long *hi) {
+    unsigned char b[10] __attribute__((aligned(16)));
+    uint16_t e, h;
+    __asm__ volatile("fstpt %0":"=m"(b)::"memory");   /* store+pop ST0 */
+    memcpy(&e, b + 8, 2); memcpy(&h, b + 6, 2);
+    *exp = (unsigned long)(e & 0x7fffu);
+    *hi  = (unsigned long)h;
+}
+
+static uintptr_t fp_page;
+static void fp_handler(int s, siginfo_t *si, void *u) {
+    (void)s; (void)si;
+    ucontext_t *uc = (ucontext_t *)u;
+    emit("F-HANDLER\n", sizeof "F-HANDLER\n" - 1);
+    fpregset_t fp = uc->uc_mcontext.fpregs;
+    emit_num("F-UC-FPREGS=", (long)(fp != 0));
+    if (fp) {
+        emit_num("F-UC-CWD=", (long)fp->cwd);
+        emit_num("F-UC-MXCSR=", (long)fp->mxcsr);
+        static const char *const xn[4] = {
+            "F-UC-X0-", "F-UC-X1-", "F-UC-X2-", "F-UC-X3-" };
+        for (int i = 0; i < 4; i++) {
+            emit_num_t(xn[i], "LO=", (long)fp->_xmm[i].element[0]);
+            emit_num_t(xn[i], "HI=", (long)fp->_xmm[i].element[3]);
+        }
+        emit_num("F-UC-ST0-EXP=", (long)fp->_st[0].exponent);
+        emit_num("F-UC-ST0-HI=", (long)fp->_st[0].significand[3]);
+        /* Edit the FRAME (not the live register): a real sigreturn applies
+         * this edit, so WEMU must read it back from the synthetic frame. */
+        fp->_xmm[0].element[0] = 0x00c0ffeeu;
+    }
+    __asm__ volatile("pxor %%xmm1, %%xmm1" ::: "memory");   /* clobber live */
+    __asm__ volatile("fstp %%st(0)\n\tfldz" ::: "memory");
+    (void)rsys(SYS_mprotect_, (long)fp_page, 4096, PROT_READ_ | PROT_WRITE_,
+               0, 0, 0);
+    /* normal return -> SA_RESTORER -> rt_sigreturn -> faulting store retried */
+}
+
+static int run_fp_frame(void) {
+    long p = rsys(SYS_mmap_, 0, 4096, PROT_READ_, MAP_PRIVATE_ANON_, -1, 0);
+    if (p < 0) return 90;
+    fp_page = (uintptr_t)p;
+    emit_num("F-SET-RC=",
+             set_siginfo_handler(SIGSEGV_, (uint64_t)(uintptr_t)&fp_handler));
+    fp_load(0, &fp_pat0); fp_load(1, &fp_pat1);
+    fp_load(2, &fp_pat2); fp_load(3, &fp_pat3);
+    __asm__ volatile("fld1" ::: "memory");              /* ST0 = 1.0 */
+    *(volatile int *)p = 0x5eedface;                    /* fault -> handler */
+    /* rt_sigreturn resumed here with the frame's FP state restored.  Save
+     * all four XMMs before any libc/emit call can clobber them. */
+    xmm_bytes b0, b1, b2, b3;
+    fp_store(0, &b0); fp_store(1, &b1);
+    fp_store(2, &b2); fp_store(3, &b3);
+    emit_num("F-BACK-X0-LO=", (long)fp_dword(&b0, 0));
+    emit_num("F-BACK-X0-HI=", (long)fp_dword(&b0, 3));
+    emit_num("F-BACK-X1-LO=", (long)fp_dword(&b1, 0));
+    emit_num("F-BACK-X2-LO=", (long)fp_dword(&b2, 0));
+    emit_num("F-BACK-X3-LO=", (long)fp_dword(&b3, 0));
+    unsigned long ex, hi;
+    fp_st0(&ex, &hi);
+    emit_num("F-BACK-ST0-EXP=", (long)ex);
+    emit_num("F-BACK-ST0-HI=", (long)hi);
+    emit_num("F-VALUE=", *(volatile int *)p);
+    emit("F-DONE\n", sizeof "F-DONE\n" - 1);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     char mode = (argc >= 2 && argv[1][0]) ? argv[1][0] : 'o';
     int rc;
@@ -753,6 +862,7 @@ int main(int argc, char **argv) {
     else if (mode == 'j') rc = run_kill_refuse();
     else if (mode == 'w') rc = run_kill_unmodeled();
     else if (mode == 'a') rc = run_sainfo_fault();
+    else if (mode == 'F') rc = run_fp_frame();
     else                  rc = run_ok();
     (void)rsys(SYS_exit_group_, rc, 0, 0, 0, 0, 0);
     return rc;
