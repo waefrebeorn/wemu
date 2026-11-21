@@ -26,6 +26,7 @@ extern "C" {
 #define WEMU_UM_MAX_SIGNALS   16u      /* bounded guest signal deliveries/run */
 #define WEMU_UM_SIG_NSIG      32       /* bounded guest signal-number table */
 #define WEMU_UM_MAX_FORKS     8u       /* bounded guest fork/clone children/run */
+#define WEMU_UM_MAX_THREADS   8u       /* bounded shared-VM host threads/run */
 
 typedef enum {
     WEMU_UM_OK            =   0,
@@ -72,6 +73,7 @@ typedef struct {
     uint32_t  signals_delivered; /* bounded guest signal deliveries */
     uint32_t  signals_denied;    /* fail-closed signal registrations/deliveries */
     uint32_t  forks;             /* bounded COW children created this run */
+    uint32_t  threads_created;   /* bounded shared-VM host threads created */
     uint32_t  denied_nrs[8];     /* distinct unlisted/refused syscall numbers */
     uint32_t  bad_ptrs;          /* guest pointers refused before host dispatch */
     uint32_t  bad_ptr_nr;        /* syscall number of the last refused pointer */
@@ -98,6 +100,13 @@ int wemu_um_signal_modeled(int sig);
  * optionally CLONE_CHILD_SETTID/CLEARTID), 0 when the native path refuses
  * them.  clone3's struct form is checked against the same policy. */
 int wemu_um_clone_flags_modeled(uint64_t flags);
+
+/* 1 when raw clone(2) flags describe a bounded shared-VM host thread:
+ * CLONE_VM + CLONE_THREAD + CLONE_SIGHAND, no exit signal, and only the
+ * whitelisted sharing/TLS/TID bits.  CLONE_SETTLS is honoured: the guest's
+ * TLS value is applied to the host thread by the kernel.  Any namespace or
+ * unlisted flag fails closed. */
+int wemu_um_clone_thread_flags_modeled(uint64_t flags);
 
 /* Introspection for the gate: the table itself and a readable status name. */
 const WemuUmSyscallEntry *wemu_um_syscall_table(size_t *count);

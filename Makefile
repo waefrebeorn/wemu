@@ -20,7 +20,8 @@ all: libwemu.a
 PIE_STATIC = tests/pie_hello tests/pie_signal tests/pie_nohandler tests/pie_unlisted
 PIE_DYN    = tests/pie_dynamic
 FORK_FIX   = tests/fork_clone
-PIE_BINS   = $(PIE_STATIC) $(PIE_DYN) $(FORK_FIX)
+THREAD_FIX = tests/threaded_guest
+PIE_BINS   = $(PIE_STATIC) $(PIE_DYN) $(FORK_FIX) $(THREAD_FIX)
 SANDBOX_BIN = tests/sandbox_probe
 
 src/wemu_usermode.o: CFLAGS += -fno-stack-protector
@@ -39,7 +40,8 @@ libwemu.a: $(OBJ)
 test_%: tests/test_%.c libwemu.a
 	$(CC) $(CFLAGS) -o $@ $< libwemu.a -lm
 
-test_usermode_native: $(PIE_BINS) $(SANDBOX_BIN)
+test_usermode_native: tests/test_usermode_native.c libwemu.a $(PIE_BINS) $(SANDBOX_BIN)
+	$(CC) $(CFLAGS) -o $@ $< libwemu.a -lm
 
 # Freestanding sandbox differential guest (raw syscalls, no libc).
 tests/sandbox_probe: tests/sandbox_probe.c
@@ -51,6 +53,11 @@ tests/pie_%: tests/pie_%.c
 
 tests/fork_clone: tests/fork_clone.c
 	$(CC) -static-pie -O2 -o $@ $<
+
+# Guest threads run with an emulator-provided %fs base that is not glibc's
+# TCB, so no handler/body may read the TLS canary.  Keep this fixture raw.
+tests/threaded_guest: tests/threaded_guest.c
+	$(CC) -static-pie -O2 -fno-stack-protector -o $@ $<
 
 # Real dynamically linked PIE: ET_DYN WITH PT_INTERP, refused fail-closed.
 tests/pie_dynamic: tests/pie_dynamic.c

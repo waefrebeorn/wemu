@@ -38,7 +38,19 @@ untrusted-guest sandbox. Nothing here is enabled implicitly by `wemu_cpu_run`.
    its own wall-clock alarm (alarms are not inherited across fork).  Only the
    root child publishes the result page; COW children exit with their guest
    status so the guest parent's `wait4` sees it.
-7. **Bounded guest signal delivery**: `rt_sigaction` is intercepted into a
+7. **Bounded shared-VM CLONE_THREAD**: a `clone` with CLONE_VM + CLONE_THREAD
+   + CLONE_SIGHAND (and only the whitelisted FS/FILES/SYSVSEM/SETTLS/TID
+   bits, no exit signal, no namespaces) creates a REAL host thread with raw
+   `SYS_clone` from the SIGSYS handler.  The guest's TLS value is passed
+   through to CLONE_SETTLS, so the kernel sets the new thread's `%fs` base.
+   The child resumes inside the handler on the GUEST's new stack, where there
+   is no sigreturn frame; it copies a guest ucontext from the parent's SIGSYS
+   frame and `setcontext()`s into guest code with RAX=0 on that stack.
+   Dispatch state lives in a bounded `WEMU_UM_MAX_THREADS` slot table keyed by
+   raw `gettid()` (the guest owns `%fs`, so `__thread` is unusable); a spin
+   lock serialises shared bookkeeping and is dropped around blocking host
+   calls.  `WEMU_UM_MAX_THREADS` bounds the whole thread group.
+8. **Bounded guest signal delivery**: `rt_sigaction` is intercepted into a
    small guest signal table (never passed to the host). A synchronous CPU
    fault from guest RIP (SIGSEGV/SIGBUS/SIGILL/SIGFPE) with a registered
    handler rewrites the ucontext to that handler, passing signo in RDI and
@@ -61,14 +73,31 @@ untrusted-guest sandbox. Nothing here is enabled implicitly by `wemu_cpu_run`.
   `WEMU_UM_ERR_FAULT`. Every refusal increments `signals_denied`.
 - **Fail-closed interpreter leg**: `wemu_cpu_load_elf()` still rejects
   `ET_DYN`; load-bias handling lives only in the native path.
-- **Fail-closed clone flags**: only CSIGNAL 0/`SIGCHLD`, optionally with
-  `CLONE_CHILD_SETTID`/`CLONE_CHILD_CLEARTID` (accepted but NOT applied — the
-  COW child has a private TLS and no host thread to futex-wake), are modeled.
-  `CLONE_VM`, `CLONE_FS`, `CLONE_FILES`, `CLONE_SIGHAND`, `CLONE_THREAD`,
-  `CLONE_VFORK`, `CLONE_NEW*`, `CLONE_SETTLS`, and nonzero `child_stack` all
-  return `-EINVAL` before any kernel call.  `clone3` is checked against the
-  same policy over the whole `clone_args` struct; any pidfd/tid/tls/stack knob
-  is refused.  `execve` and pidfd-bearing `clone3` remain unlisted.
+- **Fail-closed clone flags**: the FORK-ONLY policy (`wemu_um_clone_flags_modeled`)
+  admits CSIGNAL 0/`SIGCHLD`, optionally with `CLONE_CHILD_SETTID`/
+  `CLONE_CHILD_CLEARTID` (accepted but NOT applied — the COW child has a
+  private TLS and no host thread to futex-wake), and refuses `CLONE_VM`,
+  `CLONE_FS`, `CLONE_FILES`, `CLONE_SIGHAND`, `CLONE_THREAD`, `CLONE_VFORK`,
+  `CLONE_NEW*`, `CLONE_SETTLS`, and nonzero `child_stack` before any kernel
+  call.  A SEPARATE policy (`wemu_um_clone_thread_flags_modeled`) admits the
+  shared-VM thread form — CLONE_VM + CLONE_THREAD + CLONE_SIGHAND with only
+  FS/FILES/SYSVSEM/SETTLS/TID extras and no exit signal — and nothing else;
+  namespace/vfork/exit-signal thread requests return `-EINVAL`.  `clone3`
+  stays fork-only: any pidfd/tid/tls/stack knob or nonzero flags is refused.
+  `execve` and pidfd-bearing `clone3` remain unlisted.
+- **Bounded thread group**: at most `WEMU_UM_MAX_THREADS - 1` shared-VM host
+  threads per run, counted in the shared result page.  Exhaustion returns
+  `-EAGAIN` and increments `denied`.  Thread state is a fixed slot table
+  (no `__thread`: the guest owns `%fs`); a spin lock serialises dispatch and
+  is dropped around blocking host calls.  The child's bootstrap record is
+  published with a parent spin-wait acknowledgement — without it a delayed
+  child could read the NEXT clone's stack/slot and corrupt the run (this bug
+  was caught by a 40-run differential stress loop, not by a single gate).
+- **Negative control for threads**: `tests/threaded_guest` asks for the same
+  thread flags plus `CLONE_NEWUSER`; the real kernel refuses it with `-EINVAL`
+  and the guest prints `THREAD-FLAGS-RC=-22` byte-exactly.  The gate checks
+  both the host oracle and the emulated run, and asserts `threads_created=2`,
+  `denied=1`.
 - **TLS rule for handlers**: the guest owns `%fs`, so handlers may only use
   raw syscalls and TLS-free helpers.  Using glibc's `syscall()` wrote `errno`
   into the guest's TLS slot; the `ENOENT=2` from a failed
@@ -104,9 +133,20 @@ table entry against the kernel's `asm/unistd_64.h`.
 - **Static ET_EXEC and self-relocating static PIE (ET_DYN, no PT_INTERP)
   guests only.** A dynamically linked PIE (`PT_INTERP`) is refused with
   `WEMU_UM_ERR_INTERP`: loading ld.so and shared objects, and the relocations
-  they need, is not modelled. Bounded fork/clone is supported (below), but
-  there are no host threads: sharing flags and true vfork/exec semantics are
+  they need, is not modelled. Bounded fork/clone and a bounded shared-VM
+  CLONE_THREAD model are supported (below), but true vfork/exec semantics are
   refused or approximated.
+- **Threads are raw-clone only.** `pthread_create()` from a static glibc guest
+  (with its full TLS/robust-list/rseq/setxid machinery) has NOT been verified;
+  the differential fixture uses raw `SYS_clone` plus `CLONE_SETTLS` and reads
+  its per-thread index from its own TLS block. `clone3` thread flags,
+  `CLONE_NEW*` namespaces, nonzero thread exit signals, pidfds, thread
+  priorities/sched attributes, guest-owned signal masks per thread, and LTP
+  remain unmodelled. `WEMU_UM_MAX_THREADS - 1` host threads per run is a hard
+  ceiling; exhaustion returns `-EAGAIN`.
+- A guest signal delivered to one thread uses that thread's slot (no nesting);
+  cross-thread signal targeting (`tgkill`) and `CLONE_CHILD_CLEARTID`-driven
+  futex wake-ups are left to the host kernel, not modelled by the dispatcher.
 - The bounded signal path delivers only signo (RSI/RDX siginfo/ucontext args
   are zero), restores general registers only (not XMM/x87 state), allows no
   nesting, and needs the guest's `SA_RESTORER` for a C handler to return.
@@ -126,7 +166,9 @@ table entry against the kernel's `asm/unistd_64.h`.
   range checking, not address-space isolation.
 - The gate runs **45** real static busybox applets, each byte-exact against
   host `execve` of the same binary/args/env, plus static-PIE load-bias and
-  SIGSEGV fixtures, a static-PIE fork/clone fixture (private COW children),
-  and `tests/sandbox_probe` for the four sandbox differentials (RWX mmap,
-  mprotect, out-of-range pointer, brk). LTP, threads, `execve`/vfork sharing,
-  clone3 pidfds and guest signal masks are not yet modelled.
+  SIGSEGV fixtures, a static-PIE fork/clone fixture (private COW children), a
+  static-PIE shared-VM CLONE_THREAD fixture (two TLS-distinguished host
+  threads, exact output + negative clone flag), and `tests/sandbox_probe` for
+  the four sandbox differentials (RWX mmap, mprotect, out-of-range pointer,
+  brk). LTP, `pthread_create`, `execve`/vfork sharing, clone3 pidfds and guest
+  signal masks are not yet modelled.

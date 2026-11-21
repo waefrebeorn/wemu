@@ -29,9 +29,20 @@
  * child gets a PRIVATE copy-on-write address
  * space (guest image, stack and TLS) and continues at the instruction after
  * the syscall with RAX=0; the parent gets the child pid.  CLONE_VM/THREAD/
- * SIGHAND/NEWPID/... are refused with -EINVAL (no shared address space, no
- * host threads, no nested dispatch state).  The fork budget lives in the
- * MAP_SHARED page so it bounds the whole guest process tree.
+ * SIGHAND/NEWPID/... are refused by the fork-only policy.
+ *
+ * Bounded shared-VM CLONE_THREAD: a clone whose flags are CLONE_VM +
+ * CLONE_THREAD + CLONE_SIGHAND (plus whitelisted FS/FILES/SYSVSEM/TLS/TID
+ * bits, no exit signal, no namespaces) is a REAL host thread created with
+ * raw SYS_clone from the SIGSYS handler.  The guest's TLS value is passed
+ * through to CLONE_SETTLS, so the kernel sets the new thread's fs base.  The
+ * child resumes in the handler on the guest stack with no sigreturn frame;
+ * it rebuilds a guest ucontext from the parent's SIGSYS frame and
+ * setcontext()s into guest code with RAX=0 and the guest stack.  Per-thread
+ * state is a bounded slot table selected by raw gettid() (the guest owns %fs,
+ * so this cannot be __thread); dispatch is serialised by a spin lock that is dropped
+ * around blocking host calls.  A bounded clone handshake stops a parent from
+ * overwriting the bootstrap record before the child copies it.
  *
  * TLS rule: the guest owns %fs while our handlers run (it sets it with
  * arch_prctl).  Every syscall/invocation from a handler is therefore a RAW
@@ -175,12 +186,53 @@ enum { UM_WHY_EXIT = 1, UM_WHY_FAULT, UM_WHY_BUDGET, UM_WHY_ALARM, UM_WHY_BADPTR
 #define UM_NGREG \
     (sizeof(((ucontext_t *)0)->uc_mcontext.gregs) / sizeof(greg_t))
 
-static struct {
+/* x86-64 clone flags (linux/sched.h) used by the shared-VM thread model. */
+#define UM_CLONE_VM           0x00000100ull
+#define UM_CLONE_FS           0x00000200ull
+#define UM_CLONE_FILES        0x00000400ull
+#define UM_CLONE_SIGHAND      0x00000800ull
+#define UM_CLONE_THREAD       0x00010000ull
+#define UM_CLONE_SYSVSEM      0x00040000ull
+#define UM_CLONE_SETTLS       0x00080000ull
+#define UM_CLONE_PARENT_SETTID 0x00100000ull
+#define UM_CLONE_CHILD_CLEARTID 0x00200000ull
+#define UM_CLONE_CHILD_SETTID  0x01000000ull
+#define UM_THREAD_FLAG_MASK  (UM_CLONE_VM | UM_CLONE_FS | UM_CLONE_FILES | \
+                              UM_CLONE_SIGHAND | UM_CLONE_THREAD | UM_CLONE_SYSVSEM | \
+                              UM_CLONE_SETTLS | UM_CLONE_PARENT_SETTID | \
+                              UM_CLONE_CHILD_CLEARTID | UM_CLONE_CHILD_SETTID)
+
+/* Per-thread run state.  The guest owns %fs, so THIS cannot be __thread;
+ * instead each bounded host thread owns a slot, selected by raw gettid().
+ * Shared address-space state (ranges, counters, signal table, result page)
+ * stays in g_um below and is guarded by the dispatch lock. */
+typedef struct {
+    volatile long tid;               /* 0 = free slot */
     volatile sig_atomic_t active;
-    int is_root;                     /* only the first child owns the result */
-    greg_t child_rsp;                /* original (non-guest) stack */
+    int is_root;
     volatile int why;
     volatile int exit_code;
+    greg_t child_rsp;                /* stack for the abort/finish path */
+    volatile int in_handler;         /* one live guest-signal delivery/thread */
+    int saved_valid;
+    greg_t saved_gregs[UM_NGREG];
+    volatile uint32_t sig_deliveries;
+    volatile uint32_t sig_denied;
+} UmThread;
+
+static UmThread g_thr[WEMU_UM_MAX_THREADS];
+static UmThread *g_boot_thr;         /* root slot, set before the guest runs */
+
+/* Bounded slot allocator state, shared across the thread group (CLONE_VM). */
+typedef struct {
+    ucontext_t *uc;                  /* parent's SIGSYS ucontext (shared VM) */
+    uint64_t child_stack;            /* guest-provided stack top */
+    int slot;
+} UmThreadBoot;
+static UmThreadBoot g_boot;
+static volatile int g_boot_ready;    /* parent waits until the child copied it */
+
+static struct {
     volatile uint64_t syscalls;
     volatile uint64_t denied;
     uint64_t win_lo, win_hi;       /* guest ELF image window (PT_LOAD) */
@@ -192,17 +244,22 @@ static struct {
     volatile uint32_t bad_ptr_nr;
     volatile uint64_t bad_ptr_va;
     WemuUmResult *result;
-    /* bounded guest signal model (all touched only inside signal handlers) */
-    uint64_t sig_handler[WEMU_UM_SIG_NSIG];  /* guest handler RIP */
-    uint64_t sig_restorer[WEMU_UM_SIG_NSIG]; /* guest SA_RESTORER (sigreturn) */
+    /* process-wide signal dispositions (CLONE_SIGHAND shares these) */
+    uint64_t sig_handler[WEMU_UM_SIG_NSIG];
+    uint64_t sig_restorer[WEMU_UM_SIG_NSIG];
     uint32_t sig_flags[WEMU_UM_SIG_NSIG];
     uint8_t  sig_valid[WEMU_UM_SIG_NSIG];
-    volatile uint32_t sig_deliveries;
-    volatile uint32_t sig_denied;
-    volatile int in_handler;         /* no nested delivery while one is live */
-    int saved_valid;                 /* a context is stashed for sigreturn */
-    greg_t saved_gregs[UM_NGREG];    /* register context at the delivered fault */
 } g_um;
+
+/* Serialise dispatch state updates.  Released around blocking host calls so
+ * a futex-waiting thread cannot freeze a peer that needs to wake it. */
+static volatile int g_dispatch_lock;
+static void um_lock(void) {
+    while (__atomic_exchange_n(&g_dispatch_lock, 1, __ATOMIC_ACQUIRE)) { }
+}
+static void um_unlock(void) {
+    __atomic_store_n(&g_dispatch_lock, 0, __ATOMIC_RELEASE);
+}
 
 /* Only these synchronous-fault signals are ever registered or delivered.
  * Everything else is refused by rt_sigaction and would unwind on fault. */
@@ -222,10 +279,10 @@ static void um_finish(void) __attribute__((noreturn));
  * on the guest stack is rejected by glibc's fortified ____longjmp_chk and
  * is needlessly dangerous anyway: rewriting REG_RIP/REG_RSP and returning
  * from the handler makes the kernel restore the ORIGINAL stack for us. */
-static void um_abort_to_finish(ucontext_t *uc, int why) {
-    g_um.why = why;
+static void um_abort_to_finish(ucontext_t *uc, UmThread *th, int why) {
+    th->why = why;
     uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)um_finish;
-    uc->uc_mcontext.gregs[REG_RSP] = (g_um.child_rsp - 16) & ~(greg_t)15;
+    uc->uc_mcontext.gregs[REG_RSP] = (th->child_rsp - 16) & ~(greg_t)15;
 }
 
 static void um_note_denied(uint64_t nr) {
@@ -268,6 +325,99 @@ static int64_t um_raw1(long nr, long a0) {
     __asm__ volatile("syscall" : "=a"(ret) : "a"(nr), "D"(a0)
                      : "rcx", "r11", "memory");
     return (int64_t)ret;
+}
+
+static void um_skip_syscall(greg_t *r);
+
+/* TLS-free current-thread lookup: the guest owns %fs, so __thread is unsafe.
+ * A raw gettid() plus a bounded slot table identifies the host thread. */
+static long um_raw_gettid(void) { return (long)um_raw0(186 /* SYS_gettid */); }
+
+static UmThread *um_thread_select(void) {
+    long tid = um_raw_gettid();
+    for (unsigned i = 0; i < WEMU_UM_MAX_THREADS; i++)
+        if (g_thr[i].tid == tid) return &g_thr[i];
+    return NULL;
+}
+
+/* Raw clone(2): flags/stack/ptid/ctid/tls exactly as the guest supplied them.
+ * CLONE_SETTLS in `flags` makes the KERNEL apply the guest's TLS value to the
+ * new host thread's fs base — no host-side TLS surgery. */
+static int64_t um_raw_clone(uint64_t flags, uint64_t stack, uint64_t ptid,
+                            uint64_t ctid, uint64_t tls) {
+    register long r10 __asm__("r10") = (long)ctid;
+    register long r8  __asm__("r8")  = (long)tls;
+    long ret;
+    __asm__ volatile("syscall"
+        : "=a"(ret)
+        : "a"(56L /* SYS_clone */), "D"((long)flags), "S"((long)stack),
+          "d"((long)ptid), "r"(r10), "r"(r8)
+        : "rcx", "r11", "memory");
+    return (int64_t)ret;
+}
+
+/* ---- bounded shared-VM CLONE_THREAD -------------------------------- */
+int wemu_um_clone_thread_flags_modeled(uint64_t flags) {
+    uint64_t sig = flags & 0xffull;
+    if (sig != 0) return 0;                  /* threads have no exit signal */
+    if ((flags & UM_THREAD_FLAG_MASK) != (flags & ~0xffull)) return 0;
+    if (!(flags & UM_CLONE_VM) || !(flags & UM_CLONE_THREAD) ||
+        !(flags & UM_CLONE_SIGHAND)) return 0;
+    if (flags & ~(UM_THREAD_FLAG_MASK | 0xffull)) return 0;
+    return 1;
+}
+
+/* Child edge of a shared-VM clone: it resumes inside um_sigsys's handler
+ * frame but on the GUEST's new stack, with no valid sigreturn frame there.
+ * Rebuild a guest ucontext from the parent's SIGSYS frame and sigreturn via
+ * setcontext(), so the new host thread enters guest code with RAX=0 and the
+ * guest's stack/TLS.  Never takes the dispatch lock (the parent may hold it). */
+static void um_thread_child_bootstrap(void) __attribute__((noreturn));
+static void um_thread_child_bootstrap(void) {
+    UmThreadBoot b = g_boot;              /* copy before the parent can move on */
+    UmThread *th = &g_thr[b.slot];
+    __atomic_store_n(&g_boot_ready, 1, __ATOMIC_RELEASE);
+    th->tid = um_raw_gettid();
+    ucontext_t cu = *b.uc;
+    greg_t *r = cu.uc_mcontext.gregs;
+    um_skip_syscall(r);                     /* RIP past the guest syscall */
+    r[REG_RAX] = 0;                         /* clone child return value */
+    r[REG_RSP] = (greg_t)b.child_stack;
+    sigemptyset(&cu.uc_sigmask);            /* guest signal mask (empty) */
+    setcontext(&cu);                        /* enters the guest child thread */
+    _exit(127);                             /* setcontext failed: fail closed */
+}
+
+/* Parent edge: bounded slot, template state, raw clone with the guest's own
+ * flags (honouring CLONE_SETTLS).  Returns the child tid to the guest. */
+static int64_t um_thread_clone(const uint64_t a[6], ucontext_t *uc) {
+    uint32_t used = __atomic_fetch_add(&g_um.result->threads_created, 1,
+                                       __ATOMIC_SEQ_CST);
+    if (used >= WEMU_UM_MAX_THREADS - 1u) {
+        __atomic_fetch_sub(&g_um.result->threads_created, 1, __ATOMIC_SEQ_CST);
+        __atomic_fetch_add(&g_um.denied, 1, __ATOMIC_SEQ_CST);
+        return -EAGAIN;
+    }
+    int slot = (int)used + 1;                /* slot 0 is the root thread */
+    UmThread *th = &g_thr[slot];
+    memset(th, 0, sizeof *th);
+    th->active = 1;
+    th->is_root = 0;
+    th->why = 0;
+    th->exit_code = 0;
+    th->child_rsp = (greg_t)((a[1] - 16) & ~15ull);
+
+    um_lock();
+    __atomic_store_n(&g_boot_ready, 0, __ATOMIC_RELEASE);
+    g_boot.uc = uc;
+    g_boot.child_stack = a[1];
+    g_boot.slot = slot;
+    int64_t pid = um_raw_clone(a[0], a[1], a[2], a[3], a[4]);
+    if (pid == 0) um_thread_child_bootstrap();   /* never returns */
+    while (!__atomic_load_n(&g_boot_ready, __ATOMIC_ACQUIRE)) { }
+    g_thr[slot].tid = (long)pid;
+    um_unlock();
+    return pid;
 }
 
 /* ---- mapped-range guest pointer validation -------------------------- */
@@ -376,6 +526,11 @@ static int um_ptr_args_ok(uint64_t nr, const uint64_t a[6]) {
     case WEMU_UM_SYS_ARCH_PRCTL:
         if (a[0] == 0x1003 || a[0] == 0x1004) return um_chk(nr, a[1], 8);
         return 1;                              /* SET_FS/SET_GS take a value */
+    case VSL_SYS_CLONE:
+        /* A shared-VM thread's ptid/ctid are written by the host kernel. */
+        if (wemu_um_clone_thread_flags_modeled(a[0]))
+            return um_chk(nr, a[2], 4) && um_chk(nr, a[3], 4);
+        return 1;
     case VSL_SYS_OPENAT: case VSL_SYS_FACCESSAT:
         return um_chk_str(nr, a[1]);
     default:
@@ -400,11 +555,11 @@ typedef struct {
 /* Guest rt_sigaction: record only a bounded set of synchronous signals in
  * our own table; never install a host handler.  Unknown signals, bad sizes
  * and out-of-image handlers are refused — there is no implied default. */
-static int64_t um_sigaction(const uint64_t a[6]) {
+static int64_t um_sigaction(UmThread *th, const uint64_t a[6]) {
     int sig = (int)a[0];
     uint64_t act = a[1], oldact = a[2], ssz = a[3];
     if (sig <= 0 || sig >= WEMU_UM_SIG_NSIG || ssz != 8 || !um_sig_sync(sig)) {
-        g_um.sig_denied++;
+        th->sig_denied++;
         return -EINVAL;
     }
     UmKernelSigaction ksa;
@@ -420,7 +575,7 @@ static int64_t um_sigaction(const uint64_t a[6]) {
         return 0;
     }
     if (ksa.handler < g_um.win_lo || ksa.handler >= g_um.win_hi) {
-        g_um.sig_denied++;                    /* handler outside the image */
+        th->sig_denied++;                        /* handler outside the image */
         return -EINVAL;
     }
     g_um.sig_handler[sig]  = ksa.handler;
@@ -433,16 +588,16 @@ static int64_t um_sigaction(const uint64_t a[6]) {
 /* Guest rt_sigreturn: put the fault-time registers back.  The ucontext we
  * are returning from is the SIGSYS one raised by this very syscall, so the
  * kernel resumes at the restored RIP (the faulting instruction) on sigreturn. */
-static void um_sigreturn(greg_t *r) {
-    if (!g_um.in_handler || !g_um.saved_valid) {
-        g_um.sig_denied++;
+static void um_sigreturn(UmThread *th, greg_t *r) {
+    if (!th->in_handler || !th->saved_valid) {
+        th->sig_denied++;
         r[REG_RAX] = (greg_t)-EINVAL;
         um_skip_syscall(r);
         return;
     }
-    memcpy(r, g_um.saved_gregs, sizeof g_um.saved_gregs);
-    g_um.saved_valid = 0;
-    g_um.in_handler = 0;
+    memcpy(r, th->saved_gregs, sizeof th->saved_gregs);
+    th->saved_valid = 0;
+    th->in_handler = 0;
     /* Deliberately no um_skip_syscall: RIP is now the faulting instruction. */
 }
 
@@ -481,12 +636,12 @@ static int um_clone3_modeled(const uint64_t a[6]) {
 }
 
 /* One shared counter bounds the whole process tree, not just this process. */
-static int64_t um_do_fork(void) {
-    if (g_um.in_handler) { g_um.denied++; return -EPERM; }
+static int64_t um_do_fork(UmThread *th) {
+    if (th->in_handler) { __atomic_fetch_add(&g_um.denied, 1, __ATOMIC_SEQ_CST); return -EPERM; }
     uint32_t used = __atomic_fetch_add(&g_um.result->forks, 1, __ATOMIC_SEQ_CST);
     if (used >= WEMU_UM_MAX_FORKS) {
         __atomic_fetch_sub(&g_um.result->forks, 1, __ATOMIC_SEQ_CST);
-        g_um.denied++;
+        __atomic_fetch_add(&g_um.denied, 1, __ATOMIC_SEQ_CST);
         return -EAGAIN;
     }
     int64_t pid = um_raw0(57 /* SYS_fork */);
@@ -495,18 +650,34 @@ static int64_t um_do_fork(void) {
         return pid;
     }
     if (pid == 0) {
-        /* Private COW address space; inherited g_um is our own copy.  Only
-         * the root publishes results; children report status via wait4. */
-        g_um.is_root = 0;
+        /* Private COW address space: only this thread survives in the child.
+         * Re-seat the slot table on the child's own tid and demote from root;
+         * a COW child reports status via wait4, never the shared result. */
+        UmThread *c = &g_thr[0];
+        greg_t saved_rsp = th->child_rsp;
+        memset(c, 0, sizeof *c);
+        c->tid = um_raw_gettid();
+        c->active = 1;
+        c->is_root = 0;
+        c->child_rsp = saved_rsp;
+        g_boot_thr = c;
         (void)um_raw1(37 /* SYS_alarm */, WEMU_UM_TIMEOUT_SEC);
         /* alarm timers are NOT inherited across fork */
     }
     return pid;
 }
 
+/* Host call with the dispatch lock dropped: a guest thread blocked in
+ * futex/wait4 must not freeze a peer that needs to emit the wakeup. */
+static int64_t um_host_unlocked(uint64_t nr, uint64_t a[6]) {
+    um_unlock();
+    int64_t ret = um_host(nr, a);
+    um_lock();
+    return ret;
+}
+
 static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
     (void)sig;
-    if (!g_um.active) _exit(200);            /* never dispatch outside a run */
     ucontext_t *uc = (ucontext_t *)ucv;
     greg_t *r = uc->uc_mcontext.gregs;
     uint64_t nr = (uint64_t)si->si_syscall;
@@ -514,23 +685,48 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
         (uint64_t)r[REG_RDI], (uint64_t)r[REG_RSI], (uint64_t)r[REG_RDX],
         (uint64_t)r[REG_R10], (uint64_t)r[REG_R8],  (uint64_t)r[REG_R9],
     };
+    UmThread *th = um_thread_select();
+    if (!th || !th->active) _exit(200);      /* never dispatch outside a run */
+
+    /* Shared-VM CLONE_THREAD is the one path that must not hold the dispatch
+     * lock: the new host thread resumes in the handler on the guest stack and
+     * setcontext()s straight into guest code. */
+    if (nr == VSL_SYS_CLONE && wemu_um_clone_thread_flags_modeled(a[0])) {
+        int64_t pid = um_thread_clone(a, uc);
+        __atomic_fetch_add(&g_um.syscalls, 1, __ATOMIC_SEQ_CST);
+        r[REG_RAX] = (greg_t)pid;
+        um_skip_syscall(r);
+        if (__atomic_load_n(&g_um.syscalls, __ATOMIC_SEQ_CST) >=
+                WEMU_UM_MAX_SYSCALLS ||
+            __atomic_load_n(&g_um.denied, __ATOMIC_SEQ_CST) > 8)
+            um_abort_to_finish(uc, th, UM_WHY_BUDGET);
+        return;
+    }
+
+    um_lock();
     const WemuUmSyscallEntry *e = um_lookup(nr);
-    g_um.syscalls++;
+    __atomic_fetch_add(&g_um.syscalls, 1, __ATOMIC_SEQ_CST);
 
     if (!e) {                                /* FAIL CLOSED: no default-allow */
         um_note_denied(nr);
         r[REG_RAX] = (greg_t)-ENOSYS;
         um_skip_syscall(r);
-        if (g_um.denied > 8) { um_abort_to_finish(uc, UM_WHY_BUDGET); return; }
+        if (g_um.denied > 8) { um_abort_to_finish(uc, th, UM_WHY_BUDGET); }
+        um_unlock();
         return;
     }
     if (e->kind == WEMU_UM_DISPATCH_EXIT) {
-        g_um.exit_code = (int)(int32_t)a[0];
-        um_abort_to_finish(uc, UM_WHY_EXIT);
+        th->exit_code = (int)(int32_t)a[0];
+        /* exit_group from a real host thread ends the whole thread group;
+         * a fork child lives in its own process and must keep its COW status. */
+        if (nr == VSL_SYS_EXIT_GROUP && th != &g_thr[0]) th->is_root = 1;
+        um_abort_to_finish(uc, th, UM_WHY_EXIT);
+        um_unlock();
         return;
     }
     if (e->kind == WEMU_UM_DISPATCH_SIGRETURN) {
-        um_sigreturn(r);                     /* resumes at the saved fault RIP */
+        um_sigreturn(th, r);                  /* resumes at the saved fault RIP */
+        um_unlock();
         return;
     }
 
@@ -539,7 +735,8 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
      * the run with WEMU_UM_ERR_BADPTR; no host handler sees it. */
     if (!um_ptr_args_ok(nr, a)) {
         r[REG_RAX] = (greg_t)-EFAULT;
-        um_abort_to_finish(uc, UM_WHY_BADPTR);
+        um_abort_to_finish(uc, th, UM_WHY_BADPTR);
+        um_unlock();
         return;
     }
 
@@ -547,31 +744,38 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
         e->kind == WEMU_UM_DISPATCH_CLONE ||
         e->kind == WEMU_UM_DISPATCH_CLONE3) {
         int64_t child;
+        um_unlock();                         /* raw fork: child needs the lock */
         if (e->kind == WEMU_UM_DISPATCH_CLONE) {
             /* RDI=flags, RSI=child stack: a non-zero stack means the child
              * resumes on a different stack, which we do not model. */
             if (!wemu_um_clone_flags_modeled(a[0]) || a[1] != 0) {
-                um_note_denied(nr); child = -EINVAL;
-            } else child = um_do_fork();
+                um_lock(); um_note_denied(nr); um_unlock(); child = -EINVAL;
+            } else child = um_do_fork(th);
         } else if (e->kind == WEMU_UM_DISPATCH_CLONE3) {
             if (!um_clone3_modeled(a)) {
-                um_note_denied(nr); child = -EINVAL;
-            } else child = um_do_fork();
+                um_lock(); um_note_denied(nr); um_unlock(); child = -EINVAL;
+            } else child = um_do_fork(th);
         } else {
             /* fork(2)/vfork(2): the kernel fixes exit_signal=SIGCHLD.  Our
              * bounded COW model makes vfork's shared-stack rule moot. */
-            child = um_do_fork();
+            child = um_do_fork(th);
+        }
+        um_lock();
+        if (!th->active) {                   /* we are the fork child */
+            th = um_thread_select();
+            if (!th) { um_unlock(); return; }
         }
         r[REG_RAX] = (greg_t)child;
         um_skip_syscall(r);
         if (g_um.syscalls >= WEMU_UM_MAX_SYSCALLS || g_um.denied > 8)
-            um_abort_to_finish(uc, UM_WHY_BUDGET);
+            um_abort_to_finish(uc, th, UM_WHY_BUDGET);
+        um_unlock();
         return;
     }
 
     int64_t ret = -EPERM;
     if (e->kind == WEMU_UM_DISPATCH_SIGACTION) {
-        ret = um_sigaction(a);
+        ret = um_sigaction(th, a);
     } else if (e->kind == WEMU_UM_DISPATCH_EXEC_GUARD) {
         /* mmap(addr,len,prot,flags,..) / mprotect(addr,len,prot): a guest may
          * only make executable memory inside the registered image window,
@@ -581,7 +785,7 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
         int in_window = a[0] >= g_um.win_lo && a[0] < g_um.win_hi &&
                         a[1] <= g_um.win_hi - a[0];
         if (!wants_exec) {
-            ret = um_host(nr, a);
+            ret = um_host_unlocked(nr, a);
             /* Remember admitted mappings so their buffers pass pointer
              * validation; bounded table, bounded size. */
             if (nr == VSL_SYS_MMAP && ret >= 0 && a[1] &&
@@ -597,9 +801,9 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
              * Tighten: only a MAP_FIXED range wholly inside the trapped
              * image window is admitted; all other PROT_EXEC maps refused. */
             int fixed = (a[3] & MAP_FIXED) != 0;
-            if (fixed && in_window) ret = um_host(nr, a);
+            if (fixed && in_window) ret = um_host_unlocked(nr, a);
         } else if (in_window) {
-            ret = um_host(nr, a);            /* mprotect: already trapped */
+            ret = um_host_unlocked(nr, a);       /* mprotect: already trapped */
         }
     } else if (e->kind == WEMU_UM_DISPATCH_BRK) {
         /* Bounded heap growth.  brk() failure semantics: return the current
@@ -612,7 +816,7 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
                    a[0] > g_um.heap_lo + UM_HEAP_MAX) {
             ret = (int64_t)cur;              /* out of bounds: refuse */
         } else {
-            ret = um_host(nr, a);
+            ret = um_host_unlocked(nr, a);
             if (ret > 0) g_um.heap_hi = (uint64_t)ret;
         }
     } else if ((nr == VSL_SYS_WRITE || nr == VSL_SYS_WRITEV ||
@@ -621,29 +825,31 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
          * authoritative capture. */
         uint64_t room = WEMU_UM_OUT_MAX - 1u - g_um.result->out_len;
         if (nr == VSL_SYS_WRITE && a[2] > room) a[2] = room;
-        ret = um_host(nr, a);
+        ret = um_host_unlocked(nr, a);
         if (ret > 0) {
             uint64_t n = (uint64_t)ret;
             if (n > room) n = room;
             g_um.result->out_len += (uint32_t)n;
         }
     } else {
-        ret = um_host(nr, a);
+        ret = um_host_unlocked(nr, a);
     }
 
     r[REG_RAX] = (greg_t)ret;
     um_skip_syscall(r);
     if (g_um.syscalls >= WEMU_UM_MAX_SYSCALLS ||
         g_um.result->out_len >= WEMU_UM_OUT_MAX - 1u) {
-        um_abort_to_finish(uc, UM_WHY_BUDGET);
+        um_abort_to_finish(uc, th, UM_WHY_BUDGET);
     }
+    um_unlock();
 }
 
 /* A synchronous CPU fault inside the guest image is offered to a registered
  * guest handler.  Everything else fails closed: unknown signal, no handler,
  * a fault outside the guest window, a nested fault, or an exhausted budget. */
 static void um_fault(int sig, siginfo_t *si, void *ucv) {
-    if (!g_um.active) _exit(201);
+    UmThread *th = um_thread_select();
+    if (!th || !th->active) _exit(201);
     ucontext_t *uc = (ucontext_t *)ucv;
     greg_t *r = uc->uc_mcontext.gregs;
     int signo = si ? si->si_signo : sig;
@@ -651,17 +857,17 @@ static void um_fault(int sig, siginfo_t *si, void *ucv) {
     int in_guest = rip >= g_um.win_lo && rip < g_um.win_hi;
 
     if (!um_sig_sync(signo) || !in_guest || !um_sig_registered(signo) ||
-        g_um.in_handler || g_um.sig_deliveries >= WEMU_UM_MAX_SIGNALS) {
-        g_um.sig_denied++;                    /* fail closed, no delivery */
-        um_abort_to_finish(uc, UM_WHY_FAULT);
+        th->in_handler || th->sig_deliveries >= WEMU_UM_MAX_SIGNALS) {
+        th->sig_denied++;                     /* fail closed, no delivery */
+        um_abort_to_finish(uc, th, UM_WHY_FAULT);
         return;
     }
 
     /* Stash the fault-time registers (bounded: one live delivery at a time). */
-    memcpy(g_um.saved_gregs, r, sizeof g_um.saved_gregs);
-    g_um.saved_valid = 1;
-    g_um.in_handler = 1;
-    g_um.sig_deliveries++;
+    memcpy(th->saved_gregs, r, sizeof th->saved_gregs);
+    th->saved_valid = 1;
+    th->in_handler = 1;
+    th->sig_deliveries++;
 
     /* Minimal delivery frame: put the guest's SA_RESTORER where a C handler's
      * epilogue will `ret`, with SysV stack alignment at handler entry.  We
@@ -677,8 +883,9 @@ static void um_fault(int sig, siginfo_t *si, void *ucv) {
 
 static void um_alarm(int sig, siginfo_t *si, void *ucv) {
     (void)sig; (void)si;
-    if (!g_um.active) return;
-    um_abort_to_finish((ucontext_t *)ucv, UM_WHY_ALARM);
+    UmThread *th = um_thread_select();
+    if (!th || !th->active) return;
+    um_abort_to_finish((ucontext_t *)ucv, th, UM_WHY_ALARM);
 }
 
 /* ---- ELF loading ---------------------------------------------------- */
@@ -936,22 +1143,31 @@ static int um_install_filter(uint64_t lo, uint64_t hi) {
  * result is published through the MAP_SHARED page and the child _exit()s. */
 static void um_finish(void) {
     WemuUmResult *shared = g_um.result;
-    g_um.active = 0;
-    (void)um_raw1(37 /* SYS_alarm */, 0);
-    if (!g_um.is_root) {
-        /* A COW child is reaped by the guest parent's wait4: publish only a
-         * real exit status there, never the run-wide shared result. */
-        _exit(g_um.why == UM_WHY_EXIT ? (g_um.exit_code & 0xff) : 128);
+    UmThread *th = um_thread_select();
+    if (!th) th = g_boot_thr ? g_boot_thr : &g_thr[0];
+    th->active = 0;
+    if (!th->is_root) {
+        /* A COW child is reaped by the guest parent's wait4; a shared-VM
+         * host thread exits only ITSELF (raw SYS_exit, not exit_group). */
+        int code = th->why == UM_WHY_EXIT ? (th->exit_code & 0xff) : 128;
+        (void)um_raw1(60 /* SYS_exit */, code);   /* never returns */
+        _exit(code);
     }
+    (void)um_raw1(37 /* SYS_alarm */, 0);
     shared->syscalls = g_um.syscalls;
     shared->denied = g_um.denied;
-    shared->signals_delivered = g_um.sig_deliveries;
-    shared->signals_denied = g_um.sig_denied;
+    uint32_t delivered = 0, denied_sig = 0;
+    for (unsigned i = 0; i < WEMU_UM_MAX_THREADS; i++) {
+        delivered += g_thr[i].sig_deliveries;
+        denied_sig += g_thr[i].sig_denied;
+    }
+    shared->signals_delivered = delivered;
+    shared->signals_denied = denied_sig;
     shared->bad_ptrs = g_um.bad_ptrs;
     shared->bad_ptr_nr = g_um.bad_ptr_nr;
     shared->bad_ptr_va = g_um.bad_ptr_va;
-    shared->exit_code = g_um.exit_code;
-    switch (g_um.why) {
+    shared->exit_code = th->exit_code;
+    switch (th->why) {
     case UM_WHY_EXIT:  shared->status = WEMU_UM_OK;          break;
     case UM_WHY_FAULT: shared->status = WEMU_UM_ERR_FAULT;    break;
     case UM_WHY_ALARM: shared->status = WEMU_UM_ERR_BUDGET;   break;
@@ -1001,7 +1217,14 @@ static void um_child_run(const char *path, char *const argv[], char *const envp[
     free(im.file);
 
     memset(&g_um, 0, sizeof g_um);
-    g_um.is_root = 1;
+    memset(g_thr, 0, sizeof g_thr);
+    g_dispatch_lock = 0;
+    UmThread *root = &g_thr[0];
+    root->tid = um_raw_gettid();
+    root->active = 1;
+    root->is_root = 1;
+    root->child_rsp = 0;                     /* set after getcontext below */
+    g_boot_thr = root;
     g_um.result = shared;
     g_um.win_lo = im.lo;
     g_um.win_hi = im.hi;
@@ -1046,9 +1269,9 @@ static void um_child_run(const char *path, char *const argv[], char *const envp[
 
     uintptr_t sp;
     __asm__ volatile ("mov %%rsp, %0" : "=r"(sp));
-    g_um.child_rsp = (greg_t)sp;
-    g_um.why = 0;
-    g_um.active = 1;
+    root->child_rsp = (greg_t)sp;
+    root->why = 0;
+    root->active = 1;
     alarm(WEMU_UM_TIMEOUT_SEC);
     (void)setcontext(&uc);                   /* transfers to e_entry */
     um_finish();                             /* only on setcontext failure */

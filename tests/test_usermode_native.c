@@ -16,6 +16,10 @@
  *    submits unsupported clone/clone3 flags.  Its stdout is byte-exact vs
  *    host execve of the same fixture; forks/denied counters are asserted.
  *    Fail-closed flag policy is also checked through the introspection API.
+ * 8. Bounded shared-VM CLONE_THREAD: a static-PIE raw-clone fixture with
+ *    CLONE_SETTLS creates two host threads that record TLS-derived values;
+ *    a negative CLONE_NEWUSER thread request is refused.  stdout is byte-exact
+ *    against host execve of the same fixture, and threads/denied are asserted.
  */
 #define _GNU_SOURCE
 #include "wemu.h"
@@ -580,6 +584,63 @@ static void test_sandbox(void) {
            r.out);
 }
 
+/* ---- 8. bounded shared-VM CLONE_THREAD ------------------------------- */
+#define CLONE_VM_T_           0x00000100u
+#define CLONE_SIGHAND_T_      0x00000800u
+#define CLONE_THREAD_T_       0x00010000u
+#define CLONE_SETTLS_T_       0x00080000u
+#define CLONE_NEWUSER_T_      0x10000000u
+#define CLONE_VFORK_T_        0x00020000u
+
+static void test_thread_policy(void) {
+    uint64_t good = CLONE_VM_T_ | CLONE_SIGHAND_T_ | CLONE_THREAD_T_ |
+                    CLONE_SETTLS_T_;
+    if (!wemu_um_clone_thread_flags_modeled(good))
+        FAIL("thread-shaped clone flags must be modeled\n");
+    if (wemu_um_clone_thread_flags_modeled(good | CLONE_NEWUSER_T_) ||
+        wemu_um_clone_thread_flags_modeled(good & ~CLONE_VM_T_) ||
+        wemu_um_clone_thread_flags_modeled(good | SIGCHLD) ||
+        wemu_um_clone_thread_flags_modeled(good | CLONE_VFORK_T_))
+        FAIL("namespace/no-VM/exit-signal/vfork thread flags must be refused\n");
+    /* The old fork-only introspection stays fail-closed for sharing flags. */
+    if (wemu_um_clone_flags_modeled(CLONE_VM_T_ | CLONE_THREAD_T_))
+        FAIL("fork-only policy must still refuse CLONE_VM|CLONE_THREAD\n");
+    printf("ok: FAIL-CLOSED thread flag policy — VM/THREAD/SIGHAND/SETTLS "
+           "allowed; namespace/no-VM/exit-signal refused\n");
+}
+
+static void test_threads(void) {
+    const char *out =
+        "TLS-VALUES-OK\nTHREAD-FLAGS-RC=-22\nMAIN-OK\n";
+    char *argv[] = { (char *)"threaded_guest", NULL };
+    Cap oracle;
+    int he = host_exec("tests/threaded_guest", argv, &oracle);
+    if (he != 0 || oracle.n != strlen(out) ||
+        memcmp(oracle.b, out, oracle.n) != 0)
+        FAIL("threaded_guest host oracle differs (exit=%d out=[%s])\n",
+             he, oracle.b);
+
+    WemuUmResult r;
+    int rc = wemu_um_run_elf("tests/threaded_guest", argv, GUEST_ENV, &r);
+    if (rc != WEMU_UM_OK)
+        FAIL("threaded_guest: status=%s out=[%s]\n",
+             wemu_um_status_name(rc), r.out);
+    if (r.exit_code != 0) FAIL("threaded_guest exit=%d want 0\n", r.exit_code);
+    if (r.out_len != strlen(out) || memcmp(r.out, out, r.out_len) != 0)
+        FAIL("threaded_guest native out=[%s] want=[%s]\n", r.out, out);
+    if (r.threads_created != 2)
+        FAIL("threaded_guest threads=%u want 2\n", r.threads_created);
+    if (r.denied != 1)
+        FAIL("threaded_guest denied=%llu want 1 (unlisted clone flag)\n",
+             (unsigned long long)r.denied);
+    print_exact("threaded", r.out, r.out_len);
+    printf("        (threads=%u, denied=%llu, syscalls=%llu; == host execve)\n",
+           r.threads_created, (unsigned long long)r.denied,
+           (unsigned long long)r.syscalls);
+    printf("ok: BOUNDED shared-VM CLONE_THREAD + CLONE_SETTLS — two host "
+           "threads, exact output vs host, negative clone flag refused\n");
+}
+
 int main(void) {
     audit_header("/usr/include/x86_64-linux-gnu/asm/unistd_64.h");
     test_applets();
@@ -588,9 +649,11 @@ int main(void) {
     test_pie_and_signals();
     test_clone_policy();
     test_fork_clone();
+    test_thread_policy();
+    test_threads();
     test_sandbox();
     printf("WEMU NATIVE USERMODE GATE PASS (%d static busybox applets, "
-           "ET_DYN load bias, bounded signals/fork, fail-closed sandbox)\n",
+           "ET_DYN load bias, bounded signals/fork/threads, fail-closed sandbox)\n",
            g_applets_checked);
     return 0;
 }
