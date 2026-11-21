@@ -27,10 +27,15 @@
 
 #define SYS_write_          1
 #define SYS_rt_sigprocmask_ 14
+#define SYS_getpid_         39
+#define SYS_clone_          56
+#define SYS_wait4_          61
 #define SYS_clone3_         435
 #define SYS_exit_           60
 #define SYS_exit_group_     231
 #define SYS_pidfd_send_signal_ 424
+#define SYS_pidfd_open_     434
+#define SYS_pidfd_getfd_    438
 
 #define SIG_BLOCK_   0
 #define SIG_UNBLOCK_ 1
@@ -274,11 +279,53 @@ static int run_refuse2(void) {
     return 0;
 }
 
+/* ---- exact fail-closed diagnostics: pidfd_open / pidfd_getfd / CLEAR_SIGHAND ----
+ * The host oracle proves each is a real kernel feature (pidfd_open on self
+ * succeeds, pidfd_getfd on a bad fd is -EBADF, CLEAR_SIGHAND|SIGHAND is
+ * -EINVAL); WEMU refuses all three with dedicated exact reasons. */
+static int run_refuse3(void) {
+    long me = rsys(SYS_getpid_, 0, 0, 0, 0, 0, 0);
+    emit_num("PIDFDOPEN-RC=", rsys(SYS_pidfd_open_, me, 0, 0, 0, 0, 0));
+    emit_num("PIDFDGETFD-RC=", rsys(SYS_pidfd_getfd_, -1, -1, 0, 0, 0, 0));
+    emit_num("CLRCLEAR-RC=",
+             rsys(SYS_clone_, (long)(CLONE_CLEAR_SIGHAND_ | CLONE_SIGHAND_),
+                  0, 0, 0, 0, 0));
+    return 0;
+}
+
+/* ---- positive byte-exact differential: bounded fork-shaped clone3 -----
+ * A v0 clone_args with flags==0, exit_signal=SIGCHLD and NO knobs is WEMU's
+ * bounded COW fork form.  The child writes then exits 0; the parent wait4()s
+ * and reports only boolean invariants (never a pid or raw status word), so
+ * the byte stream is identical on the host kernel and under WEMU. */
+static int run_fork(void) {
+    struct local_clone_args ca;
+    memset(&ca, 0, sizeof ca);
+    ca.exit_signal = 17;                 /* SIGCHLD */
+
+    long pid = rsys(SYS_clone3_, (long)&ca, sizeof ca, 0, 0, 0, 0);
+    if (pid == 0) {
+        emit("C3FORK-CHILD\n", sizeof "C3FORK-CHILD\n" - 1);
+        (void)rsys(SYS_exit_, 0, 0, 0, 0, 0, 0);
+        __builtin_unreachable();
+    }
+    if (pid < 0) { emit(refused, sizeof refused - 1); return 7; }
+
+    int st = 0;
+    long w = rsys(SYS_wait4_, pid, (long)&st, 0, 0, 0, 0);
+    int exited0 = (w == pid) && ((st & 0x7f) == 0) && (((st >> 8) & 0xff) == 0);
+    emit_num("C3FORK-WAIT-OK=", exited0);
+    emit("C3FORK-PARENT\n", sizeof "C3FORK-PARENT\n" - 1);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     char mode = (argc >= 2 && argv[1][0]) ? argv[1][0] : 'o';
     int rc;
     if (mode == 'v')      rc = run_vmask();
     else if (mode == '2') rc = run_refuse2();
+    else if (mode == '3') rc = run_refuse3();
+    else if (mode == 'f') rc = run_fork();
     else if (mode == 'r') rc = run_refuse();
     else                  rc = run_ok();
     (void)rsys(SYS_exit_group_, rc, 0, 0, 0, 0, 0);

@@ -80,8 +80,11 @@ typedef enum {
  * instead of only that `denied` went up.  Every refusal also returns an errno
  * to the guest (-EINVAL unless noted) and leaves the image/thread state intact. */
 #define WEMU_UM_REFUSE_CLONE3_PIDFD      1u  /* CLONE_PIDFD flag or clone_args.pidfd */
-#define WEMU_UM_REFUSE_CLONE3_SIGMASK    2u  /* CLONE_CLEAR_SIGHAND (unmodeled
-                                             * signal-handler reset) */
+/* Legacy code, emitted ONLY on the old coarse-diagnostic path (exact reasons
+ * switched off) for CLONE_CLEAR_SIGHAND via clone3.  On the hardened path the
+ * dedicated WEMU_UM_REFUSE_CLONE_CLEAR_SIGHAND code below is used instead, so
+ * the same flag gets one exact reason on BOTH the raw-clone and clone3 legs. */
+#define WEMU_UM_REFUSE_CLONE3_SIGMASK    2u  /* old-path CLONE_CLEAR_SIGHAND */
 #define WEMU_UM_REFUSE_CLONE3_SHAPE      3u  /* clone_args outside the bounded
                                              * fork/thread shape (incl. bad ptr) */
 #define WEMU_UM_REFUSE_CLONE_PIDFD       4u  /* raw SYS_clone with CLONE_PIDFD */
@@ -100,7 +103,18 @@ typedef enum {
 #define WEMU_UM_REFUSE_CLONE3_FORK_SHAPE 11u /* structurally valid clone3 whose
                                              * flags/knobs are outside the
                                              * bounded COW fork form */
-#define WEMU_UM_N_REFUSE                 12u
+/* Hardened-path exact refuses added for the pidfd/CLEAR_SIGHAND leg.  Each is
+ * returned to the guest as -EINVAL and counted in WemuUmResult.refuses[].  With
+ * exact diagnostics OFF these shapes keep their OLD behaviour: pidfd_open /
+ * pidfd_getfd are unlisted syscalls (generic -ENOSYS), raw-clone CLEAR_SIGHAND
+ * is refused by the generic clone-flag policy, and clone3 CLEAR_SIGHAND folds
+ * back into the legacy CLONE3_SIGMASK code (2). */
+#define WEMU_UM_REFUSE_PIDFD_OPEN         12u /* pidfd_open: no modeled pidfd authority */
+#define WEMU_UM_REFUSE_PIDFD_GETFD        13u /* pidfd_getfd: no modeled pidfd authority */
+#define WEMU_UM_REFUSE_CLONE_CLEAR_SIGHAND 14u /* CLONE_CLEAR_SIGHAND (raw clone
+                                               * OR clone3): unmodeled per-thread
+                                               * signal-handler reset */
+#define WEMU_UM_N_REFUSE                 15u
 
 typedef struct {
     uint32_t        nr;

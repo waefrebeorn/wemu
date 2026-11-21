@@ -111,6 +111,8 @@
 #define WEMU_UM_SYS_EXECVEAT     322 /* not in the VSL table */
 #define WEMU_UM_SYS_KCMP         312 /* raw kcmp: open-file-description identity */
 #define WEMU_UM_SYS_PIDFD_SEND_SIGNAL 424 /* x86-64: no modeled pidfd authority */
+#define WEMU_UM_SYS_PIDFD_OPEN       434 /* x86-64: no modeled pidfd authority */
+#define WEMU_UM_SYS_PIDFD_GETFD      438 /* x86-64: no modeled pidfd authority */
 #define UM_KCMP_FILE             0    /* linux/kcmp.h KCMP_FILE */
 #define UM_F_GETFD               1    /* fcntl(2) */
 #define UM_F_DUPFD_CLOEXEC       1030 /* fcntl.h (x86-64) */
@@ -1328,7 +1330,11 @@ static int um_clone3_classify(const uint64_t a[6], UmCloneArgs *ca, int *reason)
         return -1;
     }
     if (ca->flags & UM_CLONE_CLEAR_SIGHAND) {
-        *reason = WEMU_UM_REFUSE_CLONE3_SIGMASK;
+        /* Hardened path: one exact code shared with the raw-clone leg.  Old
+         * coarse path keeps the legacy CLONE3_SIGMASK code (negative control). */
+        *reason = g_cfg.exact_refuse_enabled
+                    ? WEMU_UM_REFUSE_CLONE_CLEAR_SIGHAND
+                    : WEMU_UM_REFUSE_CLONE3_SIGMASK;
         return -1;
     }
     /* set_tid / cgroup hand the guest authority over host TIDs and cgroups.
@@ -1588,6 +1594,18 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
     UmThread *th = um_thread_select();
     if (!th || !th->active) _exit(200);      /* never dispatch outside a run */
 
+    /* CLONE_CLEAR_SIGHAND asks the kernel to reset the child's signal handlers
+     * to SIG_DFL.  WEMU models signal dispositions process-wide (CLONE_SIGHAND
+     * shares them; there is no per-thread disposition table), so this knob
+     * cannot be honored.  Refuse BEFORE any host clone with an exact reason;
+     * with exact diagnostics off it falls through to the generic clone-flag
+     * policy below (OLD behaviour, negative control). */
+    if (g_cfg.exact_refuse_enabled && nr == VSL_SYS_CLONE &&
+        (a[0] & UM_CLONE_CLEAR_SIGHAND)) {
+        um_refuse_fast(uc, th, r, nr, WEMU_UM_REFUSE_CLONE_CLEAR_SIGHAND, -EINVAL);
+        return;
+    }
+
     /* Shared-VM CLONE_THREAD is the one path that must not hold the dispatch
      * lock: the new host thread resumes in the handler on the guest stack and
      * setcontext()s straight into guest code. */
@@ -1616,6 +1634,20 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
      * OLD generic -ENOSYS (negative control). */
     if (g_cfg.exact_refuse_enabled && nr == WEMU_UM_SYS_PIDFD_SEND_SIGNAL) {
         um_refuse_fast(uc, th, r, nr, WEMU_UM_REFUSE_PIDFD_SEND_SIGNAL, -EINVAL);
+        return;
+    }
+
+    /* pidfd_open(2) / pidfd_getfd(2) mint a process handle (a pidfd) or duplicate
+     * another process's fd into it.  WEMU models NO pidfd authority: there is
+     * no table of pidfds a guest obtained, so dispatching either to the host
+     * would hand it a handle to a process it never created.  Refuse before any
+     * host syscall with a dedicated reason.  With exact diagnostics off both
+     * are unlisted syscalls and keep the OLD generic -ENOSYS (negative control). */
+    if (g_cfg.exact_refuse_enabled &&
+        (nr == WEMU_UM_SYS_PIDFD_OPEN || nr == WEMU_UM_SYS_PIDFD_GETFD)) {
+        um_refuse_fast(uc, th, r, nr,
+            nr == WEMU_UM_SYS_PIDFD_OPEN ? WEMU_UM_REFUSE_PIDFD_OPEN
+                                         : WEMU_UM_REFUSE_PIDFD_GETFD, -EINVAL);
         return;
     }
 

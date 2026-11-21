@@ -69,6 +69,26 @@ static const char WANT_REFUSE2_OLD[] =
     "CGROUP-RC=-22\n"
     "FORKSHAPE-RC=-22\n";
 
+/* pidfd_open(getpid(),0) + pidfd_getfd(-1,-1,0) + raw clone with
+ * CLONE_CLEAR_SIGHAND|CLONE_SIGHAND.  Host proves the features are real;
+ * WEMU refuses all three with exact codes.  Exact OFF -> old generic -ENOSYS
+ * for the two pidfds, -EINVAL (no exact code) for the raw clone. */
+static const char WANT_REFUSE3[] =
+    "PIDFDOPEN-RC=-22\n"
+    "PIDFDGETFD-RC=-22\n"
+    "CLRCLEAR-RC=-22\n";
+static const char WANT_REFUSE3_OLD[] =
+    "PIDFDOPEN-RC=-38\n"
+    "PIDFDGETFD-RC=-38\n"
+    "CLRCLEAR-RC=-22\n";
+
+/* Positive bounded fork-shaped clone3 differential: child writes, parent
+ * wait4()s and emits only boolean invariants — no pid or raw status word. */
+static const char WANT_FORK[] =
+    "C3FORK-CHILD\n"
+    "C3FORK-WAIT-OK=1\n"
+    "C3FORK-PARENT\n";
+
 typedef struct { char b[WEMU_UM_OUT_MAX]; size_t n; } Cap;
 
 /* Independent oracle: the REAL host kernel runs the same fixture/argv. */
@@ -274,16 +294,16 @@ static void test_fail_closed(void) {
     /* Exact diagnostics: two pidfd shapes, CLONE_CLEAR_SIGHAND, the oversized
      * (future-sigmask) struct, and one unmodeled rt_sigprocmask. */
     if (r.refuses[WEMU_UM_REFUSE_CLONE3_PIDFD] != 2 ||
-        r.refuses[WEMU_UM_REFUSE_CLONE3_SIGMASK] != 1 ||
+        r.refuses[WEMU_UM_REFUSE_CLONE_CLEAR_SIGHAND] != 1 ||
         r.refuses[WEMU_UM_REFUSE_SIGPROCMASK] != 1 ||
         r.refuses[WEMU_UM_REFUSE_CLONE3_SIGMASK_SIZE] != 1)
-        FAIL("exact refusal reasons: pidfd=%u sigmask=%u procmask=%u size=%u\n",
+        FAIL("exact refusal reasons: pidfd=%u clear_sighand=%u procmask=%u size=%u\n",
              r.refuses[WEMU_UM_REFUSE_CLONE3_PIDFD],
-             r.refuses[WEMU_UM_REFUSE_CLONE3_SIGMASK],
+             r.refuses[WEMU_UM_REFUSE_CLONE_CLEAR_SIGHAND],
              r.refuses[WEMU_UM_REFUSE_SIGPROCMASK],
              r.refuses[WEMU_UM_REFUSE_CLONE3_SIGMASK_SIZE]);
     printf("        (host accepts pidfd+SIGPROCMASK; WEMU refuses with exact "
-           "reasons pidfd=2 sigmask=1 procmask=1 size=1)\n");
+           "reasons pidfd=2 clear_sighand=1 procmask=1 size=1)\n");
     printf("ok: FAIL-CLOSED pidfd/sigmask — no thread, exact refusal "
            "diagnostics, no host dispatch\n");
 }
@@ -436,6 +456,98 @@ static void test_fail_closed2(void) {
            "CLONE3_SHAPE=3 instead of four exact reasons\n");
 }
 
+/* ---- pidfd_open / pidfd_getfd / raw-clone CLEAR_SIGHAND exact refusals ---- */
+static void test_refuse3(void) {
+    Cap oracle;
+    int he = host_exec("3", &oracle);
+    if (he != 0) FAIL("host refuse3 exit=%d want 0\n", he);
+    long ho, hg, hc;
+    if (sscanf(oracle.b,
+               "PIDFDOPEN-RC=%ld\nPIDFDGETFD-RC=%ld\nCLRCLEAR-RC=%ld\n",
+               &ho, &hg, &hc) != 3)
+        FAIL("host oracle refuse3 output unparsable: [%s]\n", oracle.b);
+    if (ho <= 0 || hg != -9 || hc != -22)
+        FAIL("host oracle changed: pidfd_open=%ld pidfd_getfd=%ld clear=%ld\n",
+             ho, hg, hc);
+
+    WemuUmResult r;
+    int rc = wemu_exec("3", &r);
+    if (rc != WEMU_UM_OK)
+        FAIL("refuse3 status=%s out=[%s]\n", wemu_um_status_name(rc), r.out);
+    if (r.exit_code != 0) FAIL("refuse3 exit=%d want 0\n", r.exit_code);
+    check_exact("wemu refuse3", r.out, r.out_len, WANT_REFUSE3,
+                sizeof WANT_REFUSE3 - 1);
+    if (r.clone3_threads != 0 || r.threads_created != 0 || r.forks != 0)
+        FAIL("refuse3 created a process: c3=%u threads=%u forks=%u\n",
+             r.clone3_threads, r.threads_created, r.forks);
+    if (r.denied != 3)
+        FAIL("refuse3 denied=%llu want 3\n", (unsigned long long)r.denied);
+    if (r.refuses[WEMU_UM_REFUSE_PIDFD_OPEN] != 1 ||
+        r.refuses[WEMU_UM_REFUSE_PIDFD_GETFD] != 1 ||
+        r.refuses[WEMU_UM_REFUSE_CLONE_CLEAR_SIGHAND] != 1)
+        FAIL("refuse3 exact reasons: open=%u getfd=%u clear=%u\n",
+             r.refuses[WEMU_UM_REFUSE_PIDFD_OPEN],
+             r.refuses[WEMU_UM_REFUSE_PIDFD_GETFD],
+             r.refuses[WEMU_UM_REFUSE_CLONE_CLEAR_SIGHAND]);
+    printf("        (host open=%ld getfd=%ld clear=%ld; WEMU exact "
+           "open/getfd/clear=1/1/1)\n", ho, hg, hc);
+    printf("ok: FAIL-CLOSED pidfd_open/pidfd_getfd/CLONE_CLEAR_SIGHAND — "
+           "exact reasons, no host dispatch\n");
+
+    /* NEGATIVE CONTROL: exact OFF keeps the OLD diagnostics — the two pidfds
+     * are unlisted (-ENOSYS) and the raw clone is refused by the generic flag
+     * policy (-EINVAL) with no exact code recorded. */
+    if (wemu_um_set_exact_refuse_enabled(0) != 0)
+        FAIL("disable exact refuse diagnostics (refuse3)\n");
+    WemuUmResult old;
+    rc = wemu_exec("3", &old);
+    (void)wemu_um_set_exact_refuse_enabled(1);      /* restore default */
+    if (rc != WEMU_UM_OK || old.exit_code != 0)
+        FAIL("old-path refuse3: status=%s exit=%d\n",
+             wemu_um_status_name(rc), old.exit_code);
+    check_exact("wemu refuse3 old", old.out, old.out_len,
+                WANT_REFUSE3_OLD, sizeof WANT_REFUSE3_OLD - 1);
+    if (old.refuses[WEMU_UM_REFUSE_PIDFD_OPEN] != 0 ||
+        old.refuses[WEMU_UM_REFUSE_PIDFD_GETFD] != 0 ||
+        old.refuses[WEMU_UM_REFUSE_CLONE_CLEAR_SIGHAND] != 0 ||
+        old.denied != 3)
+        FAIL("old-path coarse refuse3: open=%u getfd=%u clear=%u denied=%llu\n",
+             old.refuses[WEMU_UM_REFUSE_PIDFD_OPEN],
+             old.refuses[WEMU_UM_REFUSE_PIDFD_GETFD],
+             old.refuses[WEMU_UM_REFUSE_CLONE_CLEAR_SIGHAND],
+             (unsigned long long)old.denied);
+    printf("ok: NEGATIVE CONTROL (coarse) — pidfd_open/getfd -ENOSYS, "
+           "CLONE_CLEAR_SIGHAND -EINVAL generic, no exact codes\n");
+}
+
+/* ---- positive byte-exact differential: bounded fork-shaped clone3 ------- */
+static void test_fork_positive(void) {
+    Cap oracle;
+    int he = host_exec("f", &oracle);
+    if (he != 0) FAIL("host fork exit=%d want 0\n", he);
+    check_exact("host fork", oracle.b, oracle.n, WANT_FORK,
+                sizeof WANT_FORK - 1);
+
+    WemuUmResult r;
+    int rc = wemu_exec("f", &r);
+    if (rc != WEMU_UM_OK)
+        FAIL("clone3 fork status=%s out=[%s]\n", wemu_um_status_name(rc), r.out);
+    if (r.exit_code != 0) FAIL("clone3 fork exit=%d want 0\n", r.exit_code);
+    /* The bounded fork shape creates ONE private COW child, no host thread. */
+    if (r.forks != 1 || r.clone3_threads != 0 || r.threads_created != 0 ||
+        r.denied != 0 || r.execs != 0)
+        FAIL("clone3 fork counts: forks=%u c3=%u threads=%u denied=%llu "
+             "execs=%u want 1/0/0/0/0\n", r.forks, r.clone3_threads,
+             r.threads_created, (unsigned long long)r.denied, r.execs);
+    for (unsigned i = 0; i < WEMU_UM_N_REFUSE; i++)
+        if (r.refuses[i]) FAIL("clone3 fork positive run refuse[%u]=%u\n",
+                               i, r.refuses[i]);
+    check_exact("wemu fork", r.out, r.out_len, oracle.b, oracle.n);
+    printf("        (forks=%u, threads=%u; byte-exact vs host)\n",
+           r.forks, r.threads_created);
+    printf("ok: BOUNDED clone3 FORK — positive byte-exact host differential\n");
+}
+
 int main(void) {
     wemu_um_reset_isolation();
     test_policy();
@@ -443,9 +555,12 @@ int main(void) {
     test_fail_closed();
     test_sigmask_virtual();
     test_fail_closed2();
+    test_refuse3();
+    test_fork_positive();
     test_negative_old_path();
     printf("WEMU BOUNDED CLONE3-THREAD GATE PASS (host-byte-exact bounded "
            "thread + virtual per-thread masks; pidfd/tid/cgroup/fork fail "
-           "closed; old paths refuse)\n");
+           "closed; exact pidfd/clear-sighand refusals; bounded clone3 fork "
+           "byte-exact; old paths refuse)\n");
     return 0;
 }
