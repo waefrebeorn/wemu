@@ -142,9 +142,13 @@ int wemu_um_clone_flags_modeled(uint64_t flags);
  * unlisted flag fails closed. */
 int wemu_um_clone_thread_flags_modeled(uint64_t flags);
 
-/* 1 when the execveat(dirfd, flags) pair stays inside the bounded model:
- * AT_FDCWD with no flags.  AT_EMPTY_PATH and every other flag/dirfd are
- * refused fail-closed (plain execve has no flags and is always eligible). */
+/* 1 when the execveat(dirfd, flags) SHAPE is inside the bounded model:
+ * AT_FDCWD + no flags (CWD-relative path), an fd >= 0 + no flags
+ * (dirfd-relative path), or an fd >= 0 + AT_EMPTY_PATH (execute the fd
+ * itself).  The runtime handler still requires the fd to be in the bounded
+ * guest fd table (opened/duplicated by the guest) — this predicate is the
+ * pure form check used by the gate.  Any other flag bit, AT_FDCWD with
+ * AT_EMPTY_PATH, and unknown/negative dirfd all fail closed. */
 int wemu_um_execveat_modeled(long dirfd, uint64_t flags);
 
 /* 1 when the leading bytes of an exec target form a well-formed, BOUNDED

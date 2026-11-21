@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -60,6 +61,51 @@ int main(int argc, char **argv) {
         execve("/no/such/wemu-exec-target", nargv, nenv);
         put_errno("BADPATH-RC", -errno);
         return 5;
+    }
+
+    /* NEW: execveat(fd, "", ..., AT_EMPTY_PATH) on a guest-opened fd.  On the
+     * host the kernel executes the file the fd describes; under WEMU the fd
+     * must be in the admitted guest fd table for the image to be replaced. */
+    if (argc >= 2 && strcmp(argv[1], "empty") == 0) {
+        int fd = (int)syscall(SYS_openat, AT_FDCWD, path, O_RDONLY, 0);
+        if (fd < 0) { put_errno("OPEN-RC", -errno); return 6; }
+        syscall(SYS_execveat, fd, "", nargv, nenv, AT_EMPTY_PATH);
+        put_errno("EMPTY-RC", -errno);
+        return 8;
+    }
+    /* NEW: fd-relative execveat(dirfd, base, ..., 0). */
+    if (argc >= 2 && strcmp(argv[1], "rel") == 0) {
+        const char *dir  = argc >= 3 ? argv[2] : "tests";
+        const char *base = argc >= 4 ? argv[3] : "exec_chain";
+        int dfd = (int)syscall(SYS_openat, AT_FDCWD, dir,
+                               O_RDONLY | O_DIRECTORY, 0);
+        if (dfd < 0) { put_errno("OPENDIR-RC", -errno); return 6; }
+        syscall(SYS_execveat, dfd, base, nargv, nenv, 0);
+        put_errno("REL-RC", -errno);
+        return 9;
+    }
+    /* NEW: an fd passed in by the harness (valid, executable on the host) but
+     * NEVER opened by the guest — must be refused by the fd admission table. */
+    if (argc >= 2 && strcmp(argv[1], "fdarg") == 0) {
+        int fd = atoi(argv[2]);
+        syscall(SYS_execveat, fd, "", nargv, nenv, AT_EMPTY_PATH);
+        put_errno("FDARG-RC", -errno);
+        return 13;
+    }
+
+    /* NEW: an fd the guest never opened must be refused (host -EBADF). */
+    if (argc >= 2 && strcmp(argv[1], "unknownfd") == 0) {
+        syscall(SYS_execveat, 9999, "", nargv, nenv, AT_EMPTY_PATH);
+        put_errno("UNKNOWNFD-RC", -errno);
+        return 10;
+    }
+    /* NEW: an unsupported flag bit must be refused (host -EINVAL). */
+    if (argc >= 2 && strcmp(argv[1], "badflags") == 0) {
+        int fd = (int)syscall(SYS_openat, AT_FDCWD, path, O_RDONLY, 0);
+        if (fd < 0) { put_errno("OPEN-RC", -errno); return 6; }
+        syscall(SYS_execveat, fd, "", nargv, nenv, AT_EMPTY_PATH | 0x2000u);
+        put_errno("BADFLAGS-RC", -errno);
+        return 11;
     }
 
     execve(path, nargv, nenv);

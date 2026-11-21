@@ -14,7 +14,7 @@ TESTS = test_isa test_avx test_paging test_machine test_string test_cpuid \
         test_segments test_cpl test_iret test_tss test_task_switch \
         test_task_gates test_ldt test_call_gate_priv test_task_gpr \
         test_usermode_native test_usermode_exec test_usermode_isolate \
-        test_usermode_mpk test_usermode_exec2
+        test_usermode_mpk test_usermode_exec2 test_usermode_execfd
 
 all: libwemu.a
 
@@ -52,6 +52,10 @@ test_usermode_exec: tests/test_usermode_exec.c libwemu.a $(EXEC_FIX) $(PIE_DYN)
 
 # Bounded #! script + forked-child exec differential gate.
 test_usermode_exec2: tests/test_usermode_exec2.c libwemu.a $(EXEC2_FIX) $(EXEC_FIX)
+	$(CC) $(CFLAGS) -o $@ $< libwemu.a -lm
+
+# Bounded fd-relative execveat differential gate (reuses exec_chain fixture).
+test_usermode_execfd: tests/test_usermode_execfd.c libwemu.a $(EXEC_FIX)
 	$(CC) $(CFLAGS) -o $@ $< libwemu.a -lm
 
 # Freestanding process-per-guest isolation differential guest (raw syscalls).

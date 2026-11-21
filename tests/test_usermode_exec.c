@@ -120,12 +120,18 @@ static void test_reset(void) {
 }
 
 static void test_policy(void) {
+    /* Pure SHAPE predicate.  Runtime fd admission is a separate check in the
+     * handler; here we only assert which (dirfd, flags) forms are eligible. */
     if (wemu_um_execveat_modeled(AT_FDCWD, 0) != 1 ||
         wemu_um_execveat_modeled(AT_FDCWD, AT_EMPTY_PATH) != 0 ||
-        wemu_um_execveat_modeled(3, 0) != 0)
-        FAIL("execveat policy: only AT_FDCWD+no flags may be modeled\n");
-    printf("ok: FAIL-CLOSED execveat policy — AT_FDCWD/no-flags only; "
-           "AT_EMPTY_PATH and fd-relative refused\n");
+        wemu_um_execveat_modeled(3, 0) != 1 ||
+        wemu_um_execveat_modeled(3, AT_EMPTY_PATH) != 1 ||
+        wemu_um_execveat_modeled(3, AT_EMPTY_PATH | 0x2000u) != 0 ||
+        wemu_um_execveat_modeled(-1, 0) != 0)
+        FAIL("execveat policy: CWD/no-flags and fd-relative/fd-exec forms only; "
+             "unsupported flags and AT_FDCWD+AT_EMPTY_PATH refused\n");
+    printf("ok: FAIL-CLOSED execveat policy — CWD/fd-relative/fd-exec shapes; "
+           "other flags, AT_FDCWD+AT_EMPTY_PATH, unknown fd refused\n");
 }
 
 static void test_fail_closed(void) {

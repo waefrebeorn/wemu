@@ -90,6 +90,7 @@
 #define WEMU_UM_SYS_DUP3         292 /* not in the VSL table */
 #define WEMU_UM_SYS_EXECVEAT     322 /* not in the VSL table */
 #define UM_AT_FDCWD              (-100)
+#define UM_AT_EMPTY_PATH         0x1000u /* fcntl.h AT_EMPTY_PATH (x86-64) */
 #define UM_ARCH_GET_FS           0x1003
 #define UM_ARCH_SET_FS           0x1002
 #define SIG_DFL_ 0
@@ -211,6 +212,7 @@ enum { UM_WHY_EXIT = 1, UM_WHY_FAULT, UM_WHY_BUDGET, UM_WHY_ALARM, UM_WHY_BADPTR
  * window, the SysV stack, the bounded brk heap and guest mmap results.  A
  * pointer outside ALL of them is refused before any host syscall sees it. */
 #define UM_MAX_MMAPS  16u
+#define UM_MAX_GUEST_FDS 32u          /* bounded admitted-fd table for execveat */
 #define UM_HEAP_MAX   (16u << 20)   /* max brk growth above the initial break */
 
 /* Number of general registers in mcontext_t (compile-time, no magic 23). */
@@ -271,6 +273,13 @@ static struct {
     uint64_t heap_lo, heap_hi;     /* bounded brk heap [initial break, current] */
     uint64_t mmap_lo[UM_MAX_MMAPS], mmap_hi[UM_MAX_MMAPS];
     uint32_t n_mmaps;
+    /* Bounded guest fd table: fd numbers the guest legitimately obtained
+     * (openat/dup3).  execveat with AT_EMPTY_PATH or a dirfd-relative path is
+     * admitted ONLY for an fd in this table, so a guest cannot execute a file
+     * described by a supervisor fd it never opened.  fd state is process-wide
+     * (CLONE_FILES shares it), so it lives here, guarded by the dispatch lock. */
+    long     guest_fds[UM_MAX_GUEST_FDS];
+    uint32_t n_guest_fds;
     uint64_t arena_lo, arena_hi;   /* registered MAP_SHARED guest arena */
     volatile uint32_t bad_ptrs;    /* pointers refused before host dispatch */
     volatile uint32_t bad_ptr_nr;
@@ -473,6 +482,9 @@ static uint64_t g_host_fs;
 typedef struct {
     uint32_t nr;
     uint64_t pathp, argvp, envpp;
+    long     dirfd;                  /* execveat dirfd (AT_FDCWD for execve) */
+    uint64_t flags;                  /* execveat flags (0 for execve) */
+    uint8_t  empty_path;             /* AT_EMPTY_PATH: path names an fd, not a path */
     size_t   used;
     char     store[UM_EXEC_STORE];
     const char *path;
@@ -991,39 +1003,84 @@ static int64_t um_do_fork(UmThread *th) {
     return pid;
 }
 
-/* execveat is modelled only for AT_FDCWD with no flags: AT_EMPTY_PATH would
- * let a guest execute a file described by a host fd, and every other flag
- * changes path resolution.  Both are refused fail-closed. */
-int wemu_um_execveat_modeled(long dirfd, uint64_t flags) {
-    return dirfd == UM_AT_FDCWD && flags == 0;
+/* ---- bounded guest fd table for execveat ---------------------------- */
+/* openat/dup3 results the guest legitimately obtained are recorded here; an
+ * execveat that needs an fd (AT_EMPTY_PATH or a dirfd-relative path) is
+ * admitted ONLY for a number in this table.  A guest cannot reference a file
+ * described by a supervisor fd it never opened.  Bounded and process-wide
+ * (CLONE_FILES shares fds), so it lives in g_um under the dispatch lock. */
+static void um_fd_admit(long fd) {
+    if (fd < 0 || g_um.n_guest_fds >= UM_MAX_GUEST_FDS) return;
+    for (uint32_t i = 0; i < g_um.n_guest_fds; i++)
+        if (g_um.guest_fds[i] == fd) return;
+    g_um.guest_fds[g_um.n_guest_fds++] = fd;
+}
+static int um_fd_is_admitted(long fd) {
+    if (fd < 0) return 0;
+    for (uint32_t i = 0; i < g_um.n_guest_fds; i++)
+        if (g_um.guest_fds[i] == fd) return 1;
+    return 0;
 }
 
-/* Normalise execve / execveat register args to (path, argv, envp).  Returns 0
- * when the syscall variant/flags are outside the bounded model. */
-static int um_exec_args(uint64_t nr, const uint64_t a[6],
-                        uint64_t *pathp, uint64_t *argvp, uint64_t *envpp) {
+/* execveat SHAPE predicate (pure; no runtime fd state).  1 when (dirfd,flags)
+ * is a form the bounded model can honour:
+ *   AT_FDCWD + no flags          -> CWD-relative path
+ *   fd >= 0 + no flags           -> dirfd-relative path (fd checked at runtime)
+ *   fd >= 0 + AT_EMPTY_PATH      -> execute the fd itself  (runtime-checked)
+ * AT_FDCWD+AT_EMPTY_PATH (no fd), unknown/negative dirfd and ANY other flag bit
+ * fail closed.  The caller pairs this with um_fd_is_admitted(). */
+int wemu_um_execveat_modeled(long dirfd, uint64_t flags) {
+    if (flags & ~(uint64_t)UM_AT_EMPTY_PATH) return 0;
+    int empty = (flags & UM_AT_EMPTY_PATH) != 0;
+    if (dirfd == UM_AT_FDCWD) return !empty;   /* no fd to use with EMPTY_PATH */
+    return dirfd >= 0;                         /* runtime admission still required */
+}
+
+typedef struct {
+    uint64_t pathp, argvp, envpp;
+    long     dirfd;
+    uint64_t flags;
+    uint8_t  empty_path, fd_needed;
+} UmExecArgs;
+
+/* Normalise execve / execveat register args into a bounded request.  Returns
+ * 0 when the syscall variant/flags are outside the bounded model. */
+static int um_exec_args(uint64_t nr, const uint64_t a[6], UmExecArgs *ea) {
+    memset(ea, 0, sizeof *ea);
+    ea->dirfd = UM_AT_FDCWD;
     if (nr == VSL_SYS_EXECVE) {
-        *pathp = a[0]; *argvp = a[1]; *envpp = a[2];
+        ea->pathp = a[0]; ea->argvp = a[1]; ea->envpp = a[2];
         return 1;
     }
     if (nr == WEMU_UM_SYS_EXECVEAT) {
-        if (!wemu_um_execveat_modeled((long)a[0], a[4])) return 0;
-        *pathp = a[1]; *argvp = a[2]; *envpp = a[3];
+        /* execveat's dirfd is an int; the kernel reads only the low 32 bits.
+         * A guest passing AT_FDCWD (-100) through glibc's vararg syscall()
+         * leaves the upper half zero (0x00000000ffffff9c), so normalise by
+         * sign-extending the low word before comparing with AT_FDCWD. */
+        long dirfd = (long)(int32_t)a[0];
+        uint64_t flags = a[4];
+        if (!wemu_um_execveat_modeled(dirfd, flags)) return 0;
+        ea->dirfd = dirfd;
+        ea->flags = flags;
+        ea->empty_path = (flags & UM_AT_EMPTY_PATH) != 0;
+        ea->fd_needed = (dirfd != UM_AT_FDCWD);
+        ea->pathp = a[1]; ea->argvp = a[2]; ea->envpp = a[3];
         return 1;
     }
     return 0;
 }
 
-/* Handler-side gate: nothing is loaded here; just refuse obviously bad
- * guest pointers before redirecting to host context.  The authoritative,
- * bounded string/vector copy happens in um_exec_continue. */
-static int um_exec_args_ok(uint64_t nr, const uint64_t a[6]) {
-    uint64_t pathp, argvp, envpp;
-    if (!um_exec_args(nr, a, &pathp, &argvp, &envpp)) return 0;
-    if (!pathp || !argvp) return 0;
-    if (!um_chk_str(nr, pathp) || !um_chk(nr, argvp, (UM_EXEC_MAX_NARG + 1u) * 8u)) return 0;
-    if (envpp && !um_chk(nr, envpp, (UM_EXEC_MAX_NARG + 1u) * 8u)) return 0;
-    return 1;
+/* Handler-side gate.  Reason: 0 = admitted, 1 = unsupported form/flags,
+ * 2 = unadmitted/bad fd, 3 = bad guest pointers.  Nothing is loaded here; the
+ * authoritative bounded string/vector copy happens in um_exec_continue. */
+static int um_exec_check(uint64_t nr, const uint64_t a[6], UmExecArgs *ea) {
+    if (!um_exec_args(nr, a, ea)) return 1;
+    if (ea->fd_needed && !um_fd_is_admitted(ea->dirfd)) return 2;
+    if (!ea->pathp || !ea->argvp) return 3;
+    if (!um_chk_str(nr, ea->pathp) ||
+        !um_chk(nr, ea->argvp, (UM_EXEC_MAX_NARG + 1u) * 8u)) return 3;
+    if (ea->envpp && !um_chk(nr, ea->envpp, (UM_EXEC_MAX_NARG + 1u) * 8u)) return 3;
+    return 0;
 }
 
 /* Host call with the dispatch lock dropped: a guest thread blocked in
@@ -1097,9 +1154,14 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
      * slot 0 of its own private address space — its is_root=0 is preserved
      * across the replacement so its exit still reports through wait4. */
     if (e->kind == WEMU_UM_DISPATCH_EXECVE) {
-        if (!um_exec_args_ok(nr, a)) {
+        UmExecArgs ea;
+        int reason = um_exec_check(nr, a, &ea);
+        if (reason) {
             um_note_denied(nr);
-            r[REG_RAX] = (greg_t)-EINVAL;
+            /* An fd the guest never opened is a bad fd (host -EBADF); every
+             * other refusal is an invalid form/argument (-EINVAL).  Both leave
+             * the current image intact and increment `denied`. */
+            r[REG_RAX] = (greg_t)(reason == 2 ? -EBADF : -EINVAL);
             um_skip_syscall(r);
             if (g_um.denied > 8) um_abort_to_finish(uc, th, UM_WHY_BUDGET);
             um_unlock();
@@ -1115,13 +1177,15 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
             um_unlock();
             return;
         }
-        /* Save only guest pointers; strings are copied in host context where
-         * %fs is the HOST's, so malloc/stdio are safe.  Rewriting the SigSYS
-         * ucontext resumes um_exec_continue on the original host stack with
-         * correct SysV entry alignment (RSP % 16 == 8). */
+        /* Save only guest pointers + the exec source; strings are copied in
+         * host context where %fs is the HOST's, so malloc/stdio are safe.
+         * Rewriting the SigSYS ucontext resumes um_exec_continue on the
+         * original host stack with correct SysV entry alignment (RSP%16==8). */
         memset(&g_exec, 0, sizeof g_exec);
         g_exec.nr = (uint32_t)nr;
-        (void)um_exec_args(nr, a, &g_exec.pathp, &g_exec.argvp, &g_exec.envpp);
+        g_exec.pathp = ea.pathp; g_exec.argvp = ea.argvp; g_exec.envpp = ea.envpp;
+        g_exec.dirfd = ea.dirfd; g_exec.flags = ea.flags;
+        g_exec.empty_path = ea.empty_path;
         uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)um_exec_continue;
         uc->uc_mcontext.gregs[REG_RSP] =
             ((th->child_rsp - 16) & ~(greg_t)15) + 8;
@@ -1232,6 +1296,11 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
         }
     } else {
         ret = um_host_unlocked(nr, a);
+        /* A successfully opened/duplicated fd becomes an admitted guest fd:
+         * the guest legitimately owns it and may later describe an execveat
+         * target with it.  Unknown/neverbefore fds stay unadmitted. */
+        if (ret >= 0 && nr == VSL_SYS_OPENAT) um_fd_admit((long)ret);
+        if (ret >= 0 && nr == WEMU_UM_SYS_DUP3) um_fd_admit((long)a[1]);
     }
 
     r[REG_RAX] = (greg_t)ret;
@@ -1329,6 +1398,44 @@ static uint8_t *um_read_file(const char *path, size_t *len) {
     return buf;
 }
 
+/* Read an exec target from one of three bounded sources:
+ *   empty_path      -> read the admitted fd itself (AT_EMPTY_PATH);
+ *   dirfd == AT_FDCWD -> open(path) relative to the current directory;
+ *   otherwise       -> openat(admitted dirfd, path) (fd-relative).
+ * A borrowed fd is read with pread() so the guest's own file offset is left
+ * untouched across the (emulated) image replacement.  An unreadable/oversize
+ * source fails closed with NULL; no image is loaded. */
+static uint8_t *um_read_target(const char *path, long dirfd, int empty_path,
+                               size_t *len) {
+    int fd, owned = 0;
+    if (empty_path) {
+        fd = (int)dirfd;                       /* already admitted by the handler */
+    } else if (dirfd == UM_AT_FDCWD) {
+        fd = open(path, O_RDONLY); owned = 1;
+    } else {
+        fd = openat((int)dirfd, path, O_RDONLY); owned = 1;
+    }
+    if (fd < 0) return NULL;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0 ||
+        (uint64_t)st.st_size > (1u << 28)) {
+        if (owned) close(fd);
+        return NULL;
+    }
+    size_t n = (size_t)st.st_size;
+    uint8_t *buf = malloc(n);
+    if (!buf) { if (owned) close(fd); return NULL; }
+    size_t got = 0;
+    while (got < n) {
+        ssize_t k = pread(fd, buf + got, n - got, (off_t)got);
+        if (k <= 0) { free(buf); if (owned) close(fd); return NULL; }
+        got += (size_t)k;
+    }
+    if (owned) close(fd);
+    *len = n;
+    return buf;
+}
+
 /* Fail if the link-address window overlaps anything already mapped in the
  * child: MAP_FIXED would otherwise silently overwrite host text/libc. */
 static int um_range_free(uint64_t lo, uint64_t hi) {
@@ -1364,9 +1471,10 @@ static int um_pick_bias(uint64_t vlo, uint64_t vhi, uint64_t *out) {
 /* Map an ET_EXEC at its link addresses, or an ET_DYN (PIE) at a chosen load
  * bias.  A PT_INTERP image is flagged (not loaded) and refused by the caller:
  * running ld.so / shared objects is deliberately out of scope. */
-static int um_load(const char *path, UmImage *im) {
+static int um_load_from(const char *path, long dirfd, int empty_path,
+                        UmImage *im) {
     memset(im, 0, sizeof *im);
-    im->file = um_read_file(path, &im->len);
+    im->file = um_read_target(path, dirfd, empty_path, &im->len);
     if (!im->file || im->len < sizeof(Elf64_Ehdr)) return -1;
     Elf64_Ehdr eh;
     memcpy(&eh, im->file, sizeof eh);
@@ -1454,6 +1562,11 @@ static int um_load(const char *path, UmImage *im) {
             return -1;
     }
     return 0;
+}
+
+/* Common path-only source: the initial guest run and script interpreters. */
+static int um_load(const char *path, UmImage *im) {
+    return um_load_from(path, UM_AT_FDCWD, 0, im);
 }
 
 /* ---- SysV initial stack --------------------------------------------- */
@@ -1680,13 +1793,20 @@ static void um_exec_continue(void) {
     int loaded = 0;
 
     for (unsigned depth = 0; depth <= WEMU_UM_MAX_SCRIPT_DEPTH; depth++) {
-        file = um_read_file(cur_path, &file_len);
+        /* Depth 0 is the execveat target (CWD path, admitted dirfd-relative
+         * path, or the admitted fd itself).  Deeper hops are #! interpreters,
+         * always plain paths resolved like a normal execve. */
+        file = depth == 0
+            ? um_read_target(g_exec.path, g_exec.dirfd, g_exec.empty_path, &file_len)
+            : um_read_file(cur_path, &file_len);
         if (!file) um_child_fail(shared, WEMU_UM_ERR_FORMAT);
         UmShebang sh;
         int sp = um_parse_shebang((const char *)file, file_len, &sh);
         if (sp < 0) { free(file); um_child_fail(shared, WEMU_UM_ERR_SCRIPT); }
         if (sp == 0) {                         /* plain ELF candidate */
-            int rc = um_load(cur_path, &im);
+            int rc = depth == 0
+                ? um_load_from(g_exec.path, g_exec.dirfd, g_exec.empty_path, &im)
+                : um_load(cur_path, &im);
             free(file);
             if (rc == -2) um_child_fail(shared, WEMU_UM_ERR_RANGE);
             if (rc != 0) um_child_fail(shared, WEMU_UM_ERR_FORMAT);

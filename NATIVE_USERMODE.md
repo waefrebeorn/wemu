@@ -107,22 +107,31 @@ untrusted-guest sandbox. Nothing here is enabled implicitly by `wemu_cpu_run`.
   stays fork-only: any pidfd/tid/tls/stack knob or nonzero flags is refused.
   `execve` is now a bounded image replacement (see below); pidfd-bearing
   `clone3` remains unlisted.
-- **Bounded execve**: `execve`/`execveat` are listed and routed to a dedicated
-  handler.  The SIGSYS handler only checks the path/vector pointers and
-  saves the three guest pointers; it refuses unsupported `execveat` flags
-  (`AT_EMPTY_PATH`, fd-relative), bad pointers, a non-root/forked/threaded
-  guest, and an exhausted budget with `-EINVAL`/`-EBUSY` and `denied++`.
-  On the accepted path it rewrites the SigSYS ucontext to resume on the
-  ORIGINAL host stack, restores the HOST `%fs` (so the loader's malloc/stdio
-  use host TLS), copies bounded strings/vectors (`<=64` entries, `<=256`
-  bytes each, 16 KiB store), and loads a new validated static `ET_EXEC`/
-  `ET_DYN` image.  A `PT_INTERP` target refuses with `WEMU_UM_ERR_INTERP`;
-  a malformed/missing target with `WEMU_UM_ERR_FORMAT`.  The old image and
+- **Bounded execve / execveat**: `execve`/`execveat` are listed and routed to a
+  dedicated handler.  `execveat` admits only `AT_FDCWD`+no flags (a CWD path),
+  `fd >= 0`+no flags (a dirfd-relative path) and `fd >= 0`+`AT_EMPTY_PATH`
+  (execute the fd itself); ANY other flag bit, `AT_FDCWD`+`AT_EMPTY_PATH` and
+  unknown/negative dirfd fail closed.  An fd-relative form additionally
+  requires the fd to be in a bounded, process-wide **admitted guest fd table**
+  populated only by successful guest `openat`/`dup3` — a guest cannot execute
+  a file described by a supervisor fd it never opened.  The SIGSYS handler
+  checks pointers/flags/fd admission and saves the exec source; it returns
+  `-EINVAL` for a bad form, `-EBADF` for an unadmitted fd and `-EBUSY` for a
+  non-root/threaded guest or exhausted budget (`denied++` throughout).  On
+  the accepted path it rewrites the SigSYS ucontext to resume on the ORIGINAL
+  host stack, restores the HOST `%fs` (so the loader's malloc/stdio use host
+  TLS), copies bounded strings/vectors (`<=64` entries, `<=256` bytes each,
+  16 KiB store), and loads a new validated static `ET_EXEC`/`ET_DYN` image
+  resolved by `open(path)`, `openat(dirfd, path)` or `pread(fd)` respectively.
+  A `PT_INTERP` target refuses with `WEMU_UM_ERR_INTERP`; a malformed/missing
+  target with `WEMU_UM_ERR_FORMAT`.  The old image and
   old stack are unmapped, every per-run counter/signal/heap/mmap/thread
   state is reset, a new additive seccomp trap window is installed for the
   new image, and `setcontext()` enters its `e_entry`.  `execs` is monotonic
-  and capped at `WEMU_UM_MAX_EXECS` (4).  `test_usermode_exec` is the
-  differential gate: a real self-exec chain is byte-exact vs host `execve`.
+  and capped at `WEMU_UM_MAX_EXECS` (4).  Differential gates: `test_usermode_exec`
+  (self-exec chain byte-exact vs host `execve`) and `test_usermode_execfd`
+  (AT_EMPTY_PATH on an admitted fd and dirfd-relative path byte-exact vs host
+  `execveat`; unadmitted-supervisor-fd / unknown-fd / unsupported-flag controls).
 - **Bounded thread group**: at most `WEMU_UM_MAX_THREADS - 1` shared-VM host
   threads per run, counted in the shared result page.  Exhaustion returns
   `-EAGAIN` and increments `denied`.  Thread state is a fixed slot table
@@ -233,9 +242,10 @@ table entry against the kernel's `asm/unistd_64.h`.
   unmodified 1b09ea3 executor to show the old path has no pkey evidence and
   leaks when isolation is off. LTP,
   `pthread_create`, vfork sharing, clone3 pidfds and guest signal masks are
-  not yet modelled. `execve` only replaces static
-  ET_EXEC/ET_DYN images: PT_INTERP (ld.so), fd-relative `execveat`, exec from
-  a forked child or a process with live shared-VM threads, dynamic loaders,
-  and ELF interpreter/fd scripts are refused. Seccomp windows accumulate
-  across execs (bounded to `WEMU_UM_MAX_EXECS`), and XMM/x87 state is not
-  reset across a replacement.
+  not yet modelled. Exec only replaces static ET_EXEC/ET_DYN images:
+  PT_INTERP (ld.so), dynamic loaders, exec from a task with live shared-VM
+  threads, and ELF interpreter scripts are refused. Bounded fd-relative
+  `execveat` (admitted-fd AT_EMPTY_PATH and dirfd-relative path) IS modelled;
+  CLOEXEC/reopen fd aliasing and AT_SYMLINK_NOFOLLOW are not. Seccomp windows
+  accumulate across execs (bounded to `WEMU_UM_MAX_EXECS`), and XMM/x87 state
+  is not reset across a replacement.
