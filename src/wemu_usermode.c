@@ -55,7 +55,14 @@
  * A timer that fires while that one slot is busy, a missing arming thread,
  * periodic intervals, other which values, out-of-range delays and any timer
  * signal other than SIGALRM fail closed with exact WEMU_UM_REFUSE_TIMER_*
- * reasons.  True asynchronous delivery and nested delivery are not modelled.
+ * reasons.  BOUNDED NESTED DELIVERY: a signal queued while a handler on the
+ * same thread is still live is admitted up to WEMU_UM_MAX_SIG_NEST levels by
+ * pushing a self-contained saved-context frame; rt_sigreturn pops the frame
+ * and resumes the interrupted handler byte-exact.  Masks, dispositions and
+ * the virtual altstack are consulted at every level; exceeding the bounded
+ * depth, switching the path off, or taking a genuine fault inside a handler
+ * fails closed with exact WEMU_UM_REFUSE_NEST_* reasons.  True asynchronous
+ * host delivery and unbounded recursion remain unmodeled.
  *
  * Bounded fork/clone: fork/vfork, clone and clone3 are dispatched in-process.
  * A fork-shaped request (CSIGNAL 0/SIGCHLD, optionally the two glibc TID
@@ -408,6 +415,21 @@ typedef struct {
     int      uid;                    /* si_uid for SI_TKILL */
 } UmSigEvent;
 
+/* One saved delivery context.  A signal delivered while a previous handler
+ * is live pushes one of these onto the thread's bounded stack; rt_sigreturn
+ * pops the top and restores the interrupted handler's registers verbatim.
+ * Keeping the FP blob WITH its register set (instead of one process-wide
+ * scratch area) is what makes nested delivery correct: each level resumes
+ * with exactly the FP/GPR state it had when it was interrupted. */
+typedef struct {
+    greg_t   gregs[UM_NGREG];
+    uint8_t  fp[UM_FPSTATE_MAX];
+    size_t   fp_len;
+    uintptr_t uc_at;                  /* guest address of the synthetic ucontext
+                                       * whose FP edits sigreturn must honor */
+    int      alt_onstack;            /* frame was placed on the virtual altstack */
+} UmSigCtx;
+
 /* Per-thread run state.  The guest owns %fs, so THIS cannot be __thread;
  * instead each bounded host thread owns a slot, selected by raw gettid().
  * Shared address-space state (ranges, counters, fd table, result page)
@@ -419,17 +441,14 @@ typedef struct {
     volatile int why;
     volatile int exit_code;
     greg_t child_rsp;                /* stack for the abort/finish path */
-    volatile int in_handler;         /* one live guest-signal delivery/thread */
-    int saved_valid;
-    greg_t saved_gregs[UM_NGREG];
-    /* FP/XMM/x87 state saved at delivery from the kernel ucontext and put
-     * back by rt_sigreturn.  `saved_fp` is a verbatim copy of the kernel's
-     * FXSAVE/XSAVE blob (bounded by UM_FPSTATE_MAX); `saved_uc_at` is the
-     * guest address of the synthetic ucontext we built so sigreturn can
-     * honor handler edits to uc_mcontext.fpregs. */
-    uint8_t  saved_fp[UM_FPSTATE_MAX];
-    size_t   saved_fp_len;
-    uintptr_t saved_uc_at;
+    /* Bounded nested-delivery stack.  sig_depth is the number of LIVE guest
+     * signal deliveries on this thread (0 = none).  Each entry is a fully
+     * self-contained saved context: a nested delivery pushes one frame,
+     * rt_sigreturn pops it.  sig_depth is sig_atomic_t so async signal code
+     * (um_fault/um_alarm) can read it safely. */
+    volatile sig_atomic_t sig_depth;
+    UmSigCtx sig_ctx[WEMU_UM_MAX_SIG_NEST];
+    int saved_valid;                 /* retained: 1 while sig_depth > 0 */
     volatile uint32_t sig_deliveries;
     volatile uint32_t sig_denied;
     uint64_t clone_flags;            /* raw flags used to create this thread */
@@ -450,10 +469,12 @@ typedef struct {
     UmSigEvent pending_ev;
     volatile int pending;
     /* Bounded per-thread alternate signal stack (sigaltstack).  The kernel
-     * does NOT inherit an altstack across clone, so new slots start at zero.
-     * `alt_onstack` is set for the duration of an SA_ONSTACK delivery so a
-     * sigaltstack QUERY inside the handler reports SS_ONSTACK exactly as the
-     * kernel does; rt_sigreturn clears it.  No host altstack is installed. */
+     * kernel does NOT inherit an altstack across clone, so new slots start at zero.
+     * `alt_onstack` mirrors the TOP frame's alt_onstack: it is set for the
+     * duration of an SA_ONSTACK delivery so a sigaltstack QUERY inside the
+     * handler reports SS_ONSTACK exactly as the kernel does, and is restored
+     * from the popped frame on nested rt_sigreturn.  No host altstack is
+     * installed. */
     uint64_t alt_sp;
     uint64_t alt_size;
     volatile int alt_onstack;
@@ -580,6 +601,7 @@ static struct {
     int pidfd_authority_enabled; /* bounded pidfd authority (OLD path off) */
     int sigaltstack_enabled;    /* sigaltstack virtualization (OLD path off) */
     int onstack_enabled;        /* SA_ONSTACK frame placement (OLD path off) */
+    int nested_enabled;         /* bounded nested delivery (OLD path off) */
 } g_cfg = { .enabled = 1, .pkey_mode = WEMU_UM_PKEY_AUTO,
             .thread_exec_enabled = 1, .clone3_thread_enabled = 1,
             .sigmask_virtual_enabled = 1, .thread_disp_enabled = 1,
@@ -589,7 +611,8 @@ static struct {
             .exact_refuse_enabled = 1, .fd_ofd_check_enabled = 1,
             .fd_kcmp_forced_off = 0, .fd_cloexec_refuse = 0,
             .pidfd_authority_enabled = 1,
-            .sigaltstack_enabled = 1, .onstack_enabled = 1 };
+            .sigaltstack_enabled = 1, .onstack_enabled = 1,
+            .nested_enabled = 1 };
 
 /* CPU-enforced protection-key state, built in the forked guest child before
  * the first guest instruction.  PKRU is per-thread: the supervisor (parent)
@@ -639,6 +662,7 @@ void wemu_um_reset_isolation(void) {
     g_cfg.pidfd_authority_enabled = 1;
     g_cfg.sigaltstack_enabled = 1;
     g_cfg.onstack_enabled = 1;
+    g_cfg.nested_enabled = 1;
     memset(&g_um.pidfds, 0, sizeof g_um.pidfds);
     g_um.n_pidfds = 0;
 }
@@ -694,6 +718,12 @@ int wemu_um_set_sigaltstack_enabled(int enabled) {
 int wemu_um_set_onstack_enabled(int enabled) {
     if (enabled != 0 && enabled != 1) return -1;
     g_cfg.onstack_enabled = enabled;
+    return 0;
+}
+
+int wemu_um_set_nested_enabled(int enabled) {
+    if (enabled != 0 && enabled != 1) return -1;
+    g_cfg.nested_enabled = enabled;
     return 0;
 }
 
@@ -1632,27 +1662,32 @@ static int64_t um_sigaltstack(UmThread *th, const uint64_t a[6]) {
 /* Guest rt_sigreturn: put the fault-time registers AND FP state back.  The
  * ucontext we are returning from is the SIGSYS one raised by this very
  * syscall, so the kernel resumes at the restored RIP with the restored FP
- * state.  The guest handler saw a synthetic ucontext at `saved_uc_at` whose
- * __fpregs_mem holds the XMM/x87 FXSAVE state; honour edits the handler made
- * there exactly as a real kernel's rt_sigreturn would, overlay them on the
+ * state.  The guest handler saw a synthetic ucontext at the popped frame's
+ * `uc_at` whose __fpregs_mem holds the XMM/x87 FXSAVE state; honour edits the
+ * handler made there exactly as a real kernel's rt_sigreturn would, overlay them on the
  * verbatim kernel blob we saved at delivery, and write the whole bounded blob
  * back.  A bad destination fails closed: no partial FP write. */
 static void um_sigreturn(UmThread *th, ucontext_t *uc) {
     greg_t *r = uc->uc_mcontext.gregs;
-    if (!th->in_handler || !th->saved_valid) {
+    if (th->sig_depth <= 0 || !th->saved_valid) {
         th->sig_denied++;
         r[REG_RAX] = (greg_t)-EINVAL;
         um_skip_syscall(r);
         return;
     }
-    if (th->saved_fp_len) {
+    /* Pop the TOP context.  A nested sigreturn resumes the interrupted
+     * handler (or the original guest when the stack empties) with the exact
+     * GPR/FP state it had at delivery — this is the whole point of keeping a
+     * per-level context rather than one process-wide scratch slot. */
+    UmSigCtx *ctx = &th->sig_ctx[th->sig_depth - 1];
+    if (ctx->fp_len) {
         fpregset_t dst = uc->uc_mcontext.fpregs;
-        size_t n = th->saved_fp_len;
+        size_t n = ctx->fp_len;
         if (dst && um_fpstate_len(dst) == n) {
-            /* `saved_fp` is consumed by this sigreturn, so overlay in place
+            /* `ctx->fp` is consumed by this sigreturn, so overlay in place
              * instead of using an 8 KiB stack buffer in the signal handler. */
-            uint8_t *blob = th->saved_fp;
-            uintptr_t uc_at = (uintptr_t)th->saved_uc_at;
+            uint8_t *blob = ctx->fp;
+            uintptr_t uc_at = (uintptr_t)ctx->uc_at;
             size_t legacy = sizeof(((ucontext_t *)0)->__fpregs_mem);
             if (uc_at && um_ptr_ok((uint64_t)uc_at, sizeof(ucontext_t)) &&
                 legacy <= n)
@@ -1664,12 +1699,13 @@ static void um_sigreturn(UmThread *th, ucontext_t *uc) {
             g_um.result->fpstate_unsupported++;
         }
     }
-    memcpy(r, th->saved_gregs, sizeof th->saved_gregs);
-    th->saved_valid = 0;
-    th->in_handler = 0;
-    th->alt_onstack = 0;             /* sigaltstack query is no longer on-stack */
-    th->saved_fp_len = 0;
-    th->saved_uc_at = 0;
+    memcpy(r, ctx->gregs, sizeof ctx->gregs);
+    th->sig_depth--;
+    th->saved_valid = th->sig_depth > 0;
+    /* Mirror the altstack flag of the now-top frame so a sigaltstack query
+     * in the resumed handler still reports SS_ONSTACK when appropriate. */
+    th->alt_onstack = th->sig_depth > 0
+                    ? th->sig_ctx[th->sig_depth - 1].alt_onstack : 0;
     /* Deliberately no um_skip_syscall: RIP is now the faulting instruction. */
 }
 
@@ -1805,7 +1841,9 @@ static int um_clone3_classify(const uint64_t a[6], UmCloneArgs *ca, int *reason)
 
 /* One shared counter bounds the whole process tree, not just this process. */
 static int64_t um_do_fork(UmThread *th) {
-    if (th->in_handler) { __atomic_fetch_add(&g_um.denied, 1, __ATOMIC_SEQ_CST); return -EPERM; }
+    /* A fork/clone from inside a live signal handler stays refused: the
+     * bounded model does not snapshot a handler's signal stack into a child. */
+    if (th->sig_depth > 0) { __atomic_fetch_add(&g_um.denied, 1, __ATOMIC_SEQ_CST); return -EPERM; }
     uint32_t used = __atomic_fetch_add(&g_um.result->forks, 1, __ATOMIC_SEQ_CST);
     if (used >= WEMU_UM_MAX_FORKS) {
         __atomic_fetch_sub(&g_um.result->forks, 1, __ATOMIC_SEQ_CST);
@@ -2157,6 +2195,26 @@ static int um_deliver_frame(UmThread *th, ucontext_t *uc, greg_t *r,
     UmSigDisp *d = um_disp(th);
     int signo = ev->signo;
     int sainfo = (d->flags[signo] & UM_SA_SIGINFO) != 0;
+    int nested = th->sig_depth > 0;
+
+    /* Bounded nested delivery.  A delivery is NESTED when a previous handler
+     * on this same thread is still live (sig_depth > 0).  The hardened path
+     * admits it up to WEMU_UM_MAX_SIG_NEST live frames; every other shape
+     * fails closed BEFORE any host handler runs.  With the path switched off
+     * we reproduce the OLD one-slot/no-nesting behaviour exactly (the pending
+     * event is dropped and no guest handler is entered). */
+    if (nested && !g_cfg.nested_enabled) {
+        th->sig_denied++;
+        if (g_cfg.exact_refuse_enabled)
+            g_um.result->refuses[WEMU_UM_REFUSE_NEST_DISABLED]++;
+        return -1;
+    }
+    if ((unsigned)th->sig_depth >= WEMU_UM_MAX_SIG_NEST) {
+        th->sig_denied++;
+        if (g_cfg.exact_refuse_enabled)
+            g_um.result->refuses[WEMU_UM_REFUSE_NEST_DEPTH]++;
+        return -1;
+    }
 
     /* The kernel-saved FP blob is the byte-exact state the interrupted guest
      * was running with.  Hold the whole bounded blob in per-thread supervisor
@@ -2186,8 +2244,9 @@ static int um_deliver_frame(UmThread *th, ucontext_t *uc, greg_t *r,
      * at the TOP of that stack, growing down — exactly where the kernel puts
      * it.  Only the guest RIP/RSP in the trapping ucontext are rewritten: no
      * host altstack is ever installed.  A missing/disabled altstack falls
-     * back to the interrupted stack (kernel behaviour), and an altstack we
-     * are already on is refused as a nested shape (nesting is unmodeled). */
+     * back to the interrupted stack (kernel behaviour).  An altstack we are
+     * already on keeps the frame on the current stack — the kernel does the
+     * same for a nested handler rather than switching stacks twice. */
     int onstack = g_cfg.onstack_enabled &&
                   (d->flags[signo] & UM_SA_ONSTACK) &&
                   !th->alt_disabled && th->alt_size != 0 && !th->alt_onstack;
@@ -2208,23 +2267,31 @@ static int um_deliver_frame(UmThread *th, ucontext_t *uc, greg_t *r,
         return -1;                       /* fail closed: no handler runs */
     }
 
-    /* Save the interrupted registers: rt_sigreturn restores exactly these, so
-     * the guest resumes where it was interrupted (fault RIP or post-syscall). */
-    memcpy(th->saved_gregs, r, sizeof th->saved_gregs);
+    /* Push the interrupted context BEFORE any register rewrite.  The FP blob
+     * lives inside the frame, so a nested delivery can never clobber the
+     * handler it interrupted; rt_sigreturn pops this exact frame. */
+    UmSigCtx *ctx = &th->sig_ctx[th->sig_depth];
+    memcpy(ctx->gregs, r, sizeof ctx->gregs);
+    ctx->alt_onstack = onstack;
+    ctx->uc_at = uc_at;
+    th->sig_depth++;
     th->saved_valid = 1;
-    th->in_handler = 1;
     th->alt_onstack = onstack;
     if (onstack)
         __atomic_fetch_add(&g_um.result->onstack_deliveries, 1,
                            __ATOMIC_SEQ_CST);
     th->sig_deliveries++;
-    th->saved_uc_at = uc_at;
+    if (nested)
+        __atomic_fetch_add(&g_um.result->nested_deliveries, 1,
+                           __ATOMIC_SEQ_CST);
+    if ((uint32_t)th->sig_depth > g_um.result->nest_depth_max)
+        g_um.result->nest_depth_max = (uint32_t)th->sig_depth;
     if (fp_len) {
-        memcpy(th->saved_fp, uc->uc_mcontext.fpregs, fp_len);
-        th->saved_fp_len = fp_len;
+        memcpy(ctx->fp, uc->uc_mcontext.fpregs, fp_len);
+        ctx->fp_len = fp_len;
         g_um.result->fpstate_saved++;
     } else {
-        th->saved_fp_len = 0;                /* OLD path (negative control) */
+        ctx->fp_len = 0;                     /* OLD path (negative control) */
     }
 
     if (sainfo) {
@@ -2244,7 +2311,7 @@ static int um_deliver_frame(UmThread *th, ucontext_t *uc, greg_t *r,
         }
         ucontext_t uctx;
         memset(&uctx, 0, sizeof uctx);
-        memcpy(uctx.uc_mcontext.gregs, th->saved_gregs,
+        memcpy(uctx.uc_mcontext.gregs, ctx->gregs,
                sizeof uctx.uc_mcontext.gregs);
         if (fp_len) {
             /* Byte-exact XMM/x87 FXSAVE state in the ucontext's own FP slot;
@@ -2289,11 +2356,13 @@ static int um_deliver_frame(UmThread *th, ucontext_t *uc, greg_t *r,
 static void um_timer_tick(void);
 
 /* Consume a pending cross-thread OR timer-generated signal at the TARGET
- * thread's next syscall checkpoint.  Mask, disposition, nesting and budget are
- * the TARGET's own state: a blocked signal stays queued (one bounded slot)
- * until it is unblocked; no handler, nesting or budget exhaustion fails
- * closed.  SIGALRM is accepted ONLY with the kernel's setitimer si_code so an
- * unrelated queued event cannot be mistaken for a timer signal. */
+ * thread's next syscall checkpoint.  Mask, disposition and budget are the
+ * TARGET's own state: a blocked signal stays queued (one bounded slot) until
+ * it is unblocked; no handler, nesting or budget exhaustion fails closed.
+ * A live handler is NO LONGER a reason to drop the event: um_deliver_frame
+ * pushes a bounded nested context (or fails closed at the depth/path limit).
+ * SIGALRM is accepted ONLY with the kernel's setitimer si_code so an unrelated
+ * queued event cannot be mistaken for a timer signal. */
 static void um_check_pending(UmThread *th, ucontext_t *uc, greg_t *r) {
     um_timer_tick();
     if (!__atomic_load_n(&th->pending, __ATOMIC_ACQUIRE)) return;
@@ -2308,7 +2377,7 @@ static void um_check_pending(UmThread *th, ucontext_t *uc, greg_t *r) {
     }
     if ((th->sig_mask >> (signo - 1)) & 1ull) return;   /* stays pending */
     __atomic_store_n(&th->pending, 0, __ATOMIC_RELEASE);
-    if (th->in_handler || th->sig_deliveries >= WEMU_UM_MAX_SIGNALS ||
+    if (th->sig_deliveries >= WEMU_UM_MAX_SIGNALS ||
         !um_sig_registered(signo, th)) {
         th->sig_denied++;
         return;
@@ -2984,10 +3053,19 @@ static void um_fault(int sig, siginfo_t *si, void *ucv) {
 
     /* A pkey violation is never offered to a guest handler: the bytes are
      * unreadable by hardware, and retrying from a handler could only loop or
-     * brute-force the key.  Fail closed straight to the result page. */
+     * brute-force the key.  A genuine SYNCHRONOUS fault taken while a handler
+     * is live is a different unmodeled shape from a queued nested signal: its
+     * si_addr/RIP retry semantics cannot be reproduced byte-exact, so it also
+     * fails closed (with its own exact reason).  Queued signals still nest
+     * through um_deliver_frame; only real faults are refused here. */
+    int nested_fault = (th->sig_depth > 0 && !pku && um_sig_sync(signo) &&
+                        in_guest && um_sig_registered(signo, th) &&
+                        th->sig_deliveries < WEMU_UM_MAX_SIGNALS);
     if (pku || !um_sig_sync(signo) || !in_guest || !um_sig_registered(signo, th) ||
-        th->in_handler || th->sig_deliveries >= WEMU_UM_MAX_SIGNALS) {
+        th->sig_depth > 0 || th->sig_deliveries >= WEMU_UM_MAX_SIGNALS) {
         th->sig_denied++;                     /* fail closed, no delivery */
+        if (nested_fault && g_cfg.exact_refuse_enabled)
+            g_um.result->refuses[WEMU_UM_REFUSE_NEST_FAULT]++;
         um_abort_to_finish(uc, th, UM_WHY_FAULT);
         return;
     }

@@ -40,6 +40,14 @@ extern "C" {
 #define WEMU_UM_TIMER_MAX_USEC   1000000u /* 1 s: alarm(1) admitted, >1 s refused */
 #define WEMU_UM_TIMER_TICK_USEC  1000u    /* one virtual checkpoint tick = 1 ms */
 #define WEMU_UM_TIMER_MAX_TICKS  1000u    /* MAX_USEC / TICK_USEC */
+/* Bounded nested signal delivery.  Each modeled thread keeps a bounded stack
+ * of saved delivery contexts: a signal delivered while a handler is live
+ * pushes a context and rt_sigreturn pops it.  The depth is capped here; a
+ * delivery that would exceed it fails closed with an exact refusal instead
+ * of dispatching a host handler.  Per-thread masks, dispositions and the
+ * virtual alternate stack are respected at every level.  True asynchronous
+ * host delivery and unbounded recursion remain unmodeled. */
+#define WEMU_UM_MAX_SIG_NEST     4u       /* max live nested deliveries/thread */
 
 /* CPU-enforced protection-key (MPK/pkeys) mode for the isolation path.
  * AUTO uses x86-64 protection keys when the host supports them and falls
@@ -205,7 +213,21 @@ typedef enum {
 #define WEMU_UM_REFUSE_TIMER_TARGET      35u /* arming thread slot no longer
                                              * active when the timer fires */
 #define WEMU_UM_REFUSE_TIMER_DISABLED    36u /* timer path off (OLD path): -ENOSYS */
-#define WEMU_UM_N_REFUSE                 37u
+/* Bounded nested signal delivery.  A nested delivery is one that happens
+ * while a previous handler on the SAME thread is still live.  Only the
+ * bounded depth is admitted; every out-of-scope shape fails closed with an
+ * exact reason and NO host handler runs.  Codes are appended after the timer
+ * block; values are stable by symbol. */
+#define WEMU_UM_REFUSE_NEST_DISABLED     37u /* nested delivery attempted with
+                                             * the path switched off (OLD path:
+                                             * no delivery, pending dropped) */
+#define WEMU_UM_REFUSE_NEST_DEPTH        38u /* live delivery depth already at
+                                             * WEMU_UM_MAX_SIG_NEST: the pending
+                                             * event is dropped, no handler runs */
+#define WEMU_UM_REFUSE_NEST_FAULT        39u /* synchronous CPU fault taken while
+                                             * a handler is live: unmodeled
+                                             * nested fault, fail closed */
+#define WEMU_UM_N_REFUSE                 40u
 
 typedef struct {
     uint32_t        nr;
@@ -293,6 +315,12 @@ typedef struct {
     uint32_t  timer_ticks;
     uint32_t  timer_signals;
     uint32_t  timer_dropped;
+    /* Bounded nested signal delivery evidence (appended last so existing
+     * offsets are unchanged).  nested_deliveries counts frames pushed while
+     * a previous handler was live; nest_depth_max is the deepest live stack
+     * reached this run (0 = no delivery, 1 = a single flat delivery). */
+    uint32_t  nested_deliveries;
+    uint32_t  nest_depth_max;
 } WemuUmResult;
 
 /* Run one ELF to completion.  Both ET_EXEC (mapped at its link addresses)
@@ -539,6 +567,15 @@ int wemu_um_set_sigaltstack_enabled(int enabled);
  * placed on the interrupted stack.  Returns 0, or -1 for a value other than
  * 0/1. */
 int wemu_um_set_onstack_enabled(int enabled);
+
+/* Negative-control switch for bounded nested signal delivery.  ON (default):
+ * a signal delivered at a syscall checkpoint while a handler on the same
+ * thread is still live pushes a bounded saved-context frame (up to
+ * WEMU_UM_MAX_SIG_NEST); rt_sigreturn pops it and resumes the interrupted
+ * handler exactly where it stopped.  OFF: the OLD path, where any delivery
+ * with a live handler is refused (pending dropped, no nested handler runs),
+ * counted under WEMU_UM_REFUSE_NEST_DISABLED.  Returns 0, or -1 otherwise. */
+int wemu_um_set_nested_enabled(int enabled);
 
 /* ---- process-per-guest address-space isolation ----------------------- */
 /* Register a supervisor-owned MAP_SHARED region as the GUEST ARENA.  The
