@@ -116,10 +116,11 @@ untrusted-guest sandbox. Nothing here is enabled implicitly by `wemu_cpu_run`.
   populated only by successful guest `openat`/`dup3` — a guest cannot execute
   a file described by a supervisor fd it never opened.  The SIGSYS handler
   checks pointers/flags/fd admission and saves the exec source; it returns
-  `-EINVAL` for a bad form, `-EBADF` for an unadmitted fd and `-EBUSY` for a
-  non-root/threaded guest or exhausted budget (`denied++` throughout).  On
+  `-EINVAL` for a bad form, `-EBADF` for an unadmitted fd and `-EBUSY` for an
+  exhausted budget (`denied++` throughout).  On
   the accepted path it rewrites the SigSYS ucontext to resume on the ORIGINAL
-  host stack, restores the HOST `%fs` (so the loader's malloc/stdio use host
+  host stack (or a FRESH host stack for a thread caller — see below),
+  restores the HOST `%fs` (so the loader's malloc/stdio use host
   TLS), copies bounded strings/vectors (`<=64` entries, `<=256` bytes each,
   16 KiB store), and loads a new validated static `ET_EXEC`/`ET_DYN` image
   resolved by `open(path)`, `openat(dirfd, path)` or `pread(fd)` respectively.
@@ -140,6 +141,26 @@ untrusted-guest sandbox. Nothing here is enabled implicitly by `wemu_cpu_run`.
   published with a parent spin-wait acknowledgement — without it a delayed
   child could read the NEXT clone's stack/slot and corrupt the run (this bug
   was caught by a 40-run differential stress loop, not by a single gate).
+- **Bounded execve from a CLONE_THREAD guest**: `execve`/`execveat` issued by a
+  NON-ROOT shared-VM thread is now admitted; the caller becomes the new root
+  and the whole thread group is replaced, as the kernel does.  The caller's
+  creation shape is recorded at clone time and re-checked at exec: only the
+  bounded CLONE_THREAD form (VM+THREAD+SIGHAND, whitelisted SETTLS/TID bits,
+  no exit signal/namespaces) is eligible — pidfd/`clone3`/sigmask shapes never
+  reach a slot and any unmodeled shape fails closed with `-EINVAL`.  In host
+  context, every active peer is sent a reserved signal (`SIGUSR2`, outside the
+  guest signal table) whose TLS-free handler marks its slot inactive and exits
+  ONLY that host thread; a bounded spin-wait fails closed if a peer does not
+  quiesce.  The caller's register state is reset to the new image's initial
+  context (RIP=`e_entry`, RSP=new SysV stack, EFLAGS=0x202, RDX=0) and its TLS
+  is reset: `%fs` is restored to the HOST for the loader, then re-established
+  by the new guest's own `ARCH_SET_FS`.  Because a thread's guest stack lives
+  INSIDE the image window being replaced, the loader runs on a fresh 1 MiB
+  HOST stack, and the old-window unmap is guarded against the new image/stack
+  ranges so it cannot tear down the image just loaded.  `exec_thread` counts
+  successful thread-originated replacements.  `tests/thread_exec` (non-main
+  thread execve) is byte-exact against the host kernel; the negative control
+  (`wemu_um_set_thread_exec_enabled(0)`) reproduces the OLD `-EBUSY` refusal.
 - **Negative control for threads**: `tests/threaded_guest` asks for the same
   thread flags plus `CLONE_NEWUSER`; the real kernel refuses it with `-EINVAL`
   and the guest prints `THREAD-FLAGS-RC=-22` byte-exactly.  The gate checks
@@ -243,8 +264,10 @@ table entry against the kernel's `asm/unistd_64.h`.
   leaks when isolation is off. LTP,
   `pthread_create`, vfork sharing, clone3 pidfds and guest signal masks are
   not yet modelled. Exec only replaces static ET_EXEC/ET_DYN images:
-  PT_INTERP (ld.so), dynamic loaders, exec from a task with live shared-VM
-  threads, and ELF interpreter scripts are refused. Bounded fd-relative
+  PT_INTERP (ld.so), dynamic loaders, and ELF interpreter scripts over a
+  depth bound are refused. Bounded execve from a non-root shared-VM
+  CLONE_THREAD guest IS modelled (peers quiesced, register/TLS state reset);
+  pidfd/`clone3`/sigmask thread shapes are not. Bounded fd-relative
   `execveat` (admitted-fd AT_EMPTY_PATH and dirfd-relative path) IS modelled;
   CLOEXEC/reopen fd aliasing and AT_SYMLINK_NOFOLLOW are not. Seccomp windows
   accumulate across execs (bounded to `WEMU_UM_MAX_EXECS`), and XMM/x87 state

@@ -89,6 +89,8 @@ typedef struct {
     uint32_t  forks;             /* bounded COW children created this run */
     uint32_t  threads_created;   /* bounded shared-VM host threads created */
     uint32_t  execs;             /* bounded successful guest image replacements */
+    uint32_t  exec_thread;       /* image replacements issued by a non-root
+                                    CLONE_THREAD guest (bounded thread-exec) */
     uint32_t  denied_nrs[8];     /* distinct unlisted/refused syscall numbers */
     uint32_t  bad_ptrs;          /* guest pointers refused before host dispatch */
     uint32_t  bad_ptr_nr;        /* syscall number of the last refused pointer */
@@ -141,6 +143,19 @@ int wemu_um_clone_flags_modeled(uint64_t flags);
  * TLS value is applied to the host thread by the kernel.  Any namespace or
  * unlisted flag fails closed. */
 int wemu_um_clone_thread_flags_modeled(uint64_t flags);
+
+/* 1 when these raw clone flags describe a thread whose execve WEMU will
+ * admit: exactly the bounded shared-VM CLONE_THREAD shape (CLONE_VM +
+ * CLONE_THREAD + CLONE_SIGHAND, optional CLONE_SETTLS/TID bits, no exit
+ * signal, no namespaces).  Any other thread shape — pidfd / clone3 thread
+ * flags / per-thread signal masks / unlisted bits — fails closed. */
+int wemu_um_thread_exec_modeled(uint64_t flags);
+
+/* Negative-control switch for the differential gate: when disabled, an
+ * execve issued by a non-root shared-VM thread is refused exactly as in the
+ * OLD path (-EBUSY, no image replacement).  Thread-exec is ON by default.
+ * Returns 0, or -1 for a value other than 0/1. */
+int wemu_um_set_thread_exec_enabled(int enabled);
 
 /* 1 when the execveat(dirfd, flags) SHAPE is inside the bounded model:
  * AT_FDCWD + no flags (CWD-relative path), an fd >= 0 + no flags

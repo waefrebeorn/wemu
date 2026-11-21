@@ -14,7 +14,8 @@ TESTS = test_isa test_avx test_paging test_machine test_string test_cpuid \
         test_segments test_cpl test_iret test_tss test_task_switch \
         test_task_gates test_ldt test_call_gate_priv test_task_gpr \
         test_usermode_native test_usermode_exec test_usermode_isolate \
-        test_usermode_mpk test_usermode_exec2 test_usermode_execfd
+        test_usermode_mpk test_usermode_exec2 test_usermode_execfd \
+        test_usermode_threadexec
 
 all: libwemu.a
 
@@ -24,7 +25,8 @@ FORK_FIX   = tests/fork_clone
 THREAD_FIX = tests/threaded_guest
 EXEC_FIX   = tests/exec_chain
 EXEC2_FIX  = tests/script_interp tests/exec_fork tests/exec_script
-PIE_BINS   = $(PIE_STATIC) $(PIE_DYN) $(FORK_FIX) $(THREAD_FIX) $(EXEC_FIX) $(EXEC2_FIX)
+TEXEC_FIX  = tests/thread_exec
+PIE_BINS   = $(PIE_STATIC) $(PIE_DYN) $(FORK_FIX) $(THREAD_FIX) $(EXEC_FIX) $(EXEC2_FIX) $(TEXEC_FIX)
 SANDBOX_BIN = tests/sandbox_probe
 ISOLATE_BIN = tests/isolate_probe
 
@@ -56,6 +58,10 @@ test_usermode_exec2: tests/test_usermode_exec2.c libwemu.a $(EXEC2_FIX) $(EXEC_F
 
 # Bounded fd-relative execveat differential gate (reuses exec_chain fixture).
 test_usermode_execfd: tests/test_usermode_execfd.c libwemu.a $(EXEC_FIX)
+	$(CC) $(CFLAGS) -o $@ $< libwemu.a -lm
+
+# Bounded execve-from-CLONE_THREAD differential gate (raw TLS-safe fixture).
+test_usermode_threadexec: tests/test_usermode_threadexec.c libwemu.a $(TEXEC_FIX)
 	$(CC) $(CFLAGS) -o $@ $< libwemu.a -lm
 
 # Freestanding process-per-guest isolation differential guest (raw syscalls).
@@ -98,6 +104,10 @@ tests/exec_chain: tests/exec_chain.c
 # Guest threads run with an emulator-provided %fs base that is not glibc's
 # TCB, so no handler/body may read the TLS canary.  Keep this fixture raw.
 tests/threaded_guest: tests/threaded_guest.c
+	$(CC) -static-pie -O2 -fno-stack-protector -o $@ $<
+
+# Non-main-thread execve fixture: raw syscalls, no TLS canary (see above).
+tests/thread_exec: tests/thread_exec.c
 	$(CC) -static-pie -O2 -fno-stack-protector -o $@ $<
 
 # Real dynamically linked PIE: ET_DYN WITH PT_INTERP, refused fail-closed.

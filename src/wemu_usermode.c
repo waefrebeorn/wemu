@@ -251,7 +251,11 @@ typedef struct {
     greg_t saved_gregs[UM_NGREG];
     volatile uint32_t sig_deliveries;
     volatile uint32_t sig_denied;
+    uint64_t clone_flags;            /* raw flags used to create this thread */
+    uint8_t  modeled_thread;         /* 1 = admitted CLONE_THREAD shape */
 } UmThread;
+
+#define UM_SHAPE_THREAD 1u
 
 static UmThread g_thr[WEMU_UM_MAX_THREADS];
 static UmThread *g_boot_thr;         /* root slot, set before the guest runs */
@@ -305,7 +309,9 @@ static struct {
     uint32_t n_hide;
     int enabled;
     int pkey_mode;               /* WEMU_UM_PKEY_AUTO or FORCE_FALLBACK */
-} g_cfg = { .enabled = 1, .pkey_mode = WEMU_UM_PKEY_AUTO };
+    int thread_exec_enabled;     /* bounded execve from a CLONE_THREAD guest */
+} g_cfg = { .enabled = 1, .pkey_mode = WEMU_UM_PKEY_AUTO,
+            .thread_exec_enabled = 1 };
 
 /* CPU-enforced protection-key state, built in the forked guest child before
  * the first guest instruction.  PKRU is per-thread: the supervisor (parent)
@@ -339,12 +345,28 @@ void wemu_um_reset_isolation(void) {
     g_cfg.n_hide = 0;
     g_cfg.enabled = 1;
     g_cfg.pkey_mode = WEMU_UM_PKEY_AUTO;
+    g_cfg.thread_exec_enabled = 1;
 }
 
 int wemu_um_set_isolation_enabled(int enabled) {
     if (enabled != 0 && enabled != 1) return -1;
     g_cfg.enabled = enabled;
     return 0;
+}
+
+int wemu_um_set_thread_exec_enabled(int enabled) {
+    if (enabled != 0 && enabled != 1) return -1;
+    g_cfg.thread_exec_enabled = enabled;
+    return 0;
+}
+
+/* The exec-from-thread policy is exactly the modeled shared-VM CLONE_THREAD
+ * shape; keeping it a single predicate makes the handler and the gate audit
+ * the same rule.  pidfd / clone3 / signal-mask thread shapes never reach a
+ * slot because they are refused at clone time, so a slot that reaches exec
+ * is always one whose recorded flags pass this. */
+int wemu_um_thread_exec_modeled(uint64_t flags) {
+    return wemu_um_clone_thread_flags_modeled(flags);
 }
 
 int wemu_um_set_pkey_mode(int mode) {
@@ -485,6 +507,7 @@ typedef struct {
     long     dirfd;                  /* execveat dirfd (AT_FDCWD for execve) */
     uint64_t flags;                  /* execveat flags (0 for execve) */
     uint8_t  empty_path;             /* AT_EMPTY_PATH: path names an fd, not a path */
+    uint8_t  from_thread;            /* caller was a non-root CLONE_THREAD guest */
     size_t   used;
     char     store[UM_EXEC_STORE];
     const char *path;
@@ -674,6 +697,104 @@ static UmThread *um_thread_select(void) {
     return NULL;
 }
 
+/* ---- bounded exec-from-thread: quiesce peer host threads -------------- */
+/* An execve from a shared-VM thread replaces the image for the WHOLE thread
+ * group: the kernel kills every peer thread and continues on the caller with
+ * fresh registers and a fresh TLS base.  WEMU's peer threads are real host
+ * threads sharing the image window, so leaving one alive would run stale
+ * guest code over a replaced image.  Before the swap we signal each active
+ * peer with a reserved host signal; its handler marks the slot inactive and
+ * exits only that thread with a raw SYS_exit (no glibc/TLS, %fs is the
+ * guest's).  SIGUSR2 is outside the guest signal table (WEMU_UM_SIG_NSIG=32)
+ * and outside WEMU's own SIGSYS/SIGSEGV/SIGALRM handlers. */
+#define UM_EXEC_QUIESCE_SIG SIGUSR2
+
+static void um_exec_peer_die(int sig, siginfo_t *si, void *ucv) {
+    (void)sig; (void)si; (void)ucv;
+    UmThread *th = um_thread_select();       /* raw gettid: TLS-free */
+    if (th) __atomic_store_n(&th->active, 0, __ATOMIC_RELEASE);
+    __asm__ volatile("syscall" :: "a"(60L /* SYS_exit */), "D"(0L)
+                     : "rcx", "r11", "memory");
+    _exit(0);                                /* unreachable */
+}
+
+/* Three-arg raw syscall helper (tgkill). */
+static int64_t um_raw3(long nr, long a0, long a1, long a2) {
+    long ret;
+    __asm__ volatile("syscall" : "=a"(ret)
+                     : "a"(nr), "D"(a0), "S"(a1), "d"(a2)
+                     : "rcx", "r11", "memory");
+    return (int64_t)ret;
+}
+
+/* A CLONE_THREAD guest's stack is a static array INSIDE the image window that
+ * execve replaces; mapping the new image at the same bias would clobber the
+ * very stack um_exec_continue runs on.  Allocate a fresh HOST stack (outside
+ * every guest window) for the loader.  Raw syscall: this is called from the
+ * SIGSYS handler where %fs is the guest's and glibc is unsafe.  Returns the
+ * stack TOP, or 0 on failure. */
+#define UM_EXEC_STACK_SZ (1u << 20)
+static uint64_t um_raw_exec_stack(void) {
+    register long r10 __asm__("r10") = 0x22L; /* MAP_PRIVATE | MAP_ANONYMOUS */
+    register long r8  __asm__("r8")  = -1L;
+    register long r9  __asm__("r9")  = 0L;
+    long ret;
+    __asm__ volatile("syscall" : "=a"(ret)
+        : "a"(9L /* SYS_mmap */), "D"(0L), "S"((long)UM_EXEC_STACK_SZ),
+          "d"(3L /* PROT_READ|PROT_WRITE */), "r"(r10), "r"(r8), "r"(r9)
+        : "rcx", "r11", "memory");
+    if ((uint64_t)ret >= (uint64_t)-4095ULL) return 0;
+    return (uint64_t)ret + UM_EXEC_STACK_SZ;
+}
+
+/* Signal every active peer to die and wait (boundedly) for their slots to go
+ * inactive.  Returns 0 when the group is down to the caller only, -1 if any
+ * peer failed to quiesce in budget (the caller then fails the run closed —
+ * no image is swapped under a live peer).  Called in HOST context from
+ * um_exec_continue with %fs restored. */
+static int um_exec_quiesce(UmThread *caller) {
+    long self = um_raw_gettid();
+    long pid  = (long)um_raw0(39 /* SYS_getpid */);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = um_exec_peer_die;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO;
+    if (sigaction(UM_EXEC_QUIESCE_SIG, &sa, NULL) != 0) return -1;
+
+    int have_peer = 0;
+    for (unsigned i = 0; i < WEMU_UM_MAX_THREADS; i++) {
+        UmThread *t = &g_thr[i];
+        long tid = __atomic_load_n(&t->tid, __ATOMIC_ACQUIRE);
+        if (t == caller || tid <= 0 || tid == self) continue;
+        if (!__atomic_load_n(&t->active, __ATOMIC_ACQUIRE)) continue;
+        /* A non-root peer that is not the bounded CLONE_THREAD shape is
+         * unsupported: fail closed instead of replacing the image beneath
+         * it.  The root (slot 0) is always an admissible peer. */
+        if (t != &g_thr[0] &&
+            (t->modeled_thread != UM_SHAPE_THREAD ||
+             !wemu_um_thread_exec_modeled(t->clone_flags))) return -1;
+        (void)um_raw3(234 /* SYS_tgkill */, pid, tid, UM_EXEC_QUIESCE_SIG);
+        have_peer = 1;
+    }
+    if (!have_peer) return 0;
+
+    for (unsigned tries = 0; tries < 500000u; tries++) {
+        int all_quiet = 1;
+        for (unsigned i = 0; i < WEMU_UM_MAX_THREADS; i++) {
+            UmThread *t = &g_thr[i];
+            long tid = __atomic_load_n(&t->tid, __ATOMIC_ACQUIRE);
+            if (t == caller || tid <= 0 || tid == self) continue;
+            if (__atomic_load_n(&t->active, __ATOMIC_ACQUIRE)) {
+                all_quiet = 0; break;
+            }
+        }
+        if (all_quiet) return 0;
+        (void)um_raw0(24 /* SYS_sched_yield */);
+    }
+    return -1;
+}
+
 /* Raw clone(2): flags/stack/ptid/ctid/tls exactly as the guest supplied them.
  * CLONE_SETTLS in `flags` makes the KERNEL apply the guest's TLS value to the
  * new host thread's fs base — no host-side TLS surgery. */
@@ -740,6 +861,10 @@ static int64_t um_thread_clone(const uint64_t a[6], ucontext_t *uc) {
     th->why = 0;
     th->exit_code = 0;
     th->child_rsp = (greg_t)((a[1] - 16) & ~15ull);
+    /* Record the creation shape so a later execve can fail closed for any
+     * thread that is not the bounded CLONE_THREAD form. */
+    th->clone_flags = a[0];
+    th->modeled_thread = wemu_um_thread_exec_modeled(a[0]) ? UM_SHAPE_THREAD : 0;
 
     um_lock();
     __atomic_store_n(&g_boot_ready, 0, __ATOMIC_RELEASE);
@@ -1148,11 +1273,13 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
 
     /* Bounded image replacement: execve / execveat.  Refuse here (the guest
      * sees an error, no image is loaded) for unsupported variants/flags, bad
-     * guest pointers, an exhausted exec budget or live shared-VM threads.
-     * A COW forked child MAY exec: only slot 0 can call execve (a shared-VM
-     * thread cannot replace the image under its peers), but a fork child is
-     * slot 0 of its own private address space — its is_root=0 is preserved
-     * across the replacement so its exit still reports through wait4. */
+     * guest pointers or an exhausted exec budget.  A COW forked child execs
+     * as slot 0 of its own private address space (is_root=0 is preserved so
+     * its exit still reports through wait4).  A bounded shared-VM
+     * CLONE_THREAD guest may now exec too: the caller becomes the new root and
+     * its peers are quiesced in host context (um_exec_continue) before the
+     * image is swapped.  The negative-control switch reproduces the OLD
+     * refusal exactly. */
     if (e->kind == WEMU_UM_DISPATCH_EXECVE) {
         UmExecArgs ea;
         int reason = um_exec_check(nr, a, &ea);
@@ -1167,9 +1294,7 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
             um_unlock();
             return;
         }
-        if (th != &g_thr[0] ||
-            g_um.result->execs >= WEMU_UM_MAX_EXECS ||
-            g_um.result->threads_created != 0) {
+        if (g_um.result->execs >= WEMU_UM_MAX_EXECS) {
             um_note_denied(nr);
             r[REG_RAX] = (greg_t)-EBUSY;
             um_skip_syscall(r);
@@ -1177,18 +1302,57 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
             um_unlock();
             return;
         }
+        /* OLD PATH (negative control): a shared-VM thread, or a process that
+         * created threads, could never replace the image (-EBUSY). */
+        if (!g_cfg.thread_exec_enabled &&
+            (th != &g_thr[0] || g_um.result->threads_created != 0)) {
+            um_note_denied(nr);
+            r[REG_RAX] = (greg_t)-EBUSY;
+            um_skip_syscall(r);
+            if (g_um.denied > 8) um_abort_to_finish(uc, th, UM_WHY_BUDGET);
+            um_unlock();
+            return;
+        }
+        /* NEW PATH: a non-root caller must be the bounded CLONE_THREAD shape;
+         * any unmodeled thread shape fails closed with no image replacement. */
+        if (th != &g_thr[0] &&
+            (th->modeled_thread != UM_SHAPE_THREAD ||
+             !wemu_um_thread_exec_modeled(th->clone_flags))) {
+            um_note_denied(nr);
+            r[REG_RAX] = (greg_t)-EINVAL;
+            um_skip_syscall(r);
+            if (g_um.denied > 8) um_abort_to_finish(uc, th, UM_WHY_BUDGET);
+            um_unlock();
+            return;
+        }
         /* Save only guest pointers + the exec source; strings are copied in
          * host context where %fs is the HOST's, so malloc/stdio are safe.
-         * Rewriting the SigSYS ucontext resumes um_exec_continue on the
-         * original host stack with correct SysV entry alignment (RSP%16==8). */
+         * Rewriting the SigSYS ucontext resumes um_exec_continue with correct
+         * SysV entry alignment (RSP%16==8).  A thread's guest stack lives in
+         * the image window we are about to replace, so the loader runs on a
+         * fresh HOST stack instead; the root keeps its original stack. */
         memset(&g_exec, 0, sizeof g_exec);
         g_exec.nr = (uint32_t)nr;
         g_exec.pathp = ea.pathp; g_exec.argvp = ea.argvp; g_exec.envpp = ea.envpp;
         g_exec.dirfd = ea.dirfd; g_exec.flags = ea.flags;
         g_exec.empty_path = ea.empty_path;
+        g_exec.from_thread = (uint8_t)(th != &g_thr[0]);
+        uint64_t run_sp = 0;
+        if (g_exec.from_thread) {
+            run_sp = um_raw_exec_stack();
+            if (!run_sp) {                     /* fail closed: no replacement */
+                um_note_denied(nr);
+                r[REG_RAX] = (greg_t)-EBUSY;
+                um_skip_syscall(r);
+                if (g_um.denied > 8) um_abort_to_finish(uc, th, UM_WHY_BUDGET);
+                um_unlock();
+                return;
+            }
+        }
         uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)um_exec_continue;
-        uc->uc_mcontext.gregs[REG_RSP] =
-            ((th->child_rsp - 16) & ~(greg_t)15) + 8;
+        uc->uc_mcontext.gregs[REG_RSP] = run_sp
+            ? (greg_t)(run_sp - 8)
+            : (greg_t)(((th->child_rsp - 16) & ~(greg_t)15) + 8);
         um_unlock();
         return;
     }
@@ -1773,6 +1937,16 @@ static void um_exec_continue(void) {
      * new image is entered below. */
     if (g_pkey_active) um_wrpkru(g_host_pkru);
 
+    /* Exec from a shared-VM thread replaces the image for the whole thread
+     * group: quiesce every peer host thread BEFORE any image/stack is swapped,
+     * so no stale guest code survives over the new image.  Fail closed (no
+     * replacement) if a peer cannot be quiesced or has an unsupported shape.
+     * The caller is selected by raw gettid (host %fs is restored above). */
+    {
+        UmThread *caller = um_thread_select();
+        if (!caller || um_exec_quiesce(caller) != 0)
+            um_child_fail(shared, WEMU_UM_ERR_INTERNAL);
+    }
     g_exec.used = 0;
     g_exec.path = um_exec_str(g_exec.pathp, UM_EXEC_MAX_ARG);
     if (!g_exec.path ||
@@ -1847,15 +2021,27 @@ static void um_exec_continue(void) {
     if (!rsp) um_child_fail(shared, WEMU_UM_ERR_INTERNAL);
     free(im.file);                             /* strings now live in g_exec */
 
-    /* Replace the current guest image: release the old image window, and the
-     * old SysV stack UNLESS it is the supervisor's MAP_SHARED arena (the new
-     * stack was just built in that same region — unmapping it would pull the
-     * rug out from under the image we are about to enter). */
-    (void)munmap((void *)(uintptr_t)g_um.win_lo,
-                 (size_t)(g_um.win_hi - g_um.win_lo));
-    if (!(g_um.stack_lo == g_cfg.arena_lo && g_um.stack_hi == g_cfg.arena_lo + (1u << 20)))
-        (void)munmap((void *)(uintptr_t)g_um.stack_lo,
-                     (size_t)(g_um.stack_hi - g_um.stack_lo));
+    /* Replace the current guest image: release the OLD image window and the
+     * old SysV stack.  Only unmap the parts that the NEW image/stack do not
+     * cover: a thread's stack and a re-chosen PIE bias can coincide with the
+     * old window, and unmapping it wholesale would tear down the image we
+     * just loaded.  Never release the supervisor's MAP_SHARED arena either. */
+    {
+        uint64_t wlo = g_um.win_lo, whi = g_um.win_hi;
+        if (wlo < im.lo)
+            (void)munmap((void *)(uintptr_t)wlo,
+                         (size_t)((whi < im.lo ? whi : im.lo) - wlo));
+        if (whi > im.hi) {
+            uint64_t a = wlo > im.hi ? wlo : im.hi;
+            (void)munmap((void *)(uintptr_t)a, (size_t)(whi - a));
+        }
+        if (!(g_um.stack_lo == g_cfg.arena_lo &&
+              g_um.stack_hi == g_cfg.arena_lo + (1u << 20)) &&
+            !(g_um.stack_lo >= im.lo && g_um.stack_hi <= im.hi) &&
+            !(g_um.stack_lo >= lo && g_um.stack_hi <= hi))
+            (void)munmap((void *)(uintptr_t)g_um.stack_lo,
+                         (size_t)(g_um.stack_hi - g_um.stack_lo));
+    }
 
     /* Reset every per-run state the new image must not inherit: syscall and
      * denial budgets, guest signal table, admitted mmap/heap ranges and the
@@ -1881,6 +2067,8 @@ static void um_exec_continue(void) {
         shared->fault_code = 0; shared->fault_pkey = -1;
     }
     __atomic_fetch_add(&shared->execs, 1, __ATOMIC_SEQ_CST);  /* monotonic: resets cannot reset it */
+    if (g_exec.from_thread)
+        __atomic_fetch_add(&shared->exec_thread, 1, __ATOMIC_SEQ_CST);
     for (unsigned i = 1; i < WEMU_UM_MAX_THREADS; i++)
         memset(&g_thr[i], 0, sizeof g_thr[i]);
     UmThread *root = &g_thr[0];
