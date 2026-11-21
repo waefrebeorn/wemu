@@ -28,6 +28,7 @@ extern "C" {
 #define WEMU_UM_MAX_FORKS     8u       /* bounded guest fork/clone children/run */
 #define WEMU_UM_MAX_THREADS   8u       /* bounded shared-VM host threads/run */
 #define WEMU_UM_MAX_EXECS     4u       /* bounded image replacements/run */
+#define WEMU_UM_MAX_HOST_PAGES 8u      /* bounded host-only regions hidden/guest */
 
 typedef enum {
     WEMU_UM_OK            =   0,
@@ -81,6 +82,11 @@ typedef struct {
     uint32_t  bad_ptrs;          /* guest pointers refused before host dispatch */
     uint32_t  bad_ptr_nr;        /* syscall number of the last refused pointer */
     uint64_t  bad_ptr_va;        /* the refused guest pointer (host-address-shaped) */
+    /* Address-space isolation evidence (process-per-guest): the MAP_SHARED
+     * guest arena the SysV stack was built in, and how many host-only pages
+     were unmapped from the GUEST child before it began executing. */
+    uint64_t  arena_lo, arena_hi;/* registered MAP_SHARED guest arena (shared region) */
+    uint32_t  host_pages_hidden; /* host pages removed from the guest process */
     uint32_t  out_len;       /* bytes captured from fd 1/2, <= OUT_MAX */
     char      out[WEMU_UM_OUT_MAX]; /* NUL-terminated if out_len < OUT_MAX */
 } WemuUmResult;
@@ -115,6 +121,34 @@ int wemu_um_clone_thread_flags_modeled(uint64_t flags);
  * AT_FDCWD with no flags.  AT_EMPTY_PATH and every other flag/dirfd are
  * refused fail-closed (plain execve has no flags and is always eligible). */
 int wemu_um_execveat_modeled(long dirfd, uint64_t flags);
+
+/* ---- process-per-guest address-space isolation ----------------------- */
+/* Register a supervisor-owned MAP_SHARED region as the GUEST ARENA.  The
+ * forked guest process builds its SysV stack inside this region, so the
+ * guest's writable world is a mapping the supervisor also holds.  Every
+ * host syscall pointer the guest passes is validated against the registered
+ * guest ranges (image / this shared arena stack / bounded heap / admitted
+ * mmap); a pointer outside all of them is refused before any host handler
+ * sees it.  base must be page-aligned; len >= 2 MiB (first MiB = stack,
+ * remainder = shared scratch).  Returns 0, or -1 on bad arguments. */
+int wemu_um_set_guest_arena(void *base, size_t len);
+
+/* Register a host-only region that the GUEST PROCESS must not be able to
+ * observe.  The supervisor keeps its own mapping; the forked guest child
+ * unmaps every registered region BEFORE it starts executing guest code, so
+ * a direct guest load/store faults instead of reading host bytes, and the
+ * syscall pointer validator refuses the same address.  At most
+ * WEMU_UM_MAX_HOST_PAGES regions.  Returns 0, or -1 if the table is full. */
+int wemu_um_isolate_host_pages(void *addr, size_t len);
+
+/* Clear the host-page hide list and the guest arena (reset between runs). */
+void wemu_um_reset_isolation(void);
+
+/* Negative-control switch for the differential gate: when disabled the
+ * guest child does NOT unmap registered host pages, reproducing the
+ * pre-isolation (shared-address-space) behaviour.  Isolation is ON by
+ * default.  Returns 0, or -1 if the value was out of range. */
+int wemu_um_set_isolation_enabled(int enabled);
 
 /* Introspection for the gate: the table itself and a readable status name. */
 const WemuUmSyscallEntry *wemu_um_syscall_table(size_t *count);

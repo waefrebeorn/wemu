@@ -59,6 +59,19 @@ untrusted-guest sandbox. Nothing here is enabled implicitly by `wemu_cpu_run`.
    the faulting instruction is retried. `wemu_usermode.c` is compiled without
    `-fstack-protector`: its handlers run on the guest stack with a
    guest-set `%fs`, so a TLS stack canary there is not the host's.
+9. **Process-per-guest address-space isolation.** `wemu_um_set_guest_arena()`
+   registers a supervisor-owned `MAP_SHARED` region; forked guest children
+   build the SysV stack inside it, so the guest's writable world is a mapping
+   the supervisor also holds and validates against. `wemu_um_isolate_host_pages()`
+   registers host-only regions (e.g. a supervisor secret) that the guest child
+   `munmap()`s **before its first instruction** — a direct guest load/store of
+   such a page faults instead of observing host bytes. Independently, every
+   host-syscall pointer is validated against the registered guest region
+   (image / shared arena stack / brk heap / admitted mmap); an out-of-region
+   pointer ends the run with `WEMU_UM_ERR_BADPTR` and no host dispatch.
+   `WemuUmResult` reports `arena_lo/hi` and `host_pages_hidden` as evidence.
+   `wemu_um_set_isolation_enabled(0)` is the differential-gate negative
+   control: it reproduces the old shared-address-space behaviour (leak).
 
 ## Bounded / fail-closed
 
@@ -169,26 +182,43 @@ table entry against the kernel's `asm/unistd_64.h`.
   nesting, and needs the guest's `SA_RESTORER` for a C handler to return.
   Asynchronous signals (kill/tgkill/timers) and guest-owned signal masks are
   not modelled; `rt_sigprocmask` still passes through to the host.
-- The filter window covers ELF PT_LOAD mappings. The stack and the bounded
-  brk heap are registered for **pointer validation**, but code fetched from
-  them is not trapped (making them executable is refused, and non-`MAP_FIXED`
-  `PROT_EXEC` mmap is refused outright). This path shares the host address
-  space; it is still not a sandbox for hostile guests.
-- Guest pointers are host pointers (same ABI) but are now **validated**
-  against the registered guest ranges before dispatch. Validation is a
-  per-syscall table: a newly added pointer-taking syscall must be added to
+- The filter window covers ELF PT_LOAD mappings. The stack (now built inside
+  the supervisor's `MAP_SHARED` guest arena when one is registered), the
+  bounded brk heap and admitted guest mmaps are registered for **pointer
+  validation**, but code fetched from them is not trapped (making them
+  executable is refused, and non-`MAP_FIXED` `PROT_EXEC` mmap is refused
+  outright). The ELF image itself stays at its link address (ET_EXEC) or a
+  chosen bias (ET_DYN), so it is NOT inside the shared arena — a single
+  contiguous arena holding image + stack + heap is future work. This path
+  still shares most of the host address space with trusted guests; the
+  isolation increment hides a caller-registered set of host pages and refuses
+  out-of-region syscall pointers, but it is not a full sandbox for hostile
+  guests (see below).
+- Guest pointers are host pointers (same ABI) and are **validated** against
+  the registered guest ranges before dispatch. Validation is a per-syscall
+  table: a newly added pointer-taking syscall must be added to
   `um_ptr_args_ok()` or it is not checked. `prctl` option-specific pointer
   payloads and ioctl request-specific layouts are not decoded; `ioctl` args
-  that look like small scalars are passed through. Pointer validation is
-  range checking, not address-space isolation.
+  that look like small scalars are passed through. A direct load/store that
+  stays inside the guest image/stack/heap cannot be seen by the syscall
+  validator — only the host-page hide list removes host bytes from the guest
+  page table, and a host page NOT registered for hiding (or reachable via an
+  already-admitted guest mapping) is still observable. Pointer validation is
+  range checking plus a caller-managed hide list, not address-space isolation
+  enforced by the CPU (no EPT/MPK/pkeys); the avoid-leak guarantee holds only
+  for pages registered with `wemu_um_isolate_host_pages()` before the run.
 - The gate runs **45** real static busybox applets, each byte-exact against
   host `execve` of the same binary/args/env, plus static-PIE load-bias and
   SIGSEGV fixtures, a static-PIE fork/clone fixture (private COW children), a
   static-PIE shared-VM CLONE_THREAD fixture (two TLS-distinguished host
   threads, exact output + negative clone flag), and `tests/sandbox_probe` for
   the four sandbox differentials (RWX mmap, mprotect, out-of-range pointer,
-  brk). LTP, `pthread_create`, vfork sharing, clone3 pidfds and guest
-  signal masks are not yet modelled. `execve` only replaces static
+  brk), plus `tests/isolate_probe` in `test_usermode_isolate` for the four
+  process-per-guest differentials (valid pointer byte-exact vs host oracle,
+  MAP_SHARED arena pointer, out-of-region pointer refused, and a direct host
+  load that faults with isolation ON / leaks with isolation OFF). LTP,
+  `pthread_create`, vfork sharing, clone3 pidfds and guest signal masks are
+  not yet modelled. `execve` only replaces static
   ET_EXEC/ET_DYN images: PT_INTERP (ld.so), fd-relative `execveat`, exec from
   a forked child or a process with live shared-VM threads, dynamic loaders,
   and ELF interpreter/fd scripts are refused. Seccomp windows accumulate

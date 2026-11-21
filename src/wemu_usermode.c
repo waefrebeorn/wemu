@@ -246,6 +246,7 @@ static struct {
     uint64_t heap_lo, heap_hi;     /* bounded brk heap [initial break, current] */
     uint64_t mmap_lo[UM_MAX_MMAPS], mmap_hi[UM_MAX_MMAPS];
     uint32_t n_mmaps;
+    uint64_t arena_lo, arena_hi;   /* registered MAP_SHARED guest arena */
     volatile uint32_t bad_ptrs;    /* pointers refused before host dispatch */
     volatile uint32_t bad_ptr_nr;
     volatile uint64_t bad_ptr_va;
@@ -256,6 +257,61 @@ static struct {
     uint32_t sig_flags[WEMU_UM_SIG_NSIG];
     uint8_t  sig_valid[WEMU_UM_SIG_NSIG];
 } g_um;
+
+/* Supervisor-side isolation configuration.  Set by the gate BEFORE
+ * wemu_um_run_elf(), inherited by the forked guest child (COW), and read by
+ * the child while it builds the guest address space.  Isolation is ON by
+ * default; the disable switch exists only as a differential-test control. */
+static struct {
+    uint64_t arena_lo, arena_hi;   /* MAP_SHARED guest arena (0 = none) */
+    uint64_t hide_lo[WEMU_UM_MAX_HOST_PAGES];
+    uint64_t hide_hi[WEMU_UM_MAX_HOST_PAGES];
+    uint32_t n_hide;
+    int enabled;
+} g_cfg = { .enabled = 1 };
+
+int wemu_um_set_guest_arena(void *base, size_t len) {
+    uint64_t b = (uint64_t)(uintptr_t)base;
+    if (!base || (b & 0xfffull) || len < (2u << 20) || b + len < b) return -1;
+    g_cfg.arena_lo = b;
+    g_cfg.arena_hi = b + len;
+    return 0;
+}
+
+int wemu_um_isolate_host_pages(void *addr, size_t len) {
+    uint64_t lo = (uint64_t)(uintptr_t)addr;
+    if (!addr || !len || lo + len < lo) return -1;
+    if (g_cfg.n_hide >= WEMU_UM_MAX_HOST_PAGES) return -1;
+    g_cfg.hide_lo[g_cfg.n_hide] = lo;
+    g_cfg.hide_hi[g_cfg.n_hide] = lo + len;
+    g_cfg.n_hide++;
+    return 0;
+}
+
+void wemu_um_reset_isolation(void) {
+    g_cfg.arena_lo = g_cfg.arena_hi = 0;
+    g_cfg.n_hide = 0;
+    g_cfg.enabled = 1;
+}
+
+int wemu_um_set_isolation_enabled(int enabled) {
+    if (enabled != 0 && enabled != 1) return -1;
+    g_cfg.enabled = enabled;
+    return 0;
+}
+
+/* Called in the FORKED GUEST CHILD, after all host-side setup is complete and
+ * before setcontext() transfers control to the guest.  Removing the mapping
+ * is what makes host bytes unobservable by ordinary guest loads/stores; the
+ * syscall validator is the second, independent line of defence.  Returns the
+ * number of regions actually removed (a short count fails the run closed). */
+static uint32_t um_hide_host_pages(void) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < g_cfg.n_hide; i++)
+        if (munmap((void *)(uintptr_t)g_cfg.hide_lo[i],
+                   (size_t)(g_cfg.hide_hi[i] - g_cfg.hide_lo[i])) == 0) n++;
+    return n;
+}
 
 /* The guest owns %fs while our handlers run, so the image loader (malloc,
  * stdio) must be called only after %fs is put back on the HOST's value.
@@ -490,6 +546,7 @@ static int um_range_has(uint64_t lo, uint64_t hi, uint64_t ptr, uint64_t len) {
 static int um_ptr_ok(uint64_t ptr, uint64_t len) {
     if (ptr == 0) return 1;                 /* NULL: absent/optional buffer */
     if (um_range_has(g_um.win_lo, g_um.win_hi, ptr, len)) return 1;
+    if (um_range_has(g_um.arena_lo, g_um.arena_hi, ptr, len)) return 1;
     if (um_range_has(g_um.stack_lo, g_um.stack_hi, ptr, len)) return 1;
     if (um_range_has(g_um.heap_lo, g_um.heap_hi, ptr, len)) return 1;
     for (uint32_t i = 0; i < g_um.n_mmaps; i++)
@@ -503,6 +560,7 @@ static int um_str_ok(uint64_t ptr) {
     if (ptr == 0) return 1;
     uint64_t end = 0;
     if (ptr >= g_um.win_lo && ptr < g_um.win_hi) end = g_um.win_hi;
+    else if (ptr >= g_um.arena_lo && ptr < g_um.arena_hi) end = g_um.arena_hi;
     else if (ptr >= g_um.stack_lo && ptr < g_um.stack_hi) end = g_um.stack_hi;
     else if (ptr >= g_um.heap_lo && ptr < g_um.heap_hi) end = g_um.heap_hi;
     else for (uint32_t i = 0; i < g_um.n_mmaps; i++)
@@ -1195,9 +1253,18 @@ static uint64_t um_build_stack(char *const argv[], char *const envp[],
 #define UM_NAUX 9
     size_t vecsz = 8 + (argc + 1) * 8 + (envc + 1) * 8 + UM_NAUX * 16 + 16;
     size_t stacksz = 1u << 20;
-    uint8_t *mem = mmap(NULL, stacksz, PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (mem == MAP_FAILED) return 0;
+    uint8_t *mem;
+    if (g_cfg.arena_hi > g_cfg.arena_lo &&
+        g_cfg.arena_hi - g_cfg.arena_lo >= stacksz) {
+        /* Process-per-guest: build the SysV stack inside the supervisor's
+         * MAP_SHARED arena, so the guest's writable world is a region the
+         * supervisor also maps and can validate against. */
+        mem = (uint8_t *)(uintptr_t)g_cfg.arena_lo;
+    } else {
+        mem = mmap(NULL, stacksz, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mem == MAP_FAILED) return 0;
+    }
     uint64_t base = (uint64_t)(uintptr_t)mem, top = base + stacksz;
     uint64_t strp = top - strsz;
     uint64_t randp = strp - 16;
@@ -1376,12 +1443,15 @@ static void um_exec_continue(void) {
     if (!rsp) um_child_fail(shared, WEMU_UM_ERR_INTERNAL);
     free(im.file);                             /* strings now live in g_exec */
 
-    /* Replace the current guest image: release the old image window and the
-     * old SysV stack before the new ranges become the trapped window. */
+    /* Replace the current guest image: release the old image window, and the
+     * old SysV stack UNLESS it is the supervisor's MAP_SHARED arena (the new
+     * stack was just built in that same region — unmapping it would pull the
+     * rug out from under the image we are about to enter). */
     (void)munmap((void *)(uintptr_t)g_um.win_lo,
                  (size_t)(g_um.win_hi - g_um.win_lo));
-    (void)munmap((void *)(uintptr_t)g_um.stack_lo,
-                 (size_t)(g_um.stack_hi - g_um.stack_lo));
+    if (!(g_um.stack_lo == g_cfg.arena_lo && g_um.stack_hi == g_cfg.arena_lo + (1u << 20)))
+        (void)munmap((void *)(uintptr_t)g_um.stack_lo,
+                     (size_t)(g_um.stack_hi - g_um.stack_lo));
 
     /* Reset every per-run state the new image must not inherit: syscall and
      * denial budgets, guest signal table, admitted mmap/heap ranges and the
@@ -1477,6 +1547,10 @@ static void um_child_run(const char *path, char *const argv[], char *const envp[
     g_um.win_hi = im.hi;
     g_um.stack_lo = stack_lo;
     g_um.stack_hi = stack_hi;
+    g_um.arena_lo = g_cfg.arena_lo;          /* supervisor's MAP_SHARED region */
+    g_um.arena_hi = g_cfg.arena_hi;
+    shared->arena_lo = g_um.arena_lo;
+    shared->arena_hi = g_um.arena_hi;
     /* The initial brk is the floor of the bounded guest heap; query it
      * BEFORE the trap filter is installed (host code, never trapped). */
     g_um.heap_lo = (uint64_t)(int64_t)syscall(SYS_brk, 0);
@@ -1516,6 +1590,17 @@ static void um_child_run(const char *path, char *const argv[], char *const envp[
     uc.uc_mcontext.gregs[REG_EFL] = 0x202;    /* IF=1, reserved bit 1 */
     uc.uc_mcontext.gregs[REG_RDX] = 0;        /* rtld_fini */
     sigemptyset(&uc.uc_sigmask);             /* all signals live in the guest */
+
+    /* Process-per-guest isolation: strip host-only mappings from THIS process
+     * before the guest's first instruction.  The supervisor (parent) keeps
+     * its own copies.  A short count fails closed.  With the switch off this
+     * is a no-op, reproducing the old shared-address-space behaviour. */
+    uint32_t hidden = 0;
+    if (g_cfg.enabled) {
+        hidden = um_hide_host_pages();
+        if (hidden != g_cfg.n_hide) um_child_fail(shared, WEMU_UM_ERR_TRAP);
+    }
+    shared->host_pages_hidden = hidden;
 
     uintptr_t sp;
     __asm__ volatile ("mov %%rsp, %0" : "=r"(sp));

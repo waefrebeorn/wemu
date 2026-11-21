@@ -18,3 +18,4 @@ test_isa_atomic_fence
 /tests/threaded_guest
 /tests/sandbox_probe
 /tests/exec_chain
+/tests/isolate_probe

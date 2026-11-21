@@ -13,7 +13,7 @@ TESTS = test_isa test_avx test_paging test_machine test_string test_cpuid \
         test_exceptions test_isa_atomic_fence test_idt test_priv test_faults \
         test_segments test_cpl test_iret test_tss test_task_switch \
         test_task_gates test_ldt test_call_gate_priv test_task_gpr \
-        test_usermode_native test_usermode_exec
+        test_usermode_native test_usermode_exec test_usermode_isolate
 
 all: libwemu.a
 
@@ -24,6 +24,7 @@ THREAD_FIX = tests/threaded_guest
 EXEC_FIX   = tests/exec_chain
 PIE_BINS   = $(PIE_STATIC) $(PIE_DYN) $(FORK_FIX) $(THREAD_FIX) $(EXEC_FIX)
 SANDBOX_BIN = tests/sandbox_probe
+ISOLATE_BIN = tests/isolate_probe
 
 src/wemu_usermode.o: CFLAGS += -fno-stack-protector
 # The native user-mode signal handlers run on the guest stack after the guest
@@ -47,8 +48,16 @@ test_usermode_native: tests/test_usermode_native.c libwemu.a $(PIE_BINS) $(SANDB
 test_usermode_exec: tests/test_usermode_exec.c libwemu.a $(EXEC_FIX) $(PIE_DYN)
 	$(CC) $(CFLAGS) -o $@ $< libwemu.a -lm
 
+# Freestanding process-per-guest isolation differential guest (raw syscalls).
+test_usermode_isolate: tests/test_usermode_isolate.c libwemu.a $(ISOLATE_BIN)
+	$(CC) $(CFLAGS) -o $@ $< libwemu.a -lm
+
 # Freestanding sandbox differential guest (raw syscalls, no libc).
 tests/sandbox_probe: tests/sandbox_probe.c
+	$(CC) -static -nostdlib -no-pie -ffreestanding -fno-builtin -O2 -o $@ $<
+
+# Freestanding isolation differential guest (raw syscalls, no libc).
+tests/isolate_probe: tests/isolate_probe.c
 	$(CC) -static -nostdlib -no-pie -ffreestanding -fno-builtin -O2 -o $@ $<
 
 # Self-relocating static PIE (ET_DYN, no PT_INTERP) — also the fork/clone fixture.
@@ -76,7 +85,7 @@ test: $(TESTS)
 	@echo "ALL WEMU GATES PASS"
 
 clean:
-	rm -f $(OBJ) $(OBJ:.o=.d) libwemu.a $(TESTS) $(PIE_BINS) $(SANDBOX_BIN)
+	rm -f $(OBJ) $(OBJ:.o=.d) libwemu.a $(TESTS) $(PIE_BINS) $(SANDBOX_BIN) $(ISOLATE_BIN)
 
 -include $(OBJ:.o=.d)
 .PHONY: all test clean
