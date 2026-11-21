@@ -23,4 +23,5 @@ test_isa_atomic_fence
 /tests/exec_fork
 /tests/exec_script
 /tests/thread_exec
+/tests/clone3_thread
 /tests/wemu_script_*.scr

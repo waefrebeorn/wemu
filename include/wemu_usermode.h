@@ -69,9 +69,29 @@ typedef enum {
     WEMU_UM_DISPATCH_FORK,       /* fork/vfork: bounded COW guest child */
     WEMU_UM_DISPATCH_CLONE,      /* clone: same, but flags checked first */
     WEMU_UM_DISPATCH_CLONE3,     /* clone3: clone_args flags checked first */
+    WEMU_UM_DISPATCH_SIGPROCMASK,/* rt_sigprocmask: per-thread masks fail closed
+                                  * when they touch WEMU's own signals */
     WEMU_UM_DISPATCH_BRK,        /* brk: bounded heap growth, range tracked */
     WEMU_UM_DISPATCH_EXECVE      /* execve/execveat: bounded image replacement */
 } WemuUmDispatch;
+
+/* Exact fail-closed reasons.  `refuses[code]` in WemuUmResult counts how many
+ * times each shape was refused, so a gate can assert WHY a request failed
+ * instead of only that `denied` went up.  Every refusal also returns an errno
+ * to the guest (-EINVAL unless noted) and leaves the image/thread state intact. */
+#define WEMU_UM_REFUSE_CLONE3_PIDFD      1u  /* CLONE_PIDFD flag or clone_args.pidfd */
+#define WEMU_UM_REFUSE_CLONE3_SIGMASK    2u  /* CLONE_CLEAR_SIGHAND (unmodeled
+                                             * signal-handler reset) */
+#define WEMU_UM_REFUSE_CLONE3_SHAPE      3u  /* clone_args outside the bounded
+                                             * fork/thread shape (incl. bad ptr) */
+#define WEMU_UM_REFUSE_CLONE_PIDFD       4u  /* raw SYS_clone with CLONE_PIDFD */
+#define WEMU_UM_REFUSE_SIGPROCMASK       5u  /* rt_sigprocmask masking a signal
+                                             * WEMU needs (SIGSYS/ALRM/USR2) */
+#define WEMU_UM_REFUSE_CLONE3_DISABLED   6u  /* bounded clone3 thread with the
+                                             * new path switched off (old path) */
+#define WEMU_UM_REFUSE_CLONE3_SIGMASK_SIZE 7u  /* clone_args larger than v0
+                                                * (future sigmask field): -E2BIG */
+#define WEMU_UM_N_REFUSE                 8u
 
 typedef struct {
     uint32_t        nr;
@@ -92,6 +112,10 @@ typedef struct {
     uint32_t  exec_thread;       /* image replacements issued by a non-root
                                     CLONE_THREAD guest (bounded thread-exec) */
     uint32_t  denied_nrs[8];     /* distinct unlisted/refused syscall numbers */
+    uint32_t  refuses[WEMU_UM_N_REFUSE]; /* exact fail-closed reason counts
+                                          * (indexed by WEMU_UM_REFUSE_*) */
+    uint32_t  clone3_threads;    /* bounded shared-VM host threads created via
+                                    * the modeled clone3 CLONE_THREAD shape */
     uint32_t  bad_ptrs;          /* guest pointers refused before host dispatch */
     uint32_t  bad_ptr_nr;        /* syscall number of the last refused pointer */
     uint64_t  bad_ptr_va;        /* the refused guest pointer (host-address-shaped) */
@@ -147,9 +171,26 @@ int wemu_um_clone_thread_flags_modeled(uint64_t flags);
 /* 1 when these raw clone flags describe a thread whose execve WEMU will
  * admit: exactly the bounded shared-VM CLONE_THREAD shape (CLONE_VM +
  * CLONE_THREAD + CLONE_SIGHAND, optional CLONE_SETTLS/TID bits, no exit
- * signal, no namespaces).  Any other thread shape — pidfd / clone3 thread
- * flags / per-thread signal masks / unlisted bits — fails closed. */
+ * signal, no namespaces).  Any other thread shape — pidfd / per-thread
+ * signal masks / unlisted bits — fails closed.  The bounded clone3 thread
+ * shape maps onto exactly this flag set before the host clone is issued. */
 int wemu_um_thread_exec_modeled(uint64_t flags);
+
+/* 1 when a Linux x86-64 `struct clone_args` (exactly `size` bytes, v0 = 88)
+ * describes the bounded shared-VM CLONE_THREAD shape WEMU admits through
+ * clone3: flags == the modeled CLONE_THREAD form (no CLONE_PIDFD /
+ * CLONE_CLEAR_SIGHAND / namespaces / exit signal), pidfd == 0, an in-bounds
+ * stack + stack_size, TLS only with CLONE_SETTLS, and only the TID pointers
+ * the declared flags require.  Anything else — pidfd fields, a larger struct
+ * (future per-thread sigmask), unlisted flags, bad stack/tid knobs — fails
+ * closed.  Pure predicate: no I/O, safe for the gate to audit off-line. */
+int wemu_um_clone3_thread_modeled(const void *args, size_t size);
+
+/* Negative-control switch: when disabled, a bounded clone3 CLONE_THREAD
+ * request is refused with -EINVAL and no host thread is created (the OLD
+ * path, where clone3 admitted only fork-shaped requests).  ON by default.
+ * Returns 0, or -1 for a value other than 0/1. */
+int wemu_um_set_clone3_thread_enabled(int enabled);
 
 /* Negative-control switch for the differential gate: when disabled, an
  * execve issued by a non-root shared-VM thread is refused exactly as in the

@@ -44,6 +44,17 @@
  * around blocking host calls.  A bounded clone handshake stops a parent from
  * overwriting the bootstrap record before the child copies it.
  *
+ * Bounded clone3 thread: the SAME thread shape submitted through clone3's
+ * struct clone_args is admitted when args are exactly v0 (88 bytes), pidfd,
+ * CLONE_PIDFD/CLONE_CLEAR_SIGHAND, namespaces, exit signal, set_tid and cgroup
+ * are all absent, and the stack/TLS/TID knobs match the declared flags.  The
+ * fields are translated to the equivalent raw SYS_clone arguments and the
+ * bounded thread path above creates the host thread.  clone3 requests that
+ * are not this shape or the bounded fork shape fail closed with an exact
+ * reason code in WemuUmResult.refuses[].  Per-thread signal masks remain
+ * unmodeled: CLONE_CLEAR_SIGHAND is refused, and rt_sigprocmask may not mask
+ * SIGSYS/SIGALRM/SIGUSR2 (WEMU's control signals).
+ *
  * TLS rule: the guest owns %fs while our handlers run (it sets it with
  * arch_prctl).  Every syscall/invocation from a handler is therefore a RAW
  * syscall or a TLS-free helper — glibc's syscall() wrapper would write errno
@@ -139,7 +150,7 @@ static const WemuUmSyscallEntry um_table[] = {
     { VSL_SYS_BRK,             "brk",              WEMU_UM_DISPATCH_BRK },
     { VSL_SYS_RT_SIGACTION,    "rt_sigaction",    WEMU_UM_DISPATCH_SIGACTION },
     { WEMU_UM_SYS_RT_SIGRETURN,"rt_sigreturn",    WEMU_UM_DISPATCH_SIGRETURN },
-    { VSL_SYS_RT_SIGPROCMASK,  "rt_sigprocmask",  WEMU_UM_DISPATCH_HOST },
+    { VSL_SYS_RT_SIGPROCMASK,  "rt_sigprocmask",  WEMU_UM_DISPATCH_SIGPROCMASK },
     { VSL_SYS_IOCTL,           "ioctl",           WEMU_UM_DISPATCH_HOST },
     { VSL_SYS_WRITEV,          "writev",          WEMU_UM_DISPATCH_HOST },
     { WEMU_UM_SYS_SENDFILE,    "sendfile",        WEMU_UM_DISPATCH_HOST },
@@ -236,6 +247,8 @@ enum { UM_WHY_EXIT = 1, UM_WHY_FAULT, UM_WHY_BUDGET, UM_WHY_ALARM, UM_WHY_BADPTR
 #define UM_CLONE_PARENT_SETTID 0x00100000ull
 #define UM_CLONE_CHILD_CLEARTID 0x00200000ull
 #define UM_CLONE_CHILD_SETTID  0x01000000ull
+#define UM_CLONE_PIDFD         0x00001000ull   /* CLONE_PIDFD: not modeled */
+#define UM_CLONE_CLEAR_SIGHAND 0x100000000ull  /* CLONE_CLEAR_SIGHAND: not modeled */
 #define UM_THREAD_FLAG_MASK  (UM_CLONE_VM | UM_CLONE_FS | UM_CLONE_FILES | \
                               UM_CLONE_SIGHAND | UM_CLONE_THREAD | UM_CLONE_SYSVSEM | \
                               UM_CLONE_SETTLS | UM_CLONE_PARENT_SETTID | \
@@ -335,6 +348,7 @@ static struct {
     int enabled;
     int pkey_mode;               /* WEMU_UM_PKEY_AUTO or FORCE_FALLBACK */
     int thread_exec_enabled;     /* bounded execve from a CLONE_THREAD guest */
+    int clone3_thread_enabled;   /* bounded CLONE_THREAD via clone3 (old-path control) */
     int fd_ofd_check_enabled;    /* bind admitted fds to their OFD (kcmp) */
     /* Negative-control knobs for the fd-identity differential gates.  Both
      * default to the hardened behaviour; the gate flips them to reproduce the
@@ -342,7 +356,8 @@ static struct {
     int fd_kcmp_forced_off;      /* 1 = pretend kcmp is unavailable (-ENOSYS) */
     int fd_cloexec_refuse;       /* 1 = OLD path: refuse every CLOEXEC fd */
 } g_cfg = { .enabled = 1, .pkey_mode = WEMU_UM_PKEY_AUTO,
-            .thread_exec_enabled = 1, .fd_ofd_check_enabled = 1,
+            .thread_exec_enabled = 1, .clone3_thread_enabled = 1,
+            .fd_ofd_check_enabled = 1,
             .fd_kcmp_forced_off = 0, .fd_cloexec_refuse = 0 };
 
 /* CPU-enforced protection-key state, built in the forked guest child before
@@ -378,6 +393,7 @@ void wemu_um_reset_isolation(void) {
     g_cfg.enabled = 1;
     g_cfg.pkey_mode = WEMU_UM_PKEY_AUTO;
     g_cfg.thread_exec_enabled = 1;
+    g_cfg.clone3_thread_enabled = 1;
     g_cfg.fd_ofd_check_enabled = 1;
     g_cfg.fd_kcmp_forced_off = 0;
     g_cfg.fd_cloexec_refuse = 0;
@@ -392,6 +408,12 @@ int wemu_um_set_isolation_enabled(int enabled) {
 int wemu_um_set_thread_exec_enabled(int enabled) {
     if (enabled != 0 && enabled != 1) return -1;
     g_cfg.thread_exec_enabled = enabled;
+    return 0;
+}
+
+int wemu_um_set_clone3_thread_enabled(int enabled) {
+    if (enabled != 0 && enabled != 1) return -1;
+    g_cfg.clone3_thread_enabled = enabled;
     return 0;
 }
 
@@ -415,9 +437,10 @@ int wemu_um_set_fd_cloexec_refuse(int refuse) {
 
 /* The exec-from-thread policy is exactly the modeled shared-VM CLONE_THREAD
  * shape; keeping it a single predicate makes the handler and the gate audit
- * the same rule.  pidfd / clone3 / signal-mask thread shapes never reach a
- * slot because they are refused at clone time, so a slot that reaches exec
- * is always one whose recorded flags pass this. */
+ * the same rule.  A slot that reaches exec was admitted at clone time: raw
+ * clone or the bounded clone3 shape both record these flags.  Requests with
+ * pidfd / signal-mask knobs are refused before a slot is allocated, so they
+ * never reach exec. */
 int wemu_um_thread_exec_modeled(uint64_t flags) {
     return wemu_um_clone_thread_flags_modeled(flags);
 }
@@ -1180,17 +1203,78 @@ typedef struct {
              stack, stack_size, tls, set_tid, set_tid_size, cgroup;
 } UmCloneArgs;
 
-static int um_clone3_modeled(const uint64_t a[6]) {
-    UmCloneArgs ca;
-    if (a[1] < sizeof ca || !a[0]) return 0;
-    memcpy(&ca, (const void *)(uintptr_t)a[0], sizeof ca);
-    /* No pidfd/tid/tls/stack knobs: all of them imply either shared state
-     * or a child starting on a different stack, which we do not model. */
-    if (ca.pidfd || ca.child_tid || ca.parent_tid || ca.stack ||
-        ca.stack_size || ca.tls || ca.set_tid || ca.set_tid_size || ca.cgroup)
+/* Bounded fork-shaped clone3: the form admitted before the clone3 thread
+ * path existed.  No pidfd/tid/tls/stack knobs — every one implies shared
+ * state or a child starting on a different stack, which we do not model. */
+static int um_clone3_fork_ok(const UmCloneArgs *ca, size_t size) {
+    if (size != sizeof *ca) return 0;
+    if (ca->pidfd || ca->child_tid || ca->parent_tid || ca->stack ||
+        ca->stack_size || ca->tls || ca->set_tid || ca->set_tid_size || ca->cgroup)
         return 0;
-    if (ca.flags != 0) return 0;
-    return ca.exit_signal == 0 || ca.exit_signal == SIGCHLD;
+    if (ca->flags & (UM_CLONE_PIDFD | UM_CLONE_CLEAR_SIGHAND)) return 0;
+    if (ca->flags != 0) return 0;
+    return ca->exit_signal == 0 || ca->exit_signal == SIGCHLD;
+}
+
+/* Pure shape predicate: is this exactly v0 clone_args for the bounded
+ * shared-VM CLONE_THREAD form?  No I/O — the gate audits the same rule. */
+static int um_clone3_thread_shape(const UmCloneArgs *ca, size_t size) {
+    if (size != sizeof *ca) return 0;
+    if (ca->flags & (UM_CLONE_PIDFD | UM_CLONE_CLEAR_SIGHAND)) return 0;
+    if (ca->pidfd || ca->set_tid || ca->set_tid_size || ca->cgroup) return 0;
+    if (!wemu_um_clone_thread_flags_modeled(ca->flags)) return 0;
+    if (ca->exit_signal != 0) return 0;             /* a thread has no exit signal */
+    /* The kernel puts the child's RSP at stack + stack_size.  Bound both so a
+     * hostile guest cannot wrap the pointer or claim the whole address space. */
+    if (ca->stack == 0 || ca->stack_size < 4096 ||
+        ca->stack_size > (1ull << 26)) return 0;
+    if (ca->stack > UINT64_MAX - ca->stack_size) return 0;
+    /* TLS and the TID pointers must match the declared flags — no silent
+     * extra kernel writes into guest memory through an undeclared knob. */
+    if (!(ca->flags & UM_CLONE_SETTLS) && ca->tls) return 0;
+    if (((ca->flags & UM_CLONE_PARENT_SETTID) != 0) != (ca->parent_tid != 0))
+        return 0;
+    if (((ca->flags & (UM_CLONE_CHILD_SETTID | UM_CLONE_CHILD_CLEARTID)) != 0) !=
+        (ca->child_tid != 0)) return 0;
+    return 1;
+}
+
+int wemu_um_clone3_thread_modeled(const void *args, size_t size) {
+    UmCloneArgs ca;
+    if (!args || size < sizeof ca) return 0;
+    memcpy(&ca, args, sizeof ca);
+    return um_clone3_thread_shape(&ca, size);
+}
+
+/* Classify a clone3 syscall: 1 = bounded CLONE_THREAD (new path), 0 = bounded
+ * fork (old path), -1 = fail closed with *reason = a WEMU_UM_REFUSE_* code.
+ * The guest struct is read through the mapped-range check before it is
+ * copied, so a bogus pointer never makes the host read supervisor memory. */
+static int um_clone3_classify(const uint64_t a[6], UmCloneArgs *ca, int *reason) {
+    *reason = WEMU_UM_REFUSE_CLONE3_SHAPE;
+    memset(ca, 0, sizeof *ca);
+    if (!a[0] || !um_ptr_ok(a[0], sizeof *ca)) return -1;
+    if (a[1] < sizeof *ca) return -1;               /* truncated struct */
+    memcpy(ca, (const void *)(uintptr_t)a[0], sizeof *ca);
+    /* A longer struct may carry a per-thread sigmask (unmodeled): exact
+     * diagnostic, and the kernel's own -E2BIG is returned to the guest. */
+    if (a[1] > sizeof *ca) {
+        *reason = WEMU_UM_REFUSE_CLONE3_SIGMASK_SIZE;
+        return -1;
+    }
+    /* pidfd (flag or field) and signal-handler reset are the two unmodeled
+     * knobs; classify them separately so the gate sees an exact reason. */
+    if ((ca->flags & UM_CLONE_PIDFD) || ca->pidfd) {
+        *reason = WEMU_UM_REFUSE_CLONE3_PIDFD;
+        return -1;
+    }
+    if (ca->flags & UM_CLONE_CLEAR_SIGHAND) {
+        *reason = WEMU_UM_REFUSE_CLONE3_SIGMASK;
+        return -1;
+    }
+    if (um_clone3_thread_shape(ca, a[1])) return 1;
+    if (um_clone3_fork_ok(ca, a[1])) return 0;
+    return -1;
 }
 
 /* One shared counter bounds the whole process tree, not just this process. */
@@ -1372,6 +1456,23 @@ static int64_t um_host_unlocked(uint64_t nr, uint64_t a[6]) {
     return ret;
 }
 
+/* Fast-path fail-closed refusal: no lock is held here (the CLONE_THREAD path
+ * above runs lock-free), so take it just long enough to record the denial and
+ * the exact reason.  The guest sees an errno; no host syscall is dispatched. */
+static void um_refuse_fast(ucontext_t *uc, UmThread *th, greg_t *r, uint64_t nr,
+                           int reason, int err) {
+    __atomic_fetch_add(&g_um.syscalls, 1, __ATOMIC_SEQ_CST);
+    um_lock();
+    um_note_denied(nr);
+    if ((unsigned)reason < WEMU_UM_N_REFUSE) g_um.result->refuses[reason]++;
+    um_unlock();
+    r[REG_RAX] = (greg_t)err;
+    um_skip_syscall(r);
+    if (__atomic_load_n(&g_um.syscalls, __ATOMIC_SEQ_CST) >= WEMU_UM_MAX_SYSCALLS ||
+        __atomic_load_n(&g_um.denied, __ATOMIC_SEQ_CST) > 8)
+        um_abort_to_finish(uc, th, UM_WHY_BUDGET);
+}
+
 static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
     (void)sig;
     ucontext_t *uc = (ucontext_t *)ucv;
@@ -1397,6 +1498,63 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
             __atomic_load_n(&g_um.denied, __ATOMIC_SEQ_CST) > 8)
             um_abort_to_finish(uc, th, UM_WHY_BUDGET);
         return;
+    }
+
+    /* CLONE_PIDFD is a pidfd-returning shape WEMU does not model.  Refuse
+     * before any host clone, with an exact reason (raw SYS_clone form). */
+    if (nr == VSL_SYS_CLONE && (a[0] & UM_CLONE_PIDFD)) {
+        um_refuse_fast(uc, th, r, nr, WEMU_UM_REFUSE_CLONE_PIDFD, -EINVAL);
+        return;
+    }
+
+    /* clone3 is classified here so the bounded CLONE_THREAD shape can create
+     * a real host thread without the dispatch lock (same reason as above).
+     * Every other shape either fails closed with an exact reason or is a
+     * bounded fork, which falls through to the COW dispatch below. */
+    if (nr == VSL_SYS_CLONE3) {
+        UmCloneArgs ca;
+        int reason = WEMU_UM_REFUSE_CLONE3_SHAPE;
+        int cls = um_clone3_classify(a, &ca, &reason);
+        if (cls < 0) {
+            um_refuse_fast(uc, th, r, nr, reason,
+                reason == WEMU_UM_REFUSE_CLONE3_SIGMASK_SIZE ? -E2BIG : -EINVAL);
+            return;
+        }
+        if (cls == 1) {
+            if (!g_cfg.clone3_thread_enabled) {   /* old path negative control */
+                um_refuse_fast(uc, th, r, nr, WEMU_UM_REFUSE_CLONE3_DISABLED,
+                               -EINVAL);
+                return;
+            }
+            /* The thread path bypasses um_ptr_args_ok, so validate the two
+             * TID pointers the host kernel writes before creating the thread. */
+            if (((ca.flags & UM_CLONE_PARENT_SETTID) &&
+                 !um_ptr_ok(ca.parent_tid, 4)) ||
+                ((ca.flags & (UM_CLONE_CHILD_SETTID | UM_CLONE_CHILD_CLEARTID)) &&
+                 !um_ptr_ok(ca.child_tid, 4))) {
+                um_refuse_fast(uc, th, r, nr, WEMU_UM_REFUSE_CLONE3_SHAPE,
+                               -EFAULT);
+                return;
+            }
+            /* Translate v0 clone_args into the raw SYS_clone argument shape
+             * the bounded thread path already models.  On x86-64 the kernel
+             * starts the child at stack + stack_size (the top of the stack). */
+            uint64_t na[6] = { ca.flags, ca.stack + ca.stack_size,
+                               ca.parent_tid, ca.child_tid, ca.tls, 0 };
+            int64_t pid = um_thread_clone(na, uc);
+            __atomic_fetch_add(&g_um.syscalls, 1, __ATOMIC_SEQ_CST);
+            if (pid > 0)
+                __atomic_fetch_add(&g_um.result->clone3_threads, 1,
+                                   __ATOMIC_SEQ_CST);
+            r[REG_RAX] = (greg_t)pid;
+            um_skip_syscall(r);
+            if (__atomic_load_n(&g_um.syscalls, __ATOMIC_SEQ_CST) >=
+                    WEMU_UM_MAX_SYSCALLS ||
+                __atomic_load_n(&g_um.denied, __ATOMIC_SEQ_CST) > 8)
+                um_abort_to_finish(uc, th, UM_WHY_BUDGET);
+            return;
+        }
+        /* cls == 0: bounded fork-shaped clone3; COW fork dispatch below. */
     }
 
     um_lock();
@@ -1534,8 +1692,16 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
                 um_lock(); um_note_denied(nr); um_unlock(); child = -EINVAL;
             } else child = um_do_fork(th);
         } else if (e->kind == WEMU_UM_DISPATCH_CLONE3) {
-            if (!um_clone3_modeled(a)) {
-                um_lock(); um_note_denied(nr); um_unlock(); child = -EINVAL;
+            UmCloneArgs c3;
+            int c3r = WEMU_UM_REFUSE_CLONE3_SHAPE;
+            /* The fast path classified this as the bounded fork form; confirm
+             * again before trusting the guest struct (fail closed otherwise). */
+            if (um_clone3_classify(a, &c3, &c3r) != 0) {
+                um_lock();
+                um_note_denied(nr);
+                if ((unsigned)c3r < WEMU_UM_N_REFUSE) g_um.result->refuses[c3r]++;
+                um_unlock();
+                child = -EINVAL;
             } else child = um_do_fork(th);
         } else {
             /* fork(2)/vfork(2): the kernel fixes exit_signal=SIGCHLD.  Our
@@ -1558,6 +1724,29 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
     int64_t ret = -EPERM;
     if (e->kind == WEMU_UM_DISPATCH_SIGACTION) {
         ret = um_sigaction(th, a);
+    } else if (e->kind == WEMU_UM_DISPATCH_SIGPROCMASK) {
+        /* Per-thread signal masks are unmodeled: a guest host thread that
+         * masks SIGSYS would stop trapping its own syscalls, one that masks
+         * SIGALRM would disable the run bound, and one that masks SIGUSR2
+         * would hang the exec quiesce handshake.  Read the kernel sigset and
+         * refuse (before any host call) when it touches a WEMU signal.  An
+         * empty set / a pure query (set == NULL) still passes through. */
+        uint64_t setmask = 0;
+        if (a[1] && a[3] == 8)
+            memcpy(&setmask, (const void *)(uintptr_t)a[1], 8);
+        const uint64_t wemu_signals =
+            (1ull << (SIGSYS - 1)) | (1ull << (SIGALRM - 1)) |
+            (1ull << (SIGUSR2 - 1));
+        if (setmask & wemu_signals) {
+            um_note_denied(nr);
+            g_um.result->refuses[WEMU_UM_REFUSE_SIGPROCMASK]++;
+            r[REG_RAX] = (greg_t)-EINVAL;
+            um_skip_syscall(r);
+            if (g_um.denied > 8) um_abort_to_finish(uc, th, UM_WHY_BUDGET);
+            um_unlock();
+            return;
+        }
+        ret = um_host_unlocked(nr, a);
     } else if (e->kind == WEMU_UM_DISPATCH_EXEC_GUARD) {
         /* mmap(addr,len,prot,flags,..) / mprotect(addr,len,prot): a guest may
          * only make executable memory inside the registered image window,

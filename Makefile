@@ -15,7 +15,7 @@ TESTS = test_isa test_avx test_paging test_machine test_string test_cpuid \
         test_task_gates test_ldt test_call_gate_priv test_task_gpr \
         test_usermode_native test_usermode_exec test_usermode_isolate \
         test_usermode_mpk test_usermode_exec2 test_usermode_execfd \
-        test_usermode_threadexec
+        test_usermode_threadexec test_usermode_clone3
 
 all: libwemu.a
 
@@ -26,7 +26,8 @@ THREAD_FIX = tests/threaded_guest
 EXEC_FIX   = tests/exec_chain
 EXEC2_FIX  = tests/script_interp tests/exec_fork tests/exec_script
 TEXEC_FIX  = tests/thread_exec
-PIE_BINS   = $(PIE_STATIC) $(PIE_DYN) $(FORK_FIX) $(THREAD_FIX) $(EXEC_FIX) $(EXEC2_FIX) $(TEXEC_FIX)
+C3_FIX     = tests/clone3_thread
+PIE_BINS   = $(PIE_STATIC) $(PIE_DYN) $(FORK_FIX) $(THREAD_FIX) $(EXEC_FIX) $(EXEC2_FIX) $(TEXEC_FIX) $(C3_FIX)
 SANDBOX_BIN = tests/sandbox_probe
 ISOLATE_BIN = tests/isolate_probe
 
@@ -62,6 +63,10 @@ test_usermode_execfd: tests/test_usermode_execfd.c libwemu.a $(EXEC_FIX) tests/p
 
 # Bounded execve-from-CLONE_THREAD differential gate (raw TLS-safe fixture).
 test_usermode_threadexec: tests/test_usermode_threadexec.c libwemu.a $(TEXEC_FIX)
+	$(CC) $(CFLAGS) -o $@ $< libwemu.a -lm
+
+# Bounded clone3 CLONE_THREAD + pidfd/sigmask fail-closed differential gate.
+test_usermode_clone3: tests/test_usermode_clone3.c libwemu.a $(C3_FIX)
 	$(CC) $(CFLAGS) -o $@ $< libwemu.a -lm
 
 # Freestanding process-per-guest isolation differential guest (raw syscalls).
@@ -110,6 +115,10 @@ tests/threaded_guest: tests/threaded_guest.c
 tests/thread_exec: tests/thread_exec.c
 	$(CC) -static-pie -O2 -fno-stack-protector -o $@ $<
 
+# Bounded clone3 thread fixture: raw TLS-safe static PIE (see above).
+tests/clone3_thread: tests/clone3_thread.c
+	$(CC) -static-pie -O2 -fno-stack-protector -o $@ $<
+
 # Real dynamically linked PIE: ET_DYN WITH PT_INTERP, refused fail-closed.
 tests/pie_dynamic: tests/pie_dynamic.c
 	$(CC) -O2 -o $@ $<
@@ -119,7 +128,7 @@ test: $(TESTS)
 	@echo "ALL WEMU GATES PASS"
 
 clean:
-	rm -f $(OBJ) $(OBJ:.o=.d) libwemu.a $(TESTS) $(PIE_BINS) $(SANDBOX_BIN) $(ISOLATE_BIN)
+	rm -f $(OBJ) $(OBJ:.o=.d) libwemu.a $(TESTS) $(PIE_BINS) $(C3_FIX) $(SANDBOX_BIN) $(ISOLATE_BIN)
 
 -include $(OBJ:.o=.d)
 .PHONY: all test clean
