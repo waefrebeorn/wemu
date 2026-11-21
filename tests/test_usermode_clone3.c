@@ -16,11 +16,18 @@
  * 4. Negative control (old path): with the bounded clone3 thread path
  *    disabled, the same fixture is refused exactly as before (-EINVAL, no
  *    host thread, denied>0, reason CLONE3_DISABLED).
+ * 5. Per-thread dispositions: each modeled CLONE_THREAD guest owns a private
+ *    rt_sigaction table inherited by copy at clone; a fault runs the faulting
+ *    thread's handler.  Distinct signals are byte-exact vs the host; the same
+ *    signal in both threads proves per-thread routing, with the shared-table
+ *    old path as a negative control.  Unsupported signals, sigset sizes and
+ *    out-of-image handlers fail closed with an exact SIGACTION reason.
  * License: WaefreBeorn Umbrella License v3.0. */
 #define _GNU_SOURCE
 #include "wemu_usermode.h"
 
 #include <errno.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -88,6 +95,36 @@ static const char WANT_FORK[] =
     "C3FORK-CHILD\n"
     "C3FORK-WAIT-OK=1\n"
     "C3FORK-PARENT\n";
+
+/* Per-thread signal dispositions.  Mode "d" uses DISTINCT signals so a real
+ * kernel (shared CLONE_SIGHAND dispositions) and WEMU's per-thread tables are
+ * byte-exact: the child's query-only readback sees the handler the root
+ * installed before clone (inherited copy), and each fault runs its owner's
+ * handler.  Mode "x" registers the SAME signal in both threads: WEMU keeps
+ * the two tables separate while the old process-wide path clobbers the root's
+ * disposition with the child's (negative control).  Mode "s" submits three
+ * unsupported sigaction shapes, all refused by WEMU but real on the host. */
+static const char WANT_DISP[] =
+    "D-ROOT-SET-RC=0\n"
+    "D-QUERY-RC=0\n"
+    "D-INHERIT=1\n"
+    "D-CHILD-SET-RC=0\n"
+    "D-CHILD-HANDLER\n"
+    "D-ROOT-HANDLER\n";
+static const char WANT_DISP_X[] =
+    "X-ROOT-SET-RC=0\n"
+    "X-CHILD-SET-RC=0\n"
+    "X-CHILD-HANDLER\n"
+    "X-ROOT-HANDLER\n";
+static const char WANT_DISP_X_OLD[] =
+    "X-ROOT-SET-RC=0\n"
+    "X-CHILD-SET-RC=0\n"
+    "X-CHILD-HANDLER\n"
+    "X-CHILD-HANDLER\n";
+static const char WANT_DISP_S[] =
+    "SA-USR1-RC=-22\n"
+    "SA-SIZE-RC=-22\n"
+    "SA-ADDR-RC=-22\n";
 
 typedef struct { char b[WEMU_UM_OUT_MAX]; size_t n; } Cap;
 
@@ -548,6 +585,113 @@ static void test_fork_positive(void) {
     printf("ok: BOUNDED clone3 FORK — positive byte-exact host differential\n");
 }
 
+/* ---- per-thread signal disposition table ------------------------------ */
+static void test_disp_positive(void) {
+    Cap oracle;
+    int he = host_exec("d", &oracle);
+    if (he != 0) FAIL("host disp exit=%d want 0\n", he);
+    check_exact("host disp", oracle.b, oracle.n, WANT_DISP,
+                sizeof WANT_DISP - 1);
+
+    WemuUmResult r;
+    int rc = wemu_exec("d", &r);
+    if (rc != WEMU_UM_OK)
+        FAIL("disp status=%s out=[%s]\n", wemu_um_status_name(rc), r.out);
+    if (r.exit_code != 0) FAIL("disp exit=%d want 0\n", r.exit_code);
+    check_exact("wemu disp", r.out, r.out_len, oracle.b, oracle.n);
+    /* Two rt_sigaction registrations (root's SIGFPE + child's SIGILL) land in
+     * two DIFFERENT per-thread tables; two faults are delivered from those
+     * tables.  A query-only readback is not a registration. */
+    if (r.sig_disp_registrations != 2 || r.signals_delivered != 2 ||
+        r.signals_denied != 0 || r.threads_created != 1 ||
+        r.clone3_threads != 1 || r.forks != 0 || r.denied != 0)
+        FAIL("disp counts: reg=%u del=%u den=%u threads=%u c3=%u forks=%u "
+             "syscalls=%llu\n", r.sig_disp_registrations, r.signals_delivered,
+             r.signals_denied, r.threads_created, r.clone3_threads, r.forks,
+             (unsigned long long)r.denied);
+    for (unsigned i = 0; i < WEMU_UM_N_REFUSE; i++)
+        if (r.refuses[i]) FAIL("disp positive run refuse[%u]=%u\n", i, r.refuses[i]);
+    printf("        (reg=%u, sigdel=%u; byte-exact vs host)\n",
+           r.sig_disp_registrations, r.signals_delivered);
+    printf("ok: PER-THREAD SIGNAL DISPOSITIONS — distinct signals byte-exact "
+           "vs host, inherited copy + per-thread delivery\n");
+}
+
+static void test_disp_fail_closed(void) {
+    /* Pure shape predicate: only synchronous-fault signals with the exact
+     * kernel sigaction size are admitted; every other shape fails closed. */
+    if (!wemu_um_sigaction_modeled(SIGSEGV, 8) ||
+        !wemu_um_sigaction_modeled(SIGBUS, 8) ||
+        !wemu_um_sigaction_modeled(SIGILL, 8) ||
+        !wemu_um_sigaction_modeled(SIGFPE, 8) ||
+        wemu_um_sigaction_modeled(SIGUSR1, 8) ||
+        wemu_um_sigaction_modeled(SIGSYS, 8) ||
+        wemu_um_sigaction_modeled(SIGSEGV, 16) ||
+        wemu_um_sigaction_modeled(0, 8) ||
+        wemu_um_sigaction_modeled(-1, 8))
+        FAIL("sigaction shape predicate edges\n");
+    if (wemu_um_set_thread_disp_enabled(2) != -1 ||
+        wemu_um_set_thread_disp_enabled(1) != 0)
+        FAIL("per-thread-disposition negative-control switch validation\n");
+
+    WemuUmResult r;
+    int rc = wemu_exec("s", &r);
+    if (rc != WEMU_UM_OK)
+        FAIL("disp fail-closed status=%s out=[%s]\n",
+             wemu_um_status_name(rc), r.out);
+    if (r.exit_code != 0) FAIL("disp fail-closed exit=%d want 0\n", r.exit_code);
+    check_exact("wemu disp refuse", r.out, r.out_len, WANT_DISP_S,
+                sizeof WANT_DISP_S - 1);
+    /* Unsupported signal, bad sigsetsize and out-of-image handler each get
+     * the SAME exact reason; no handler is registered, no thread created, no
+     * host sigaction dispatched. */
+    if (r.refuses[WEMU_UM_REFUSE_SIGACTION] != 3 || r.signals_denied < 3 ||
+        r.sig_disp_registrations != 0 || r.signals_delivered != 0 ||
+        r.threads_created != 0 || r.clone3_threads != 0)
+        FAIL("disp refuse counts: sigaction=%u sigden=%u reg=%u del=%u "
+             "threads=%u c3=%u\n",
+             r.refuses[WEMU_UM_REFUSE_SIGACTION], r.signals_denied,
+             r.sig_disp_registrations, r.signals_delivered,
+             r.threads_created, r.clone3_threads);
+    printf("ok: FAIL-CLOSED sigaction — unmodeled signal/bad size/outside-image "
+           "handler refused (exact=%u), no host handler\n",
+           r.refuses[WEMU_UM_REFUSE_SIGACTION]);
+}
+
+static void test_disp_isolation(void) {
+    WemuUmResult r;
+    int rc = wemu_exec("x", &r);
+    if (rc != WEMU_UM_OK)
+        FAIL("disp isolation status=%s out=[%s]\n",
+             wemu_um_status_name(rc), r.out);
+    if (r.exit_code != 0) FAIL("disp isolation exit=%d want 0\n", r.exit_code);
+    check_exact("wemu disp isolation", r.out, r.out_len, WANT_DISP_X,
+                sizeof WANT_DISP_X - 1);
+    if (r.sig_disp_registrations != 2 || r.signals_delivered != 2 ||
+        r.signals_denied != 0 || r.threads_created != 1)
+        FAIL("disp isolation counts: reg=%u del=%u den=%u threads=%u\n",
+             r.sig_disp_registrations, r.signals_delivered,
+             r.signals_denied, r.threads_created);
+    printf("ok: DISPATCH ROUTING — same signal, different handlers per thread "
+           "(root handler ran in root, child's in child)\n");
+
+    /* NEGATIVE CONTROL: the OLD process-wide table makes the child's
+     * registration clobber the root's, so the root's fault runs the child's
+     * handler and the byte stream differs from the per-thread model. */
+    if (wemu_um_set_thread_disp_enabled(0) != 0)
+        FAIL("disable per-thread dispositions\n");
+    WemuUmResult old;
+    rc = wemu_exec("x", &old);
+    (void)wemu_um_set_thread_disp_enabled(1);      /* restore default */
+    if (rc != WEMU_UM_OK || old.exit_code != 0)
+        FAIL("old-path disp isolation: status=%s exit=%d\n",
+             wemu_um_status_name(rc), old.exit_code);
+    check_exact("wemu disp isolation old", old.out, old.out_len,
+                WANT_DISP_X_OLD, sizeof WANT_DISP_X_OLD - 1);
+    printf("ok: NEGATIVE CONTROL (shared dispositions) — child clobbers root, "
+           "root ran child handler; byte stream differs from per-thread\n");
+}
+
 int main(void) {
     wemu_um_reset_isolation();
     test_policy();
@@ -557,10 +701,13 @@ int main(void) {
     test_fail_closed2();
     test_refuse3();
     test_fork_positive();
+    test_disp_positive();
+    test_disp_fail_closed();
+    test_disp_isolation();
     test_negative_old_path();
     printf("WEMU BOUNDED CLONE3-THREAD GATE PASS (host-byte-exact bounded "
-           "thread + virtual per-thread masks; pidfd/tid/cgroup/fork fail "
-           "closed; exact pidfd/clear-sighand refusals; bounded clone3 fork "
-           "byte-exact; old paths refuse)\n");
+           "thread + virtual per-thread masks + per-thread signal dispositions; "
+           "pidfd/tid/cgroup/fork fail closed; exact pidfd/clear-sighand/"
+           "sigaction refusals; bounded clone3 fork byte-exact; old paths refuse)\n");
     return 0;
 }

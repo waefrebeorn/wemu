@@ -275,9 +275,22 @@ enum { UM_WHY_EXIT = 1, UM_WHY_FAULT, UM_WHY_BUDGET, UM_WHY_ALARM, UM_WHY_BADPTR
                               UM_CLONE_SETTLS | UM_CLONE_PARENT_SETTID | \
                               UM_CLONE_CHILD_CLEARTID | UM_CLONE_CHILD_SETTID)
 
+/* Bounded per-thread signal disposition table.  Only synchronous-fault
+ * signals live here; a modeled CLONE_THREAD guest owns a private copy, a new
+ * thread inherits a COPY of its parent's table, and a synchronous fault is
+ * delivered from the FAULTING thread's table.  The legacy process-wide table
+ * (used when the negative-control switch is off) is a separate UmSigDisp so
+ * the two paths cannot alias. */
+typedef struct {
+    uint64_t handler[WEMU_UM_SIG_NSIG];
+    uint64_t restorer[WEMU_UM_SIG_NSIG];
+    uint32_t flags[WEMU_UM_SIG_NSIG];
+    uint8_t  valid[WEMU_UM_SIG_NSIG];
+} UmSigDisp;
+
 /* Per-thread run state.  The guest owns %fs, so THIS cannot be __thread;
  * instead each bounded host thread owns a slot, selected by raw gettid().
- * Shared address-space state (ranges, counters, signal table, result page)
+ * Shared address-space state (ranges, counters, fd table, result page)
  * stays in g_um below and is guarded by the dispatch lock. */
 typedef struct {
     volatile long tid;               /* 0 = free slot */
@@ -297,6 +310,9 @@ typedef struct {
      * the host thread: SIGSYS/ALRM/USR2 stay dispatchable while the guest
      * thinks it has blocked an ordinary signal. */
     uint64_t sig_mask;
+    /* Private signal disposition table for this modeled thread.  Allocated
+     * per slot (not __thread); a CLONE_THREAD child inherits a copy. */
+    UmSigDisp disp;
 } UmThread;
 
 #define UM_SHAPE_THREAD 1u
@@ -355,11 +371,10 @@ static struct {
     int      fault_code;           /* si_code of last guest sync fault */
     int      fault_pkey;           /* si_pkey of a SEGV_PKUERR fault, -1 else */
     WemuUmResult *result;
-    /* process-wide signal dispositions (CLONE_SIGHAND shares these) */
-    uint64_t sig_handler[WEMU_UM_SIG_NSIG];
-    uint64_t sig_restorer[WEMU_UM_SIG_NSIG];
-    uint32_t sig_flags[WEMU_UM_SIG_NSIG];
-    uint8_t  sig_valid[WEMU_UM_SIG_NSIG];
+    /* Legacy PROCESS-WIDE signal dispositions (CLONE_SIGHAND shared).  Used
+     * only by the negative-control path (per-thread dispositions disabled);
+     * the hardened path stores dispositions in each UmThread.disp instead. */
+    UmSigDisp shared_disp;
 } g_um;
 
 /* Supervisor-side isolation configuration.  Set by the gate BEFORE
@@ -376,6 +391,7 @@ static struct {
     int thread_exec_enabled;     /* bounded execve from a CLONE_THREAD guest */
     int clone3_thread_enabled;   /* bounded CLONE_THREAD via clone3 (old-path control) */
     int sigmask_virtual_enabled; /* guest masks stay in per-thread state */
+    int thread_disp_enabled;     /* per-thread rt_sigaction disposition tables */
     int exact_refuse_enabled;    /* dedicated refuse codes instead of coarse */
     int fd_ofd_check_enabled;    /* bind admitted fds to their OFD (kcmp) */
     /* Negative-control knobs for the fd-identity differential gates.  Both
@@ -385,8 +401,8 @@ static struct {
     int fd_cloexec_refuse;       /* 1 = OLD path: refuse every CLOEXEC fd */
 } g_cfg = { .enabled = 1, .pkey_mode = WEMU_UM_PKEY_AUTO,
             .thread_exec_enabled = 1, .clone3_thread_enabled = 1,
-            .sigmask_virtual_enabled = 1, .exact_refuse_enabled = 1,
-            .fd_ofd_check_enabled = 1,
+            .sigmask_virtual_enabled = 1, .thread_disp_enabled = 1,
+            .exact_refuse_enabled = 1, .fd_ofd_check_enabled = 1,
             .fd_kcmp_forced_off = 0, .fd_cloexec_refuse = 0 };
 
 /* CPU-enforced protection-key state, built in the forked guest child before
@@ -424,6 +440,7 @@ void wemu_um_reset_isolation(void) {
     g_cfg.thread_exec_enabled = 1;
     g_cfg.clone3_thread_enabled = 1;
     g_cfg.sigmask_virtual_enabled = 1;
+    g_cfg.thread_disp_enabled = 1;
     g_cfg.exact_refuse_enabled = 1;
     g_cfg.fd_ofd_check_enabled = 1;
     g_cfg.fd_kcmp_forced_off = 0;
@@ -452,6 +469,20 @@ int wemu_um_set_sigmask_virtual_enabled(int enabled) {
     if (enabled != 0 && enabled != 1) return -1;
     g_cfg.sigmask_virtual_enabled = enabled;
     return 0;
+}
+
+int wemu_um_set_thread_disp_enabled(int enabled) {
+    if (enabled != 0 && enabled != 1) return -1;
+    g_cfg.thread_disp_enabled = enabled;
+    return 0;
+}
+
+/* The disposition table the caller must read/write: the faulting thread's
+ * private table on the hardened path, the legacy process-wide table on the
+ * negative-control path.  Both live in shared VM, so a CLONE_THREAD child may
+ * copy its parent's via *um_disp(parent) before the raw clone. */
+static UmSigDisp *um_disp(UmThread *th) {
+    return g_cfg.thread_disp_enabled ? &th->disp : &g_um.shared_disp;
 }
 
 int wemu_um_set_exact_refuse_enabled(int enabled) {
@@ -718,8 +749,15 @@ static int um_sig_sync(int sig) {
 
 int wemu_um_signal_modeled(int sig) { return um_sig_sync(sig); }
 
-static int um_sig_registered(int sig) {
-    return sig > 0 && sig < WEMU_UM_SIG_NSIG && g_um.sig_valid[sig];
+int wemu_um_sigaction_modeled(int sig, uint64_t sigsetsize) {
+    return um_sig_sync(sig) && sigsetsize == 8;
+}
+
+/* Registered in the CALLING thread's disposition table (or the legacy shared
+ * table on the negative-control path), never process-wide on the hardened
+ * path.  A fault is delivered from the faulting thread's own table. */
+static int um_sig_registered(int sig, UmThread *th) {
+    return sig > 0 && sig < WEMU_UM_SIG_NSIG && um_disp(th)->valid[sig];
 }
 
 static void um_finish(void) __attribute__((noreturn));
@@ -1012,7 +1050,8 @@ static void um_thread_child_bootstrap(void) {
  * virtual signal mask, just as the kernel would inherit a real one.  Returns
  * the child tid to the guest. */
 static int64_t um_thread_clone(const uint64_t a[6], ucontext_t *uc,
-                               uint64_t parent_sigmask) {
+                               uint64_t parent_sigmask,
+                               const UmSigDisp *parent_disp) {
     uint32_t used = __atomic_fetch_add(&g_um.result->threads_created, 1,
                                        __ATOMIC_SEQ_CST);
     if (used >= WEMU_UM_MAX_THREADS - 1u) {
@@ -1032,6 +1071,13 @@ static int64_t um_thread_clone(const uint64_t a[6], ucontext_t *uc,
      * thread that is not the bounded CLONE_THREAD form. */
     th->clone_flags = a[0];
     th->modeled_thread = wemu_um_thread_exec_modeled(a[0]) ? UM_SHAPE_THREAD : 0;
+    /* A new thread inherits a COPY of its parent's signal dispositions.  The
+     * child slot lives in shared VM (CLONE_VM), so seeding it before the raw
+     * clone is race-free: the parent has not published the slot to any guest
+     * yet.  On the negative-control path every thread reads the shared table
+     * instead, so seeding is a harmless no-op there. */
+    if (g_cfg.thread_disp_enabled && parent_disp)
+        th->disp = *parent_disp;
 
     um_lock();
     __atomic_store_n(&g_boot_ready, 0, __ATOMIC_RELEASE);
@@ -1187,30 +1233,43 @@ typedef struct {
 static int64_t um_sigaction(UmThread *th, const uint64_t a[6]) {
     int sig = (int)a[0];
     uint64_t act = a[1], oldact = a[2], ssz = a[3];
-    if (sig <= 0 || sig >= WEMU_UM_SIG_NSIG || ssz != 8 || !um_sig_sync(sig)) {
+    if (!wemu_um_sigaction_modeled(sig, ssz)) {
         th->sig_denied++;
+        g_um.result->refuses[WEMU_UM_REFUSE_SIGACTION]++;
         return -EINVAL;
     }
+    UmSigDisp *d = um_disp(th);        /* this thread's table, never global */
     UmKernelSigaction ksa;
-    if (act) memcpy(&ksa, (const void *)(uintptr_t)act, sizeof ksa);
-    else     memset(&ksa, 0, sizeof ksa);
+    /* act == NULL is a QUERY, not a SIG_DFL registration: fill oldact from
+     * this thread's disposition and leave the table untouched. */
+    if (!act) {
+        if (oldact) {
+            UmKernelSigaction old = { d->handler[sig], d->flags[sig],
+                                      d->restorer[sig], 0 };
+            memcpy((void *)(uintptr_t)oldact, &old, sizeof old);
+        }
+        return 0;
+    }
+    memcpy(&ksa, (const void *)(uintptr_t)act, sizeof ksa);
     if (oldact) {
-        UmKernelSigaction old = { g_um.sig_handler[sig], g_um.sig_flags[sig],
-                                  g_um.sig_restorer[sig], 0 };
+        UmKernelSigaction old = { d->handler[sig], d->flags[sig],
+                                  d->restorer[sig], 0 };
         memcpy((void *)(uintptr_t)oldact, &old, sizeof old);
     }
     if (ksa.handler == SIG_DFL_ || ksa.handler == SIG_IGN_) {
-        g_um.sig_valid[sig] = 0;             /* unregister */
+        d->valid[sig] = 0;             /* unregister in THIS thread only */
         return 0;
     }
     if (ksa.handler < g_um.win_lo || ksa.handler >= g_um.win_hi) {
         th->sig_denied++;                        /* handler outside the image */
+        g_um.result->refuses[WEMU_UM_REFUSE_SIGACTION]++;
         return -EINVAL;
     }
-    g_um.sig_handler[sig]  = ksa.handler;
-    g_um.sig_restorer[sig] = ksa.restorer;
-    g_um.sig_flags[sig]    = (uint32_t)ksa.flags;
-    g_um.sig_valid[sig]    = 1;
+    d->handler[sig]  = ksa.handler;
+    d->restorer[sig] = ksa.restorer;
+    d->flags[sig]    = (uint32_t)ksa.flags;
+    d->valid[sig]    = 1;
+    g_um.result->sig_disp_registrations++;
     return 0;
 }
 
@@ -1381,7 +1440,12 @@ static int64_t um_do_fork(UmThread *th) {
         UmThread *c = &g_thr[0];
         greg_t saved_rsp = th->child_rsp;
         uint64_t inherited_mask = th->sig_mask;   /* fork inherits the mask */
+        /* A private-COW child inherits the parent's signal dispositions.  The
+         * slot memset below would clear this thread's table, so save it (from
+         * the hardened per-thread table, or the legacy shared one) first. */
+        UmSigDisp inherited_disp = *um_disp(th);
         memset(c, 0, sizeof *c);
+        c->disp = inherited_disp;
         c->tid = um_raw_gettid();
         c->active = 1;
         c->is_root = 0;
@@ -1595,11 +1659,12 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
     if (!th || !th->active) _exit(200);      /* never dispatch outside a run */
 
     /* CLONE_CLEAR_SIGHAND asks the kernel to reset the child's signal handlers
-     * to SIG_DFL.  WEMU models signal dispositions process-wide (CLONE_SIGHAND
-     * shares them; there is no per-thread disposition table), so this knob
-     * cannot be honored.  Refuse BEFORE any host clone with an exact reason;
-     * with exact diagnostics off it falls through to the generic clone-flag
-     * policy below (OLD behaviour, negative control). */
+     * to SIG_DFL.  WEMU models per-thread disposition tables inherited by copy
+     * at clone, but this explicit reset knob is still unmodeled: honouring it
+     * would require a second, distinct shape inside the admitted CLONE_THREAD
+     * form.  Refuse BEFORE any host clone with an exact reason; with exact
+     * diagnostics off it falls through to the generic clone-flag policy below
+     * (OLD behaviour, negative control). */
     if (g_cfg.exact_refuse_enabled && nr == VSL_SYS_CLONE &&
         (a[0] & UM_CLONE_CLEAR_SIGHAND)) {
         um_refuse_fast(uc, th, r, nr, WEMU_UM_REFUSE_CLONE_CLEAR_SIGHAND, -EINVAL);
@@ -1610,7 +1675,7 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
      * lock: the new host thread resumes in the handler on the guest stack and
      * setcontext()s straight into guest code. */
     if (nr == VSL_SYS_CLONE && wemu_um_clone_thread_flags_modeled(a[0])) {
-        int64_t pid = um_thread_clone(a, uc, th->sig_mask);
+        int64_t pid = um_thread_clone(a, uc, th->sig_mask, um_disp(th));
         __atomic_fetch_add(&g_um.syscalls, 1, __ATOMIC_SEQ_CST);
         r[REG_RAX] = (greg_t)pid;
         um_skip_syscall(r);
@@ -1685,7 +1750,7 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
              * starts the child at stack + stack_size (the top of the stack). */
             uint64_t na[6] = { ca.flags, ca.stack + ca.stack_size,
                                ca.parent_tid, ca.child_tid, ca.tls, 0 };
-            int64_t pid = um_thread_clone(na, uc, th->sig_mask);
+            int64_t pid = um_thread_clone(na, uc, th->sig_mask, um_disp(th));
             __atomic_fetch_add(&g_um.syscalls, 1, __ATOMIC_SEQ_CST);
             if (pid > 0)
                 __atomic_fetch_add(&g_um.result->clone3_threads, 1,
@@ -1985,7 +2050,8 @@ static void um_fault(int sig, siginfo_t *si, void *ucv) {
     /* A pkey violation is never offered to a guest handler: the bytes are
      * unreadable by hardware, and retrying from a handler could only loop or
      * brute-force the key.  Fail closed straight to the result page. */
-    if (pku || !um_sig_sync(signo) || !in_guest || !um_sig_registered(signo) ||
+    UmSigDisp *d = um_disp(th);        /* fault uses THIS thread's disposition */
+    if (pku || !um_sig_sync(signo) || !in_guest || !um_sig_registered(signo, th) ||
         th->in_handler || th->sig_deliveries >= WEMU_UM_MAX_SIGNALS) {
         th->sig_denied++;                     /* fail closed, no delivery */
         um_abort_to_finish(uc, th, UM_WHY_FAULT);
@@ -2002,12 +2068,12 @@ static void um_fault(int sig, siginfo_t *si, void *ucv) {
      * epilogue will `ret`, with SysV stack alignment at handler entry.  We
      * only supply signo in RDI; siginfo/ucontext args are not populated. */
     greg_t sp = (r[REG_RSP] - 16) & ~(greg_t)15;
-    *(uint64_t *)(uintptr_t)(sp + 8) = g_um.sig_restorer[signo];
+    *(uint64_t *)(uintptr_t)(sp + 8) = d->restorer[signo];
     r[REG_RSP] = sp + 8;                        /* %16 == 8, [RSP]=restorer */
     r[REG_RDI] = (greg_t)signo;
     r[REG_RSI] = 0;
     r[REG_RDX] = 0;
-    r[REG_RIP] = (greg_t)g_um.sig_handler[signo];
+    r[REG_RIP] = (greg_t)d->handler[signo];
 }
 
 static void um_alarm(int sig, siginfo_t *si, void *ucv) {
@@ -2576,10 +2642,9 @@ static void um_exec_continue(void) {
     g_um.n_mmaps = 0;
     g_um.bad_ptrs = 0; g_um.bad_ptr_nr = 0; g_um.bad_ptr_va = 0;
     g_um.fault_code = 0; g_um.fault_pkey = -1;
-    memset(g_um.sig_handler, 0, sizeof g_um.sig_handler);
-    memset(g_um.sig_restorer, 0, sizeof g_um.sig_restorer);
-    memset(g_um.sig_flags, 0, sizeof g_um.sig_flags);
-    memset(g_um.sig_valid, 0, sizeof g_um.sig_valid);
+    memset(&g_um.shared_disp, 0, sizeof g_um.shared_disp);
+    /* Per-thread tables are cleared with their slots below (all slots are
+     * memset on image replacement), so no disposition survives the exec. */
     /* A root exec resets the whole process-tree accounting (shared MAP_SHARED
      * page).  A COW forked child must NOT clobber its parent's fork/thread
      * counts: it only records that an image replacement happened. */

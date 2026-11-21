@@ -114,7 +114,11 @@ typedef enum {
 #define WEMU_UM_REFUSE_CLONE_CLEAR_SIGHAND 14u /* CLONE_CLEAR_SIGHAND (raw clone
                                                * OR clone3): unmodeled per-thread
                                                * signal-handler reset */
-#define WEMU_UM_N_REFUSE                 15u
+#define WEMU_UM_REFUSE_SIGACTION         15u /* rt_sigaction outside the bounded
+                                             * per-thread disposition table:
+                                             * unmodeled signal, bad sigsetsize,
+                                             * or handler outside the image */
+#define WEMU_UM_N_REFUSE                 16u
 
 typedef struct {
     uint32_t        nr;
@@ -141,6 +145,8 @@ typedef struct {
                                     * the modeled clone3 CLONE_THREAD shape */
     uint32_t  sigmask_virtualized; /* rt_sigprocmask calls served from the
                                     * thread's virtual mask (NO host call) */
+    uint32_t  sig_disp_registrations; /* rt_sigaction registrations recorded in
+                                    * a modeled thread's disposition table */
     uint64_t  host_sigmask_end;  /* real host-thread mask at finish: control
                                   * evidence that no guest mask leaked to it */
     uint32_t  bad_ptrs;          /* guest pointers refused before host dispatch */
@@ -226,6 +232,15 @@ int wemu_um_clone3_fork_modeled(const void *args, size_t size);
  * thread's private state instead of the host thread. */
 int wemu_um_sigprocmask_modeled(int how, uint64_t set);
 
+/* Pure shape predicate for the bounded PER-THREAD signal disposition table:
+ * rt_sigaction is admitted only for a synchronous-fault signal in the modeled
+ * whitelist (SIGSEGV/SIGBUS/SIGILL/SIGFPE) with the exact x86-64 kernel
+ * sigaction size (8).  Every other signal or size fails closed (-EINVAL) and
+ * is counted under WEMU_UM_REFUSE_SIGACTION; no host handler is ever installed
+ * and no other thread's disposition table is touched.  Handler-in-image is a
+ * runtime check (the image window is only known at run time). */
+int wemu_um_sigaction_modeled(int sig, uint64_t sigsetsize);
+
 /* Negative-control switch: when disabled, a bounded clone3 CLONE_THREAD
  * request is refused with -EINVAL and no host thread is created (the OLD
  * path, where clone3 admitted only fork-shaped requests).  ON by default.
@@ -239,6 +254,14 @@ int wemu_um_set_clone3_thread_enabled(int enabled);
  * the host rt_sigprocmask (changing the host thread's real mask).  Returns 0,
  * or -1 for a value other than 0/1. */
 int wemu_um_set_sigmask_virtual_enabled(int enabled);
+
+/* Negative-control switch for per-thread signal dispositions.  ON (default):
+ * each modeled thread owns a private rt_sigaction table (a new CLONE_THREAD
+ * inherits a COPY of its parent's, and a synchronous fault is delivered from
+ * the faulting thread's table).  OFF: the OLD path, where every thread uses
+ * one process-wide shared table (registration by one thread clobbers another).
+ * Returns 0, or -1 for a value other than 0/1. */
+int wemu_um_set_thread_disp_enabled(int enabled);
 
 /* Negative-control switch for the exact fail-closed reasons.  ON (default):
  * pidfd_send_signal, clone_args.set_tid/cgroup and unmodeled fork shapes carry

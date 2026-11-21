@@ -33,6 +33,7 @@
 #define SYS_clone3_         435
 #define SYS_exit_           60
 #define SYS_exit_group_     231
+#define SYS_rt_sigaction_   13
 #define SYS_pidfd_send_signal_ 424
 #define SYS_pidfd_open_     434
 #define SYS_pidfd_getfd_    438
@@ -55,6 +56,15 @@
 
 #define SIG_SETMASK_ 2
 #define SIGSYS_      31
+#define SIGILL_      4
+#define SIGFPE_      8
+#define SA_RESTORER_ 0x04000000u
+
+/* Kernel x86-64 rt_sigaction layout: handler@0, flags@8, restorer@16,
+ * mask@24.  Only the synchronous-fault signals are modeled by WEMU. */
+struct local_sigaction {
+    uint64_t handler, flags, restorer, mask;
+};
 
 struct local_clone_args {
     uint64_t flags, pidfd, child_tid, parent_tid, exit_signal,
@@ -71,6 +81,11 @@ static long rsys(long n, long a0, long a1, long a2, long a3, long a4, long a5) {
         : "a"(n), "D"(a0), "S"(a1), "d"(a2), "r"(r10), "r"(r8), "r"(r9)
         : "rcx", "r11", "memory");
     return ret;
+}
+
+static long raw_sigaction(int sig, const struct local_sigaction *act,
+                          struct local_sigaction *old, unsigned long ssz) {
+    return rsys(SYS_rt_sigaction_, sig, (long)act, (long)old, ssz, 0, 0);
 }
 
 static void emit(const char *s, unsigned long n) {
@@ -319,6 +334,134 @@ static int run_fork(void) {
     return 0;
 }
 
+/* ---- per-thread signal dispositions -----------------------------------
+ * Each modeled CLONE_THREAD guest owns a private rt_sigaction table: a new
+ * thread inherits a COPY of its parent's table and a synchronous fault is
+ * delivered from the FAULTING thread's table.  Mode "d" registers DISTINCT
+ * signals in root (SIGFPE) and child (SIGILL) so a real kernel (which shares
+ * dispositions under CLONE_SIGHAND) and WEMU's per-thread model are byte-exact
+ * identical: query-only readback sees the inherited handler and each fault
+ * runs its owner's handler.  Mode "x" registers the SAME signal with different
+ * handlers in both threads: WEMU's per-thread tables keep them separate while
+ * the OLD process-wide path clobbers one with the other (negative control).
+ * Handlers terminate from inside the signal frame — the synthetic delivery
+ * does not repair the faulting instruction, so there is no retry. */
+static volatile int disp_done;
+
+/* SA_RESTORER trampoline.  A real kernel needs a valid restorer to build the
+ * signal frame; WEMU's bounded delivery records but never uses it because the
+ * handlers below terminate from inside the frame. */
+static void disp_restorer(void) {
+    __asm__ volatile("mov $15, %%rax\n\tsyscall"   /* SYS_rt_sigreturn */
+                     ::: "rax", "rcx", "r11", "memory");
+}
+
+static const char d_child_h[] = "D-CHILD-HANDLER\n";
+static const char d_root_h[]  = "D-ROOT-HANDLER\n";
+static const char x_child_h[] = "X-CHILD-HANDLER\n";
+static const char x_root_h[]  = "X-ROOT-HANDLER\n";
+
+static void d_child_sigill(int sig) {
+    (void)sig;
+    emit(d_child_h, sizeof d_child_h - 1);
+    __atomic_store_n(&disp_done, 1, __ATOMIC_RELEASE);
+    (void)rsys(SYS_exit_, 0, 0, 0, 0, 0, 0);   /* end only this thread */
+    __builtin_unreachable();
+}
+static void d_root_sigfpe(int sig) {
+    (void)sig;
+    emit(d_root_h, sizeof d_root_h - 1);
+    (void)rsys(SYS_exit_group_, 0, 0, 0, 0, 0, 0);
+    __builtin_unreachable();
+}
+static void x_child_sigill(int sig) {
+    (void)sig;
+    emit(x_child_h, sizeof x_child_h - 1);
+    __atomic_store_n(&disp_done, 1, __ATOMIC_RELEASE);
+    (void)rsys(SYS_exit_, 0, 0, 0, 0, 0, 0);
+    __builtin_unreachable();
+}
+static void x_root_sigill(int sig) {
+    (void)sig;
+    emit(x_root_h, sizeof x_root_h - 1);
+    (void)rsys(SYS_exit_group_, 0, 0, 0, 0, 0, 0);
+    __builtin_unreachable();
+}
+
+__attribute__((noinline)) static void do_ud2(void) { __asm__ volatile("ud2"); }
+__attribute__((noinline)) static void do_div0(void) {
+    volatile unsigned z = 0;
+    unsigned out;
+    __asm__ volatile("xor %%edx,%%edx\n\tmov $1,%%eax\n\tdivl %1"
+                     : "=a"(out) : "m"(z) : "edx", "cc");
+    (void)out;
+}
+
+static long set_handler(int sig, uint64_t h) {
+    struct local_sigaction sa;
+    sa.handler = h;
+    sa.flags = SA_RESTORER_;
+    sa.restorer = (uint64_t)(uintptr_t)&disp_restorer;
+    sa.mask = 0;
+    return raw_sigaction(sig, &sa, 0, 8);
+}
+
+static int run_disp(void) {
+    struct local_sigaction old;
+    uint64_t rh = (uint64_t)(uintptr_t)&d_root_sigfpe;
+    emit_num("D-ROOT-SET-RC=", set_handler(SIGFPE_, rh));
+
+    struct local_clone_args ca;
+    base_args(&ca);
+    __atomic_store_n(&disp_done, 0, __ATOMIC_RELAXED);
+    long t = rsys(SYS_clone3_, (long)&ca, sizeof ca, 0, 0, 0, 0);
+    if (t == 0) {
+        memset(&old, 0, sizeof old);
+        emit_num("D-QUERY-RC=", raw_sigaction(SIGFPE_, 0, &old, 8));
+        emit_num("D-INHERIT=", old.handler == rh);
+        emit_num("D-CHILD-SET-RC=",
+                 set_handler(SIGILL_, (uint64_t)(uintptr_t)&d_child_sigill));
+        do_ud2();                       /* SIGILL -> d_child_sigill */
+        (void)rsys(SYS_exit_, 4, 0, 0, 0, 0, 0); /* unreachable */
+        __builtin_unreachable();
+    }
+    if (t < 0) { emit(refused, sizeof refused - 1); return 7; }
+    while (!__atomic_load_n(&disp_done, __ATOMIC_ACQUIRE)) { }
+    do_div0();                          /* SIGFPE -> d_root_sigfpe */
+    return 0;                           /* unreachable: handler exit_group */
+}
+
+static int run_disp_collide(void) {
+    uint64_t rh = (uint64_t)(uintptr_t)&x_root_sigill;
+    emit_num("X-ROOT-SET-RC=", set_handler(SIGILL_, rh));
+    struct local_clone_args ca;
+    base_args(&ca);
+    __atomic_store_n(&disp_done, 0, __ATOMIC_RELAXED);
+    long t = rsys(SYS_clone3_, (long)&ca, sizeof ca, 0, 0, 0, 0);
+    if (t == 0) {
+        emit_num("X-CHILD-SET-RC=",
+                 set_handler(SIGILL_, (uint64_t)(uintptr_t)&x_child_sigill));
+        do_ud2();                       /* per-thread: x_child_sigill */
+        (void)rsys(SYS_exit_, 4, 0, 0, 0, 0, 0); /* unreachable */
+        __builtin_unreachable();
+    }
+    if (t < 0) { emit(refused, sizeof refused - 1); return 7; }
+    while (!__atomic_load_n(&disp_done, __ATOMIC_ACQUIRE)) { }
+    do_ud2();       /* per-thread -> x_root_sigill; shared -> x_child_sigill */
+    return 0;
+}
+
+static int run_disp_refuse(void) {
+    struct local_sigaction sa;
+    sa.handler = (uint64_t)(uintptr_t)&d_root_sigfpe;
+    sa.flags = 0; sa.restorer = 0; sa.mask = 0;
+    emit_num("SA-USR1-RC=", raw_sigaction(SIGUSR1_, &sa, 0, 8));
+    emit_num("SA-SIZE-RC=", raw_sigaction(SIGFPE_, &sa, 0, 16));
+    sa.handler = 0x1000;               /* handler outside the guest image */
+    emit_num("SA-ADDR-RC=", raw_sigaction(SIGFPE_, &sa, 0, 8));
+    return 0;
+}
+
 int main(int argc, char **argv) {
     char mode = (argc >= 2 && argv[1][0]) ? argv[1][0] : 'o';
     int rc;
@@ -327,6 +470,9 @@ int main(int argc, char **argv) {
     else if (mode == '3') rc = run_refuse3();
     else if (mode == 'f') rc = run_fork();
     else if (mode == 'r') rc = run_refuse();
+    else if (mode == 'd') rc = run_disp();
+    else if (mode == 'x') rc = run_disp_collide();
+    else if (mode == 's') rc = run_disp_refuse();
     else                  rc = run_ok();
     (void)rsys(SYS_exit_group_, rc, 0, 0, 0, 0, 0);
     return rc;

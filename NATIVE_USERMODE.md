@@ -51,7 +51,12 @@ untrusted-guest sandbox. Nothing here is enabled implicitly by `wemu_cpu_run`.
    lock serialises shared bookkeeping and is dropped around blocking host
    calls.  `WEMU_UM_MAX_THREADS` bounds the whole thread group.
 8. **Bounded guest signal delivery**: `rt_sigaction` is intercepted into a
-   small guest signal table (never passed to the host). A synchronous CPU
+   PER-THREAD signal disposition table (never passed to the host). Each modeled
+   CLONE_THREAD guest owns a private table: a new thread inherits a COPY of its
+   parent's dispositions, and a synchronous CPU fault is delivered from the
+   FAULTING thread's table (so registering the same signal with different
+   handlers in two threads does not let one clobber the other). `act == NULL`
+   is a query-only readback and leaves the table untouched. A synchronous CPU
    fault from guest RIP (SIGSEGV/SIGBUS/SIGILL/SIGFPE) with a registered
    handler rewrites the ucontext to that handler, passing signo in RDI and
    the guest's `SA_RESTORER` as the return address; a normal handler epilogue
@@ -88,8 +93,10 @@ untrusted-guest sandbox. Nothing here is enabled implicitly by `wemu_cpu_run`.
   default-allow branch. `getcpu(309)` is the gate's negative control: the
   host supports it, the table does not list it, the guest gets `-ENOSYS`.
 - **Fail-closed signals**: only SIGSEGV/SIGBUS/SIGILL/SIGFPE can be registered
-  or delivered; `rt_sigaction` for any other signal returns `-EINVAL`. A
-  fault with no handler, outside the guest image, while already in a handler,
+  or delivered; `rt_sigaction` for any other signal, with a sigsetsize other
+  than 8, or with a handler outside the guest image returns `-EINVAL` and is
+  counted in `refuses[WEMU_UM_REFUSE_SIGACTION]`. No host handler is installed.
+  A fault with no handler, outside the guest image, while already in a handler,
   or after 16 deliveries is not delivered — the run unwinds with
   `WEMU_UM_ERR_FAULT`. Every refusal increments `signals_denied`.
 - **Fail-closed interpreter leg**: `wemu_cpu_load_elf()` still rejects
@@ -221,8 +228,10 @@ table entry against the kernel's `asm/unistd_64.h`.
   the differential fixture uses raw `SYS_clone` plus `CLONE_SETTLS` and reads
   its per-thread index from its own TLS block. `clone3` thread flags,
   `CLONE_NEW*` namespaces, nonzero thread exit signals, pidfds, thread
-  priorities/sched attributes, guest-owned signal masks per thread, and LTP
-  remain unmodelled. `WEMU_UM_MAX_THREADS - 1` host threads per run is a hard
+  priorities/sched attributes, `CLONE_CLEAR_SIGHAND`, pidfd authority and LTP
+  remain unmodelled. Per-thread virtual signal masks and per-thread signal
+  dispositions ARE modelled (inherited by copy at clone); cross-thread signal
+  targeting is not. `WEMU_UM_MAX_THREADS - 1` host threads per run is a hard
   ceiling; exhaustion returns `-EAGAIN`.
 - A guest signal delivered to one thread uses that thread's slot (no nesting);
   cross-thread signal targeting (`tgkill`) and `CLONE_CHILD_CLEARTID`-driven
