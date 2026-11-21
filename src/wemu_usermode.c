@@ -23,6 +23,17 @@
  * Delivery is bounded (WEMU_UM_MAX_SIGNALS, no nesting) and fails closed for
  * unknown signals, unregistered handlers and faults outside the guest image.
  *
+ * SA_SIGINFO + BOUNDED TGKILL: an SA_SIGINFO handler receives a synthetic
+ * siginfo_t (deterministic si_signo/code/errno plus si_addr for a fault or
+ * si_pid/uid for SI_TKILL) and ucontext_t (pre-delivery virtual mask and saved
+ * GPRs), byte-exact against a real host for those fields.  tgkill is admitted
+ * only for a modeled signal, the guest group's tgid and an admitted sibling
+ * thread slot; it queues ONE event in that thread's private slot (no host
+ * signal is sent) and the target consumes it at its own next syscall
+ * checkpoint, respecting that thread's disposition and mask.  Unmodeled
+ * shapes fail closed with exact WEMU_UM_REFUSE_TGKILL_* reasons.  FP/XMM state
+ * in the frame and truly asynchronous delivery remain unmodeled.
+ *
  * Bounded fork/clone: fork/vfork, clone and clone3 are dispatched in-process.
  * A fork-shaped request (CSIGNAL 0/SIGCHLD, optionally the two glibc TID
  * bookkeeping bits) becomes a raw SYS_fork from the SIGSYS handler: the guest
@@ -126,6 +137,7 @@
 #define WEMU_UM_SYS_PIDFD_GETFD      438 /* pidfd_getfd: bounded authority */
 #define UM_PIDFD_NONBLOCK            0x800u /* fcntl.h PIDFD_NONBLOCK (x86-64) */
 #define UM_SIGCONT                   18     /* x86-64 signal number (kernel) */
+#define WEMU_UM_SYS_TGKILL           234 /* bounded cross-thread signal target */
 #define UM_KCMP_FILE             0    /* linux/kcmp.h KCMP_FILE */
 #define UM_F_GETFD               1    /* fcntl(2) */
 #define UM_F_DUPFD_CLOEXEC       1030 /* fcntl.h (x86-64) */
@@ -185,10 +197,12 @@ static const WemuUmSyscallEntry um_table[] = {
     { VSL_SYS_RT_SIGACTION,    "rt_sigaction",    WEMU_UM_DISPATCH_SIGACTION },
     { WEMU_UM_SYS_RT_SIGRETURN,"rt_sigreturn",    WEMU_UM_DISPATCH_SIGRETURN },
     { VSL_SYS_RT_SIGPROCMASK,  "rt_sigprocmask",  WEMU_UM_DISPATCH_SIGPROCMASK },
+    { WEMU_UM_SYS_TGKILL,      "tgkill",          WEMU_UM_DISPATCH_TGKILL },
     { VSL_SYS_IOCTL,           "ioctl",           WEMU_UM_DISPATCH_HOST },
     { VSL_SYS_WRITEV,          "writev",          WEMU_UM_DISPATCH_HOST },
     { WEMU_UM_SYS_SENDFILE,    "sendfile",        WEMU_UM_DISPATCH_HOST },
     { VSL_SYS_GETPID,          "getpid",          WEMU_UM_DISPATCH_HOST },
+    { VSL_SYS_SCHED_YIELD,     "sched_yield",     WEMU_UM_DISPATCH_HOST },
     { VSL_SYS_UNAME,           "uname",           WEMU_UM_DISPATCH_HOST },
     { VSL_SYS_FCNTL,           "fcntl",           WEMU_UM_DISPATCH_HOST },
     { WEMU_UM_SYS_DUP3,        "dup3",            WEMU_UM_DISPATCH_HOST },
@@ -302,6 +316,18 @@ typedef struct {
     uint8_t  valid[WEMU_UM_SIG_NSIG];
 } UmSigDisp;
 
+/* The deterministic, host-comparable part of one guest signal event.  Fields
+ * not relevant to the event class are zero (e.g. si_addr for SI_TKILL, si_pid
+ * for a CPU fault), matching a real kernel's siginfo for the same event. */
+typedef struct {
+    int      signo;                  /* si_signo */
+    int      code;                   /* si_code: SEGV_* or SI_TKILL */
+    int      err;                    /* si_errno (zero for modeled events) */
+    uint64_t addr;                   /* si_addr for a synchronous fault */
+    int      pid;                    /* si_pid for SI_TKILL */
+    int      uid;                    /* si_uid for SI_TKILL */
+} UmSigEvent;
+
 /* Per-thread run state.  The guest owns %fs, so THIS cannot be __thread;
  * instead each bounded host thread owns a slot, selected by raw gettid().
  * Shared address-space state (ranges, counters, fd table, result page)
@@ -327,6 +353,14 @@ typedef struct {
     /* Private signal disposition table for this modeled thread.  Allocated
      * per slot (not __thread); a CLONE_THREAD child inherits a copy. */
     UmSigDisp disp;
+    /* Bounded cross-thread delivery: a tgkill from a sibling records ONE
+     * pending event here; the target consumes it at its next syscall
+     * checkpoint, into its OWN disposition table and register set.  `pending`
+     * is published with release after the payload is filled and cleared with
+     * an acq_rel exchange, so sender and target never race on a half-written
+     * event. */
+    UmSigEvent pending_ev;
+    volatile int pending;
 } UmThread;
 
 #define UM_SHAPE_THREAD 1u
@@ -421,6 +455,7 @@ static struct {
     int clone3_thread_enabled;   /* bounded CLONE_THREAD via clone3 (old-path control) */
     int sigmask_virtual_enabled; /* guest masks stay in per-thread state */
     int thread_disp_enabled;     /* per-thread rt_sigaction disposition tables */
+    int tgkill_enabled;          /* bounded cross-thread signal targeting */
     int exact_refuse_enabled;    /* dedicated refuse codes instead of coarse */
     int fd_ofd_check_enabled;    /* bind admitted fds to their OFD (kcmp) */
     /* Negative-control knobs for the fd-identity differential gates.  Both
@@ -432,6 +467,7 @@ static struct {
 } g_cfg = { .enabled = 1, .pkey_mode = WEMU_UM_PKEY_AUTO,
             .thread_exec_enabled = 1, .clone3_thread_enabled = 1,
             .sigmask_virtual_enabled = 1, .thread_disp_enabled = 1,
+            .tgkill_enabled = 1,
             .exact_refuse_enabled = 1, .fd_ofd_check_enabled = 1,
             .fd_kcmp_forced_off = 0, .fd_cloexec_refuse = 0,
             .pidfd_authority_enabled = 1 };
@@ -508,6 +544,12 @@ int wemu_um_set_sigmask_virtual_enabled(int enabled) {
 int wemu_um_set_thread_disp_enabled(int enabled) {
     if (enabled != 0 && enabled != 1) return -1;
     g_cfg.thread_disp_enabled = enabled;
+    return 0;
+}
+
+int wemu_um_set_tgkill_enabled(int enabled) {
+    if (enabled != 0 && enabled != 1) return -1;
+    g_cfg.tgkill_enabled = enabled;
     return 0;
 }
 
@@ -809,6 +851,10 @@ int wemu_um_set_pidfd_authority_enabled(int enabled) {
     g_cfg.pidfd_authority_enabled = enabled;
     return 0;
 }
+
+/* tgkill may only carry a modeled signal.  tgid/tid admission is a runtime
+ * check against the bounded thread slots, not a pure shape property. */
+int wemu_um_tgkill_modeled(int sig) { return um_sig_sync(sig); }
 
 /* Registered in the CALLING thread's disposition table (or the legacy shared
  * table on the negative-control path), never process-wide on the hardened
@@ -1807,6 +1853,159 @@ static int64_t um_sigprocmask_virtual(UmThread *th, const uint64_t a[6]) {
     return 0;
 }
 
+/* ---- SA_SIGINFO delivery + bounded cross-thread (tgkill) targeting --- */
+#define UM_SA_SIGINFO 0x00000004u        /* kernel SA_SIGINFO in sigaction.flags */
+#define UM_SI_TKILL   (-6)               /* linux/signal.h: signal sent by tgkill */
+
+/* Build the guest signal frame.  Only the deterministic siginfo fields are
+ * supplied (signo/code/errno plus si_addr for a fault, or si_pid/si_uid for
+ * SI_TKILL); every other siginfo byte and all FP context are zero — XMM/x87
+ * frame state is a documented remaining gap.  A byte-exact guest oracle can
+ * read signo, code, errno, addr/pid/uid, the virtual signal mask and the saved
+ * GPRs and get the same values on a real host and under WEMU.  Returns -1 (and
+ * changes nothing) when the frame would not fit in guest-mapped memory. */
+static int um_deliver_frame(UmThread *th, greg_t *r, const UmSigEvent *ev) {
+    UmSigDisp *d = um_disp(th);
+    int signo = ev->signo;
+    int sainfo = (d->flags[signo] & UM_SA_SIGINFO) != 0;
+
+    /* Linux places the frame ABOVE the handler's entry RSP: [RSP] is the
+     * restorer, and siginfo/ucontext live at higher addresses.  The handler's
+     * own pushes then grow downward into free stack and never overwrite the
+     * frame.  entry%16==8, matching a normal call's callee-entry alignment. */
+    uintptr_t old = (uintptr_t)r[REG_RSP];
+    uintptr_t uc_at = (old - sizeof(ucontext_t) - 16u) & ~(uintptr_t)15u;
+    uintptr_t si_at = (uc_at - sizeof(siginfo_t)) & ~(uintptr_t)15u;
+    uintptr_t entry = si_at - 8u;
+    if (entry >= old || si_at < entry ||
+        !um_ptr_ok(entry, (uint64_t)(old - entry)))
+        return -1;
+
+    /* Save the interrupted registers: rt_sigreturn restores exactly these, so
+     * the guest resumes where it was interrupted (fault RIP or post-syscall). */
+    memcpy(th->saved_gregs, r, sizeof th->saved_gregs);
+    th->saved_valid = 1;
+    th->in_handler = 1;
+    th->sig_deliveries++;
+
+    if (sainfo) {
+        siginfo_t sifo;
+        memset(&sifo, 0, sizeof sifo);
+        sifo.si_signo = ev->signo;
+        sifo.si_errno = ev->err;
+        sifo.si_code = ev->code;
+        if (ev->code == UM_SI_TKILL) {
+            sifo.si_pid = ev->pid;
+            sifo.si_uid = ev->uid;
+        } else {
+            sifo.si_addr = (void *)(uintptr_t)ev->addr;
+        }
+        ucontext_t uctx;
+        memset(&uctx, 0, sizeof uctx);
+        memcpy(uctx.uc_mcontext.gregs, th->saved_gregs,
+               sizeof uctx.uc_mcontext.gregs);
+        /* The kernel saves the mask that was in force BEFORE delivery into
+         * uc_sigmask (it applies the handler's mask afterwards), so expose
+         * the target's current virtual mask unchanged — byte-exact vs host. */
+        sigemptyset(&uctx.uc_sigmask);
+        for (int s = 1; s < 32; s++)
+            if ((th->sig_mask >> (s - 1)) & 1ull) sigaddset(&uctx.uc_sigmask, s);
+        memcpy((void *)(uintptr_t)uc_at, &uctx, sizeof uctx);
+        memcpy((void *)(uintptr_t)si_at, &sifo, sizeof sifo);
+        r[REG_RSI] = (greg_t)si_at;
+        r[REG_RDX] = (greg_t)uc_at;
+        __atomic_fetch_add(&g_um.result->siginfo_deliveries, 1,
+                           __ATOMIC_SEQ_CST);
+    } else {
+        r[REG_RSI] = 0;
+        r[REG_RDX] = 0;
+    }
+    *(uint64_t *)(uintptr_t)entry = (uint64_t)d->restorer[signo];
+    r[REG_RSP] = (greg_t)entry;
+    r[REG_RDI] = (greg_t)signo;
+    r[REG_RIP] = (greg_t)d->handler[signo];
+    return 0;
+}
+
+/* Consume a pending cross-thread signal at the TARGET thread's next syscall
+ * checkpoint.  Mask, disposition, nesting and budget are the TARGET's own
+ * state: a blocked signal stays queued (one bounded slot) until it is
+ * unblocked; no handler, nesting or budget exhaustion fails closed. */
+static void um_check_pending(UmThread *th, greg_t *r) {
+    if (!__atomic_load_n(&th->pending, __ATOMIC_ACQUIRE)) return;
+    UmSigEvent ev;
+    memcpy(&ev, &th->pending_ev, sizeof ev);
+    int signo = ev.signo;
+    if (signo <= 0 || !um_sig_sync(signo)) {
+        __atomic_store_n(&th->pending, 0, __ATOMIC_RELEASE);
+        th->sig_denied++;
+        return;
+    }
+    if ((th->sig_mask >> (signo - 1)) & 1ull) return;   /* stays pending */
+    __atomic_store_n(&th->pending, 0, __ATOMIC_RELEASE);
+    if (th->in_handler || th->sig_deliveries >= WEMU_UM_MAX_SIGNALS ||
+        !um_sig_registered(signo, th)) {
+        th->sig_denied++;
+        return;
+    }
+    if (um_deliver_frame(th, r, &ev) != 0) th->sig_denied++;
+}
+
+/* Bounded tgkill: the tgid must be the guest thread group's (a raw getpid in
+ * this group), the tid must name an admitted modeled thread slot, and the
+ * signal must be in the synchronous set.  No host signal is sent: the event is
+ * queued in the target's private slot and delivered by um_check_pending in
+ * that thread.  Every unmodeled shape fails closed with an exact reason and a
+ * kernel-shaped errno (-ESRCH for a missing group/thread, -EINVAL otherwise). */
+static int64_t um_tgkill(UmThread *th, const uint64_t a[6]) {
+    int64_t tgid = (int64_t)a[0];
+    long tid = (long)a[1];
+    int signo = (int)a[2];
+    long self_tgid = um_raw0(39 /* SYS_getpid */);
+    /* The kernel rejects a non-positive tgid as an invalid argument before it
+     * looks for a process; a positive-but-unknown tgid is simply not found. */
+    if (tgid <= 0) {
+        th->sig_denied++;
+        g_um.result->refuses[WEMU_UM_REFUSE_TGKILL_TGID]++;
+        return -EINVAL;
+    }
+    if (tgid != (int64_t)self_tgid) {
+        th->sig_denied++;
+        g_um.result->refuses[WEMU_UM_REFUSE_TGKILL_TGID]++;
+        return -ESRCH;
+    }
+    if (!wemu_um_tgkill_modeled(signo)) {
+        th->sig_denied++;
+        g_um.result->refuses[WEMU_UM_REFUSE_TGKILL_SIG]++;
+        return -EINVAL;
+    }
+    UmThread *target = NULL;
+    for (unsigned i = 0; i < WEMU_UM_MAX_THREADS; i++) {
+        UmThread *c = &g_thr[i];
+        if (c->tid == tid && __atomic_load_n(&c->active, __ATOMIC_ACQUIRE) &&
+            c->modeled_thread == UM_SHAPE_THREAD) { target = c; break; }
+    }
+    if (!target) {
+        th->sig_denied++;
+        g_um.result->refuses[WEMU_UM_REFUSE_TGKILL_TID]++;
+        return -ESRCH;
+    }
+    if (__atomic_load_n(&target->pending, __ATOMIC_ACQUIRE)) {
+        th->sig_denied++;
+        g_um.result->refuses[WEMU_UM_REFUSE_TGKILL_BUSY]++;
+        return -EAGAIN;
+    }
+    target->pending_ev.signo = signo;
+    target->pending_ev.code = UM_SI_TKILL;
+    target->pending_ev.err = 0;
+    target->pending_ev.addr = 0;
+    target->pending_ev.pid = (int)(int32_t)self_tgid;
+    target->pending_ev.uid = (int)(int32_t)um_raw0(102 /* SYS_getuid */);
+    __atomic_store_n(&target->pending, 1, __ATOMIC_RELEASE);
+    g_um.result->tgkill_accepted++;
+    return 0;
+}
+
 static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
     (void)sig;
     ucontext_t *uc = (ucontext_t *)ucv;
@@ -1859,6 +2058,16 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
         um_refuse_fast(uc, th, r, nr, WEMU_UM_REFUSE_CLONE_PIDFD, -EINVAL);
         return;
     }
+
+    /* Bounded tgkill negative control: with the path disabled, tgkill is an
+     * unlisted syscall again (the OLD behaviour, generic -ENOSYS). */
+    if (nr == WEMU_UM_SYS_TGKILL && !g_cfg.tgkill_enabled) {
+        um_refuse_fast(uc, th, r, nr, WEMU_UM_N_REFUSE, -ENOSYS);
+        return;
+    }
+
+    /* pidfd_* are handled by um_pidfd_dispatch() above: bounded authority
+     * admits in-scope shapes and refuses the rest with exact reasons. */
 
     /* clone3 is classified here so the bounded CLONE_THREAD shape can create
      * a real host thread without the dispatch lock (same reason as above).
@@ -2077,6 +2286,8 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
     int64_t ret = -EPERM;
     if (e->kind == WEMU_UM_DISPATCH_SIGACTION) {
         ret = um_sigaction(th, a);
+    } else if (e->kind == WEMU_UM_DISPATCH_TGKILL) {
+        ret = um_tgkill(th, a);
     } else if (e->kind == WEMU_UM_DISPATCH_SIGPROCMASK) {
         /* A guest that masks SIGSYS would stop trapping its own syscalls;
          * SIGALRM is the run bound and SIGUSR2 the exec-quiesce handshake.
@@ -2169,6 +2380,11 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
     if (g_um.syscalls >= WEMU_UM_MAX_SYSCALLS ||
         g_um.result->out_len >= WEMU_UM_OUT_MAX - 1u) {
         um_abort_to_finish(uc, th, UM_WHY_BUDGET);
+    } else {
+        /* Cross-thread delivery happens at the TARGET's own next checkpoint,
+         * after its syscall has completed: sigreturn resumes after that
+         * syscall with its return value intact. */
+        um_check_pending(th, r);
     }
     um_unlock();
 }
@@ -2194,7 +2410,6 @@ static void um_fault(int sig, siginfo_t *si, void *ucv) {
     /* A pkey violation is never offered to a guest handler: the bytes are
      * unreadable by hardware, and retrying from a handler could only loop or
      * brute-force the key.  Fail closed straight to the result page. */
-    UmSigDisp *d = um_disp(th);        /* fault uses THIS thread's disposition */
     if (pku || !um_sig_sync(signo) || !in_guest || !um_sig_registered(signo, th) ||
         th->in_handler || th->sig_deliveries >= WEMU_UM_MAX_SIGNALS) {
         th->sig_denied++;                     /* fail closed, no delivery */
@@ -2202,22 +2417,21 @@ static void um_fault(int sig, siginfo_t *si, void *ucv) {
         return;
     }
 
-    /* Stash the fault-time registers (bounded: one live delivery at a time). */
-    memcpy(th->saved_gregs, r, sizeof th->saved_gregs);
-    th->saved_valid = 1;
-    th->in_handler = 1;
-    th->sig_deliveries++;
-
-    /* Minimal delivery frame: put the guest's SA_RESTORER where a C handler's
-     * epilogue will `ret`, with SysV stack alignment at handler entry.  We
-     * only supply signo in RDI; siginfo/ucontext args are not populated. */
-    greg_t sp = (r[REG_RSP] - 16) & ~(greg_t)15;
-    *(uint64_t *)(uintptr_t)(sp + 8) = d->restorer[signo];
-    r[REG_RSP] = sp + 8;                        /* %16 == 8, [RSP]=restorer */
-    r[REG_RDI] = (greg_t)signo;
-    r[REG_RSI] = 0;
-    r[REG_RDX] = 0;
-    r[REG_RIP] = (greg_t)d->handler[signo];
+    /* Supply the kernel's deterministic siginfo (si_code/si_addr) and, for an
+     * SA_SIGINFO handler, a synthetic ucontext with the fault-time GPRs.  The
+     * SA_RESTORER at [RSP] returns through rt_sigreturn, which restores the
+     * saved frame and re-executes the faulting instruction. */
+    UmSigEvent ev;
+    ev.signo = signo;
+    ev.code = g_um.fault_code;
+    ev.err = si ? si->si_errno : 0;
+    ev.addr = si ? (uint64_t)(uintptr_t)si->si_addr : 0;
+    ev.pid = 0;
+    ev.uid = 0;
+    if (um_deliver_frame(th, r, &ev) != 0) {
+        th->sig_denied++;
+        um_abort_to_finish(uc, th, UM_WHY_FAULT);
+    }
 }
 
 static void um_alarm(int sig, siginfo_t *si, void *ucv) {

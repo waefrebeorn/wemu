@@ -153,6 +153,54 @@ static const char WANT_DISP_S[] =
     "SA-SIZE-RC=-22\n"
     "SA-ADDR-RC=-22\n";
 
+/* Bounded tgkill + SA_SIGINFO.  These three streams are byte-exact against a
+ * real host kernel: signo, si_code (SI_TKILL / SEGV_ACCERR), si_errno,
+ * normalized si_pid/si_uid, the pre-delivery virtual mask and a nonzero saved
+ * RIP.  Host pid/uid values are normalized to booleans so two separate runs
+ * compare; signal 0 is the one documented divergence (host accepts it as an
+ * existence check, WEMU refuses the unmodeled signal). */
+static const char WANT_TG[] =
+    "TG-SET-RC=0\n"
+    "TG-HANDLER\n"
+    "TG-SIGNO=8\n"
+    "TG-CODE=-6\n"
+    "TG-ERRNO=0\n"
+    "TG-PID-EQ=1\n"
+    "TG-UID-EQ=1\n"
+    "TG-UC-MASK=0\n"
+    "TG-UC-RIP=1\n"
+    "TG-KILL-RC=0\n";
+static const char WANT_TGM[] =
+    "TGM-SET-RC=0\n"
+    "TGM-BLOCK-RC=0\n"
+    "TGM-CHILD-MASK=1\n"
+    "TGM-NO-DELIVERY\n"
+    "TGM-HANDLER\n"
+    "TGM-SIGNO=8\n"
+    "TGM-CODE=-6\n"
+    "TGM-ERRNO=0\n"
+    "TGM-PID-EQ=1\n"
+    "TGM-UID-EQ=1\n"
+    "TGM-UC-MASK=0\n"
+    "TGM-UC-RIP=1\n"
+    "TGM-KILL-RC=0\n";
+static const char WANT_TGK[] =
+    "TGK-TGID-RC=-3\n"
+    "TGK-TID-RC=-3\n"
+    "TGK-TGID0-RC=-22\n"
+    "TGK-SIGNEG-RC=-22\n";
+static const char WANT_TGU_WEMU[] = "TGU-SIG0-RC=-22\n";
+static const char WANT_TGU_OLD[]  = "TGU-SIG0-RC=-38\n";
+static const char WANT_TGA[] =
+    "TGA-SET-RC=0\n"
+    "TGA-SIGNO=11\n"
+    "TGA-CODE=2\n"
+    "TGA-ERRNO=0\n"
+    "TGA-ADDR-EQ=1\n"
+    "TGA-UC-MASK=0\n"
+    "TGA-UC-RIP=1\n"
+    "TGA-VALUE=305419896\n";
+
 typedef struct { char b[WEMU_UM_OUT_MAX]; size_t n; } Cap;
 
 /* Independent oracle: the REAL host kernel runs the same fixture/argv. */
@@ -845,6 +893,151 @@ static void test_disp_isolation(void) {
            "root ran child handler; byte stream differs from per-thread\n");
 }
 
+/* ---- bounded tgkill + SA_SIGINFO differential ------------------------ */
+static void test_tgkill_positive(void) {
+    Cap oracle;
+    int he = host_exec("g", &oracle);
+    if (he != 0) FAIL("host tgkill exit=%d want 0\n", he);
+    check_exact("host tgkill", oracle.b, oracle.n, WANT_TG, sizeof WANT_TG - 1);
+
+    WemuUmResult r;
+    int rc = wemu_exec("g", &r);
+    if (rc != WEMU_UM_OK || r.exit_code != 0)
+        FAIL("tgkill status=%s exit=%d out=[%s]\n",
+             wemu_um_status_name(rc), r.exit_code, r.out);
+    check_exact("wemu tgkill", r.out, r.out_len, oracle.b, oracle.n);
+    if (r.tgkill_accepted != 1 || r.signals_delivered != 1 ||
+        r.siginfo_deliveries != 1 || r.sig_disp_registrations != 1 ||
+        r.threads_created != 1 || r.clone3_threads != 1 || r.denied != 0)
+        FAIL("tgkill counts: acc=%u del=%u siginfo=%u reg=%u threads=%u "
+             "c3=%u denied=%llu\n", r.tgkill_accepted, r.signals_delivered,
+             r.siginfo_deliveries, r.sig_disp_registrations, r.threads_created,
+             r.clone3_threads, (unsigned long long)r.denied);
+    for (unsigned i = 0; i < WEMU_UM_N_REFUSE; i++)
+        if (r.refuses[i]) FAIL("tgkill positive refuse[%u]=%u\n", i, r.refuses[i]);
+    printf("ok: BOUNDED TGKILL -> admitted sibling, SA_SIGINFO byte-exact vs "
+           "host (si_code=SI_TKILL, pid/uid normalized, ucontext saved)\n");
+}
+
+static void test_tgkill_mask(void) {
+    Cap oracle;
+    int he = host_exec("m", &oracle);
+    if (he != 0) FAIL("host tgkill-mask exit=%d want 0\n", he);
+    check_exact("host tgkill-mask", oracle.b, oracle.n, WANT_TGM,
+                sizeof WANT_TGM - 1);
+
+    WemuUmResult r;
+    int rc = wemu_exec("m", &r);
+    if (rc != WEMU_UM_OK || r.exit_code != 0)
+        FAIL("tgkill-mask status=%s exit=%d out=[%s]\n",
+             wemu_um_status_name(rc), r.exit_code, r.out);
+    check_exact("wemu tgkill-mask", r.out, r.out_len, oracle.b, oracle.n);
+    if (r.tgkill_accepted != 1 || r.signals_delivered != 1 ||
+        r.siginfo_deliveries != 1 || r.denied != 0)
+        FAIL("tgkill-mask counts: acc=%u del=%u siginfo=%u denied=%llu\n",
+             r.tgkill_accepted, r.signals_delivered, r.siginfo_deliveries,
+             (unsigned long long)r.denied);
+    for (unsigned i = 0; i < WEMU_UM_N_REFUSE; i++)
+        if (r.refuses[i]) FAIL("tgkill-mask refuse[%u]=%u\n", i, r.refuses[i]);
+    printf("ok: PER-THREAD MASK RESPECTED — queued while the sibling blocked "
+           "SIGFPE, delivered on unblock; byte-exact vs host\n");
+}
+
+static void test_tgkill_fail_closed(void) {
+    /* Pure signal predicate: only the four synchronous-fault signals can be
+     * sent; zero, negative and asynchronous signals fail closed. */
+    if (!wemu_um_tgkill_modeled(SIGSEGV) || !wemu_um_tgkill_modeled(SIGBUS) ||
+        !wemu_um_tgkill_modeled(SIGILL) || !wemu_um_tgkill_modeled(SIGFPE) ||
+        wemu_um_tgkill_modeled(SIGUSR1) || wemu_um_tgkill_modeled(0) ||
+        wemu_um_tgkill_modeled(-1))
+        FAIL("tgkill signal predicate edges\n");
+    if (wemu_um_set_tgkill_enabled(2) != -1 || wemu_um_set_tgkill_enabled(1) != 0)
+        FAIL("tgkill negative-control switch validation\n");
+
+    /* Wrong tgid / unknown tid / bad tgid / negative signal: host and WEMU
+     * agree byte-for-byte (-ESRCH / -EINVAL). */
+    Cap oracle;
+    int he = host_exec("k", &oracle);
+    if (he != 0) FAIL("host tgkill-refuse exit=%d want 0\n", he);
+    check_exact("host tgkill-refuse", oracle.b, oracle.n, WANT_TGK,
+                sizeof WANT_TGK - 1);
+    WemuUmResult r;
+    int rc = wemu_exec("k", &r);
+    if (rc != WEMU_UM_OK || r.exit_code != 0)
+        FAIL("tgkill-refuse status=%s exit=%d out=[%s]\n",
+             wemu_um_status_name(rc), r.exit_code, r.out);
+    check_exact("wemu tgkill-refuse", r.out, r.out_len, oracle.b, oracle.n);
+    if (r.refuses[WEMU_UM_REFUSE_TGKILL_TGID] != 2 ||
+        r.refuses[WEMU_UM_REFUSE_TGKILL_TID] != 1 ||
+        r.refuses[WEMU_UM_REFUSE_TGKILL_SIG] != 1 ||
+        r.tgkill_accepted != 0 || r.signals_delivered != 0)
+        FAIL("tgkill-refuse exact counts: tgid=%u tid=%u sig=%u acc=%u del=%u\n",
+             r.refuses[WEMU_UM_REFUSE_TGKILL_TGID],
+             r.refuses[WEMU_UM_REFUSE_TGKILL_TID],
+             r.refuses[WEMU_UM_REFUSE_TGKILL_SIG],
+             r.tgkill_accepted, r.signals_delivered);
+
+    /* Signal 0: the host proves it is a real kernel feature (existence check
+     * returns 0); WEMU refuses the unmodeled shape with an exact SIG reason. */
+    he = host_exec("u", &oracle);
+    if (he != 0 || oracle.n != sizeof "TGU-SIG0-RC=0\n" - 1 ||
+        memcmp(oracle.b, "TGU-SIG0-RC=0\n", oracle.n) != 0)
+        FAIL("host signal-0 oracle unexpected: [%s]\n", oracle.b);
+    rc = wemu_exec("u", &r);
+    if (rc != WEMU_UM_OK || r.exit_code != 0)
+        FAIL("tgkill-unmodeled status=%s out=[%s]\n",
+             wemu_um_status_name(rc), r.out);
+    check_exact("wemu tgkill-unmodeled", r.out, r.out_len, WANT_TGU_WEMU,
+                sizeof WANT_TGU_WEMU - 1);
+    if (r.refuses[WEMU_UM_REFUSE_TGKILL_SIG] != 1 || r.tgkill_accepted != 0)
+        FAIL("tgkill-unmodeled exact reason missing\n");
+
+    /* NEGATIVE CONTROL: old path (tgkill disabled) leaves tgkill unlisted, so
+     * the same request is a generic -ENOSYS with no exact reason and no WEMU
+     * queueing — the byte stream differs from the hardened path. */
+    if (wemu_um_set_tgkill_enabled(0) != 0) FAIL("disable tgkill\n");
+    WemuUmResult old;
+    rc = wemu_exec("u", &old);
+    (void)wemu_um_set_tgkill_enabled(1);          /* restore default */
+    if (rc != WEMU_UM_OK || old.exit_code != 0)
+        FAIL("old tgkill status=%s exit=%d\n", wemu_um_status_name(rc),
+             old.exit_code);
+    check_exact("wemu tgkill old", old.out, old.out_len, WANT_TGU_OLD,
+                sizeof WANT_TGU_OLD - 1);
+    if (old.tgkill_accepted != 0 || old.refuses[WEMU_UM_REFUSE_TGKILL_SIG] != 0 ||
+        old.denied != 1)
+        FAIL("old tgkill denied=%llu sigrefuse=%u acc=%u\n",
+             (unsigned long long)old.denied,
+             old.refuses[WEMU_UM_REFUSE_TGKILL_SIG], old.tgkill_accepted);
+    printf("        (host signal-0 returns 0; WEMU -EINVAL exact=%u; old path "
+           "-ENOSYS denied=1)\n",
+           r.refuses[WEMU_UM_REFUSE_TGKILL_SIG]);
+    printf("ok: FAIL-CLOSED tgkill — exact tgid/tid/signal refusals, no target "
+           "queued, old path negative control\n");
+}
+
+static void test_sainfo_fault(void) {
+    Cap oracle;
+    int he = host_exec("a", &oracle);
+    if (he != 0) FAIL("host sainfo-fault exit=%d want 0\n", he);
+    check_exact("host sainfo-fault", oracle.b, oracle.n, WANT_TGA,
+                sizeof WANT_TGA - 1);
+
+    WemuUmResult r;
+    int rc = wemu_exec("a", &r);
+    if (rc != WEMU_UM_OK || r.exit_code != 0)
+        FAIL("sainfo-fault status=%s exit=%d out=[%s]\n",
+             wemu_um_status_name(rc), r.exit_code, r.out);
+    check_exact("wemu sainfo-fault", r.out, r.out_len, oracle.b, oracle.n);
+    if (r.signals_delivered != 1 || r.siginfo_deliveries != 1 ||
+        r.sig_disp_registrations != 1 || r.denied != 0)
+        FAIL("sainfo-fault counts: del=%u siginfo=%u reg=%u denied=%llu\n",
+             r.signals_delivered, r.siginfo_deliveries,
+             r.sig_disp_registrations, (unsigned long long)r.denied);
+    printf("ok: SA_SIGINFO FAULT — si_code=SEGV_ACCERR/si_addr/ucontext "
+           "byte-exact vs host, sigreturn re-executes the store\n");
+}
+
 int main(void) {
     wemu_um_reset_isolation();
     test_policy();
@@ -860,10 +1053,16 @@ int main(void) {
     test_disp_fail_closed();
     test_disp_isolation();
     test_negative_old_path();
+    test_tgkill_positive();
+    test_tgkill_mask();
+    test_tgkill_fail_closed();
+    test_sainfo_fault();
     printf("WEMU BOUNDED CLONE3-THREAD GATE PASS (host-byte-exact bounded "
            "thread + virtual per-thread masks + per-thread signal dispositions; "
            "bounded pidfd authority byte-exact with exact fail-closed edges; "
            "pidfd/tid/cgroup/fork fail closed; exact pidfd/clear-sighand/"
-           "sigaction refusals; bounded clone3 fork byte-exact; old paths refuse)\n");
+           "sigaction refusals; bounded clone3 fork byte-exact; bounded tgkill "
+           "to an admitted sibling + SA_SIGINFO siginfo/ucontext byte-exact; "
+           "old paths refuse)\n");
     return 0;
 }

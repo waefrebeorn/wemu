@@ -60,11 +60,25 @@ untrusted-guest sandbox. Nothing here is enabled implicitly by `wemu_cpu_run`.
    fault from guest RIP (SIGSEGV/SIGBUS/SIGILL/SIGFPE) with a registered
    handler rewrites the ucontext to that handler, passing signo in RDI and
    the guest's `SA_RESTORER` as the return address; a normal handler epilogue
-   returns to `rt_sigreturn`, which restores the saved fault registers so
-   the faulting instruction is retried. `wemu_usermode.c` is compiled without
-   `-fstack-protector`: its handlers run on the guest stack with a
-   guest-set `%fs`, so a TLS stack canary there is not the host's.
-9. **Process-per-guest isolation, now CPU-enforced with MPK/pkeys.** `wemu_um_set_guest_arena()`
+   returns through `rt_sigreturn`, which restores the saved registers (and
+   re-executes a fixed fault). For an `SA_SIGINFO` handler the frame also
+   carries a synthetic `siginfo_t` (RSI) and `ucontext_t` (RDX) with the
+   deterministic kernel fields: `si_signo`, `si_code` (`SEGV_*` for a fault,
+   `SI_TKILL` for a cross-thread signal), `si_errno`, `si_addr` or
+   `si_pid`/`si_uid`, the pre-delivery virtual mask and the saved GPRs. The
+   frame is placed ABOVE the handler's entry RSP so the handler's own pushes
+   cannot overwrite it; FP/XMM state is still zero (documented gap below).
+9. **Bounded cross-thread targeting**: `tgkill(tgid, tid, sig)` is dispatched
+   only when tgid is the guest group's and tid names an admitted modeled
+   thread slot. No host signal is sent: one deterministic event is queued in
+   the target's private slot and consumed at THAT thread's next syscall
+   checkpoint, using the target's own disposition table, virtual mask and
+   register set. A blocked signal stays queued until unblocked. One bound
+   per target; a second request while pending is refused with `-EAGAIN`.
+   `wemu_usermode.c` is compiled without `-fstack-protector`: its handlers run
+   on the guest stack with a guest-set `%fs`, so a TLS stack canary there is
+   not the host's.
+10. **Process-per-guest isolation, now CPU-enforced with MPK/pkeys.** `wemu_um_set_guest_arena()`
    registers a supervisor-owned `MAP_SHARED` region; forked guest children
    build the SysV stack inside it, so the guest's writable world is a mapping
    the supervisor also holds and validates against. `wemu_um_isolate_host_pages()`
@@ -95,7 +109,11 @@ untrusted-guest sandbox. Nothing here is enabled implicitly by `wemu_cpu_run`.
 - **Fail-closed signals**: only SIGSEGV/SIGBUS/SIGILL/SIGFPE can be registered
   or delivered; `rt_sigaction` for any other signal, with a sigsetsize other
   than 8, or with a handler outside the guest image returns `-EINVAL` and is
-  counted in `refuses[WEMU_UM_REFUSE_SIGACTION]`. No host handler is installed.
+  counted in `refuses[WEMU_UM_REFUSE_SIGACTION]`. `tgkill` refuses a foreign
+  tgid (`-ESRCH`, or `-EINVAL` for a non-positive one), a tid that is not an
+  admitted modeled thread (`-ESRCH`), an unmodeled signal (`-EINVAL`) and a
+  target with a pending signal (`-EAGAIN`), each with its own exact
+  `WEMU_UM_REFUSE_TGKILL_*` code. No host signal or handler is installed.
   A fault with no handler, outside the guest image, while already in a handler,
   or after 16 deliveries is not delivered — the run unwinds with
   `WEMU_UM_ERR_FAULT`. Every refusal increments `signals_denied`.
@@ -232,9 +250,10 @@ table entry against the kernel's `asm/unistd_64.h`.
   `CLONE_PIDFD`, thread priorities/sched attributes and `CLONE_CLEAR_SIGHAND`
   remain unmodelled and fail closed. Per-thread virtual signal masks and
   per-thread signal dispositions ARE modelled (inherited by copy at clone);
-  cross-thread signal targeting is not. A bounded pidfd authority IS modelled
-  (see below). `WEMU_UM_MAX_THREADS - 1` host threads per run is a hard ceiling;
-  exhaustion returns `-EAGAIN`.
+  bounded `tgkill` to an admitted sibling IS modelled (see below), with
+  per-thread masks/dispositions respected. A bounded pidfd authority IS
+  modelled (see below). `WEMU_UM_MAX_THREADS - 1` host threads per run is a
+  hard ceiling; exhaustion returns `-EAGAIN`.
 - **Bounded pidfd authority.** `pidfd_open(tid, 0)` is admitted ONLY for a TID
   WEMU actually created (the root slot or an admitted CLONE_THREAD slot) and
   mints a real host pidfd tracked in a bounded table; `pidfd_getfd` is admitted
@@ -249,14 +268,17 @@ table entry against the kernel's `asm/unistd_64.h`.
   (negative control); with exact diagnostics OFF all three are unlisted
   (-ENOSYS).
 - A guest signal delivered to one thread uses that thread's slot (no nesting);
-  cross-thread signal targeting (`tgkill`) and `CLONE_CHILD_CLEARTID`-driven
-  futex wake-ups are left to the host kernel, not modelled by the dispatcher.
-- The bounded signal path delivers only signo (RSI/RDX siginfo/ucontext args
-  are zero), restores general registers only (not XMM/x87 state), allows no
-  nesting, and needs the guest's `SA_RESTORER` for a C handler to return.
-  Asynchronous signal generation (kill/tgkill/timers) is not modelled;
-  `rt_sigprocmask` is virtualised from the calling thread's private mask and
-  never applied to the host thread.
+  a bounded cross-thread `tgkill` to an admitted sibling is queued in the
+  target's slot and delivered at its next syscall checkpoint, NOT
+  asynchronously by the host kernel. `CLONE_CHILD_CLEARTID` futex wake-ups
+  are left to the host kernel.
+- The bounded signal path supplies signo and, for `SA_SIGINFO`, the
+  deterministic siginfo/ucontext fields; it restores general registers only
+  (not XMM/x87 state), allows no nesting, and needs the guest's `SA_RESTORER`
+  for a C handler to return. Signals beyond the four synchronous-fault ones
+  (kill/timers/other asynchronous signals) are not modelled;
+  `rt_sigprocmask` is served from the thread's private virtual mask and never
+  changes the host thread's real mask.
 - The filter window covers ELF PT_LOAD mappings. The stack (now built inside
   the supervisor's `MAP_SHARED` guest arena when one is registered), the
   bounded brk heap and admitted guest mmaps are registered for **pointer

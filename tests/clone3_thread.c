@@ -24,6 +24,8 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <signal.h>
+#include <ucontext.h>
 
 #define SYS_write_          1
 #define SYS_rt_sigprocmask_ 14
@@ -34,6 +36,12 @@
 #define SYS_exit_           60
 #define SYS_exit_group_     231
 #define SYS_rt_sigaction_   13
+#define SYS_rt_sigprocmask_ 14
+#define SYS_sched_yield_    24
+#define SYS_mmap_           9
+#define SYS_mprotect_       10
+#define SYS_getuid_         102
+#define SYS_tgkill_         234
 #define SYS_pidfd_send_signal_ 424
 #define SYS_pidfd_open_     434
 #define SYS_pidfd_getfd_    438
@@ -63,7 +71,13 @@
 #define SIGSYS_      31
 #define SIGILL_      4
 #define SIGFPE_      8
+#define SIGSEGV_     11
 #define SA_RESTORER_ 0x04000000u
+#define SA_SIGINFO_  0x00000004u
+#define SI_TKILL_    (-6)
+#define PROT_READ_   1
+#define PROT_WRITE_  2
+#define MAP_PRIVATE_ANON_ 0x22
 
 /* Kernel x86-64 rt_sigaction layout: handler@0, flags@8, restorer@16,
  * mask@24.  Only the synchronous-fault signals are modeled by WEMU. */
@@ -518,6 +532,151 @@ static int run_disp_refuse(void) {
     return 0;
 }
 
+/* ---- bounded tgkill + SA_SIGINFO delivery ----------------------------
+ * Mode "g": root registers an SA_SIGINFO SIGFPE handler, spawns ONE bounded
+ * clone3 thread, tgkills THAT tid, and the handler in the target prints the
+ * deterministic siginfo/ucontext fields.  Host and WEMU must be byte-exact.
+ * Mode "m": the target inherits a blocked SIGFPE, ignores the queued signal
+ * while masked, then unblocks and receives it (per-thread mask respected).
+ * Mode "k"/"u": fail-closed shapes (bad tgid/tid/signal); "k" matches the
+ * host's errno exactly, "u" is a signal-0 existence check the host accepts
+ * and WEMU refuses (documented bounded divergence).  Mode "a": SA_SIGINFO
+ * SIGSEGV fault — si_code/si_addr/ucontext are byte-exact and sigreturn
+ * resumes the faulting store.  All handler writes are raw syscalls. */
+static volatile int tg_ready, tg_done;
+static uintptr_t tga_page;
+
+static void emit_num_t(const char *pre, const char *suf, long v) {
+    char tag[64]; size_t i = 0;
+    while (*pre && i < 56) tag[i++] = *pre++;
+    while (*suf && i < 56) tag[i++] = *suf++;
+    tag[i] = 0;
+    emit_num(tag, v);
+}
+
+static void emit_tg_fields(const char *pre, siginfo_t *si, void *ucv) {
+    ucontext_t *uc = (ucontext_t *)ucv;
+    emit_num_t(pre, "SIGNO=", si->si_signo);
+    emit_num_t(pre, "CODE=", si->si_code);
+    emit_num_t(pre, "ERRNO=", si->si_errno);
+    emit_num_t(pre, "PID-EQ=",
+               si->si_pid == rsys(SYS_getpid_, 0, 0, 0, 0, 0, 0));
+    emit_num_t(pre, "UID-EQ=",
+               si->si_uid == rsys(SYS_getuid_, 0, 0, 0, 0, 0, 0));
+    emit_num_t(pre, "UC-MASK=", sigismember(&uc->uc_sigmask, SIGFPE_));
+    emit_num_t(pre, "UC-RIP=", uc->uc_mcontext.gregs[REG_RIP] != 0);
+}
+
+static long set_siginfo_handler(int sig, uint64_t h) {
+    struct local_sigaction sa;
+    sa.handler = h;
+    sa.flags = SA_RESTORER_ | SA_SIGINFO_;
+    sa.restorer = (uint64_t)(uintptr_t)&disp_restorer;
+    sa.mask = 0;
+    return raw_sigaction(sig, &sa, 0, 8);
+}
+
+static void tg_handler(int s, siginfo_t *si, void *u) {
+    (void)s;
+    emit("TG-HANDLER\n", sizeof "TG-HANDLER\n" - 1);
+    emit_tg_fields("TG-", si, u);
+    __atomic_store_n(&tg_done, 1, __ATOMIC_RELEASE);
+    (void)rsys(SYS_exit_, 0, 0, 0, 0, 0, 0);   /* end only this thread */
+    __builtin_unreachable();
+}
+
+static void tgm_handler(int s, siginfo_t *si, void *u) {
+    (void)s;
+    emit("TGM-HANDLER\n", sizeof "TGM-HANDLER\n" - 1);
+    emit_tg_fields("TGM-", si, u);
+    __atomic_store_n(&tg_done, 1, __ATOMIC_RELEASE);
+    (void)rsys(SYS_exit_, 0, 0, 0, 0, 0, 0);
+    __builtin_unreachable();
+}
+
+static int run_tgkill(int masked) {
+    const char *pre = masked ? "TGM-" : "TG-";
+    long me = rsys(SYS_getpid_, 0, 0, 0, 0, 0, 0);
+    emit_num_t(pre, "SET-RC=",
+               set_siginfo_handler(SIGFPE_,
+                   (uint64_t)(uintptr_t)(masked ? &tgm_handler : &tg_handler)));
+    if (masked) {
+        uint64_t blk = 1ull << (SIGFPE_ - 1);
+        emit_num("TGM-BLOCK-RC=",
+                 rsys(SYS_rt_sigprocmask_, SIG_BLOCK_, (long)&blk, 0, 8, 0, 0));
+    }
+    struct local_clone_args ca;
+    base_args(&ca);
+    __atomic_store_n(&tg_ready, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&tg_done, 0, __ATOMIC_RELAXED);
+    long t = rsys(SYS_clone3_, (long)&ca, sizeof ca, 0, 0, 0, 0);
+    if (t == 0) {
+        if (masked) {
+            uint64_t m = 0;
+            (void)rsys(SYS_rt_sigprocmask_, SIG_SETMASK_, 0, (long)&m, 8, 0, 0);
+            emit_num("TGM-CHILD-MASK=", (m >> (SIGFPE_ - 1)) & 1ull);
+        }
+        __atomic_store_n(&tg_ready, 1, __ATOMIC_RELEASE);
+        if (masked) {
+            for (int i = 0; i < 64; i++)
+                (void)rsys(SYS_sched_yield_, 0, 0, 0, 0, 0, 0);
+            emit("TGM-NO-DELIVERY\n", sizeof "TGM-NO-DELIVERY\n" - 1);
+            uint64_t un = 1ull << (SIGFPE_ - 1);
+            (void)rsys(SYS_rt_sigprocmask_, SIG_UNBLOCK_, (long)&un, 0, 8, 0, 0);
+        }
+        while (!__atomic_load_n(&tg_done, __ATOMIC_ACQUIRE))
+            (void)rsys(SYS_sched_yield_, 0, 0, 0, 0, 0, 0);
+        (void)rsys(SYS_exit_, 0, 0, 0, 0, 0, 0);
+        __builtin_unreachable();
+    }
+    if (t < 0) { emit(refused, sizeof refused - 1); return 7; }
+    while (!__atomic_load_n(&tg_ready, __ATOMIC_ACQUIRE)) { }
+    long rc = rsys(SYS_tgkill_, (int)me, (int)t, SIGFPE_, 0, 0, 0);
+    while (!__atomic_load_n(&tg_done, __ATOMIC_ACQUIRE)) { }
+    emit_num_t(pre, "KILL-RC=", rc);
+    return 0;
+}
+
+static int run_tgkill_refuse(void) {
+    long me = rsys(SYS_getpid_, 0, 0, 0, 0, 0, 0);
+    emit_num("TGK-TGID-RC=", rsys(SYS_tgkill_, me + 12345, me, SIGFPE_, 0, 0, 0));
+    emit_num("TGK-TID-RC=", rsys(SYS_tgkill_, me, 0x7fffffffL, SIGFPE_, 0, 0, 0));
+    emit_num("TGK-TGID0-RC=", rsys(SYS_tgkill_, 0, me, SIGFPE_, 0, 0, 0));
+    emit_num("TGK-SIGNEG-RC=", rsys(SYS_tgkill_, me, me, -1, 0, 0, 0));
+    return 0;
+}
+
+static int run_tgkill_unmodeled(void) {
+    long me = rsys(SYS_getpid_, 0, 0, 0, 0, 0, 0);
+    emit_num("TGU-SIG0-RC=", rsys(SYS_tgkill_, me, me, 0, 0, 0, 0));
+    return 0;
+}
+
+static void tga_handler(int s, siginfo_t *si, void *u) {
+    (void)s;
+    ucontext_t *uc = (ucontext_t *)u;
+    emit_num_t("TGA-", "SIGNO=", si->si_signo);
+    emit_num_t("TGA-", "CODE=", si->si_code);
+    emit_num_t("TGA-", "ERRNO=", si->si_errno);
+    emit_num_t("TGA-", "ADDR-EQ=", si->si_addr == (void *)tga_page);
+    emit_num_t("TGA-", "UC-MASK=", sigismember(&uc->uc_sigmask, SIGSEGV_));
+    emit_num_t("TGA-", "UC-RIP=", uc->uc_mcontext.gregs[REG_RIP] != 0);
+    (void)rsys(SYS_mprotect_, (long)tga_page, 4096, PROT_READ_ | PROT_WRITE_,
+               0, 0, 0);
+    /* normal return -> SA_RESTORER -> rt_sigreturn -> faulting store retried */
+}
+
+static int run_sainfo_fault(void) {
+    long p = rsys(SYS_mmap_, 0, 4096, PROT_READ_, MAP_PRIVATE_ANON_, -1, 0);
+    if (p < 0) return 90;
+    tga_page = (uintptr_t)p;
+    emit_num("TGA-SET-RC=",
+             set_siginfo_handler(SIGSEGV_, (uint64_t)(uintptr_t)&tga_handler));
+    *(volatile int *)p = 0x12345678;       /* fault -> handler -> sigreturn */
+    emit_num("TGA-VALUE=", *(volatile int *)p);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     char mode = (argc >= 2 && argv[1][0]) ? argv[1][0] : 'o';
     int rc;
@@ -531,6 +690,11 @@ int main(int argc, char **argv) {
     else if (mode == 'd') rc = run_disp();
     else if (mode == 'x') rc = run_disp_collide();
     else if (mode == 's') rc = run_disp_refuse();
+    else if (mode == 'g') rc = run_tgkill(0);
+    else if (mode == 'm') rc = run_tgkill(1);
+    else if (mode == 'k') rc = run_tgkill_refuse();
+    else if (mode == 'u') rc = run_tgkill_unmodeled();
+    else if (mode == 'a') rc = run_sainfo_fault();
     else                  rc = run_ok();
     (void)rsys(SYS_exit_group_, rc, 0, 0, 0, 0, 0);
     return rc;

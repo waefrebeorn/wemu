@@ -72,7 +72,9 @@ typedef enum {
     WEMU_UM_DISPATCH_SIGPROCMASK,/* rt_sigprocmask: per-thread masks fail closed
                                   * when they touch WEMU's own signals */
     WEMU_UM_DISPATCH_BRK,        /* brk: bounded heap growth, range tracked */
-    WEMU_UM_DISPATCH_EXECVE      /* execve/execveat: bounded image replacement */
+    WEMU_UM_DISPATCH_EXECVE,     /* execve/execveat: bounded image replacement */
+    WEMU_UM_DISPATCH_TGKILL      /* tgkill: bounded cross-thread signal queued
+                                  * to an admitted sibling's private slot */
 } WemuUmDispatch;
 
 /* Exact fail-closed reasons.  `refuses[code]` in WemuUmResult counts how many
@@ -128,7 +130,16 @@ typedef enum {
                                              * per-thread disposition table:
                                              * unmodeled signal, bad sigsetsize,
                                              * or handler outside the image */
-#define WEMU_UM_N_REFUSE                 16u
+/* Cross-thread (tgkill) refusals.  A wrong tgid or an unadmitted target tid is
+ * indistinguishable from a nonexistent process/thread to the guest (-ESRCH);
+ * an unmodeled signal or a busy target fails closed with -EINVAL/-EAGAIN. */
+#define WEMU_UM_REFUSE_TGKILL_TGID       16u /* tgkill tgid != the guest group */
+#define WEMU_UM_REFUSE_TGKILL_TID        17u /* tid is not an admitted modeled
+                                             * thread slot in this group */
+#define WEMU_UM_REFUSE_TGKILL_SIG        18u /* signal outside the bounded set */
+#define WEMU_UM_REFUSE_TGKILL_BUSY       19u /* target already has a pending
+                                             * signal (one bounded slot) */
+#define WEMU_UM_N_REFUSE                 20u
 
 typedef struct {
     uint32_t        nr;
@@ -160,6 +171,10 @@ typedef struct {
     uint32_t  pidfd_created;     /* pidfds minted via bounded pidfd_open */
     uint32_t  pidfd_getfd_ok;    /* successful bounded pidfd_getfd duplications */
     uint32_t  pidfd_signals;     /* bounded pidfd_send_signal deliveries */
+    uint32_t  tgkill_accepted;   /* tgkill requests queued to an admitted target */
+    uint32_t  siginfo_deliveries;/* deliveries that populated an SA_SIGINFO
+                                  * siginfo_t + ucontext frame (byte-exact
+                                  * where the host's fields are deterministic) */
     uint64_t  host_sigmask_end;  /* real host-thread mask at finish: control
                                   * evidence that no guest mask leaked to it */
     uint32_t  bad_ptrs;          /* guest pointers refused before host dispatch */
@@ -253,6 +268,17 @@ int wemu_um_sigprocmask_modeled(int how, uint64_t set);
  * and no other thread's disposition table is touched.  Handler-in-image is a
  * runtime check (the image window is only known at run time). */
 int wemu_um_sigaction_modeled(int sig, uint64_t sigsetsize);
+
+/* Pure shape predicate for bounded tgkill: only a signal in the modeled
+ * synchronous set may be sent.  tgid/tid admission is a runtime check against
+ * the group's thread slots; an unmodeled signal fails closed with -EINVAL and
+ * WEMU_UM_REFUSE_TGKILL_SIG. */
+int wemu_um_tgkill_modeled(int sig);
+
+/* Negative-control switch for bounded tgkill.  ON (default): tgkill is
+ * dispatched into the bounded pending-signal path.  OFF: the OLD path, where
+ * tgkill is an unlisted syscall (-ENOSYS).  Returns 0, or -1 otherwise. */
+int wemu_um_set_tgkill_enabled(int enabled);
 
 /* Negative-control switch: when disabled, a bounded clone3 CLONE_THREAD
  * request is refused with -EINVAL and no host thread is created (the OLD
