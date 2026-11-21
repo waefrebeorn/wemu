@@ -23,6 +23,8 @@ extern "C" {
 #define WEMU_UM_OUT_MAX       65536u   /* captured stdout/stderr bytes */
 #define WEMU_UM_MAX_SYSCALLS  200000u  /* hard per-run dispatch budget */
 #define WEMU_UM_TIMEOUT_SEC   10       /* wall-clock bound on a run */
+#define WEMU_UM_MAX_SIGNALS   16u      /* bounded guest signal deliveries/run */
+#define WEMU_UM_SIG_NSIG      32       /* bounded guest signal-number table */
 
 typedef enum {
     WEMU_UM_OK            =   0,
@@ -34,7 +36,8 @@ typedef enum {
     WEMU_UM_ERR_FAULT     =  -6,   /* guest faulted outside the ABI */
     WEMU_UM_ERR_BUDGET    =  -7,   /* syscall budget / timeout exceeded */
     WEMU_UM_ERR_DENIED    =  -8,   /* an unlisted syscall was attempted */
-    WEMU_UM_ERR_INTERNAL  =  -9
+    WEMU_UM_ERR_INTERNAL  =  -9,
+    WEMU_UM_ERR_INTERP    = -10    /* ET_DYN with PT_INTERP: no ld.so model */
 } WemuUmStatus;
 
 /* Dispatch kinds.  A syscall absent from the table is NOT passed through:
@@ -42,8 +45,10 @@ typedef enum {
 typedef enum {
     WEMU_UM_DISPATCH_HOST = 0,   /* raw host syscall with the guest's 6 args */
     WEMU_UM_DISPATCH_EXIT,       /* exit/exit_group: unwind, capture code */
-    WEMU_UM_DISPATCH_EXEC_GUARD  /* mmap/mprotect: deny new executable maps
+    WEMU_UM_DISPATCH_EXEC_GUARD, /* mmap/mprotect: deny new executable maps
                                   * outside the registered guest window */
+    WEMU_UM_DISPATCH_SIGACTION,  /* rt_sigaction: bounded guest signal table */
+    WEMU_UM_DISPATCH_SIGRETURN   /* rt_sigreturn: restore the saved context */
 } WemuUmDispatch;
 
 typedef struct {
@@ -57,15 +62,25 @@ typedef struct {
     int       exit_code;     /* guest exit/exit_group scalar argument */
     uint64_t  syscalls;      /* trapped+dispatched syscalls */
     uint64_t  denied;        /* unlisted syscalls refused (-ENOSYS) */
+    uint32_t  signals_delivered; /* bounded guest signal deliveries */
+    uint32_t  signals_denied;    /* fail-closed signal registrations/deliveries */
     uint32_t  out_len;       /* bytes captured from fd 1/2, <= OUT_MAX */
     char      out[WEMU_UM_OUT_MAX]; /* NUL-terminated if out_len < OUT_MAX */
 } WemuUmResult;
 
-/* Run one static ELF to completion.  path is the ELF file; argv is a NULL
- * terminated vector (argv[0] is passed to the guest unchanged); envp may be
- * NULL for an empty environment.  Fails closed on load/format errors. */
+/* Run one ELF to completion.  Both ET_EXEC (mapped at its link addresses)
+ * and ET_DYN / PIE (mapped at a chosen load bias) are accepted; a PIE that
+ * needs a dynamic loader (PT_INTERP) is refused with WEMU_UM_ERR_INTERP —
+ * this path runs self-relocating static PIE images only.  argv is a NULL
+ * terminated vector (argv[0] is passed unchanged); envp may be NULL.
+ * Fails closed on load/format errors. */
 int wemu_um_run_elf(const char *path, char *const argv[],
                     char *const envp[], WemuUmResult *out);
+
+/* 1 when the signal number is in the bounded synchronous-fault delivery
+ * whitelist (SIGSEGV/SIGBUS/SIGILL/SIGFPE), 0 otherwise.  Unknown signals
+ * are never registered or delivered — the path fails closed. */
+int wemu_um_signal_modeled(int sig);
 
 /* Introspection for the gate: the table itself and a readable status name. */
 const WemuUmSyscallEntry *wemu_um_syscall_table(size_t *count);

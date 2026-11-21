@@ -10,13 +10,21 @@
  * 4. Baseline control: the same real busybox on the OLD interpreter path
  *    produces no applet output in 200k instructions (that mode has no
  *    full-applet execution; only the new path does).
+ * 5. ET_DYN / PIE load bias: real `cc -static-pie` binaries run byte-exact
+ *    through the native path, while the old interpreter rejects ET_DYN.
+ * 6. Bounded guest signal delivery: a real static PIE registers SIGSEGV,
+ *    faults on a RO page, its handler mprotects + sigreturns, and the store
+ *    re-executes.  Fail-closed controls: no handler -> ERR_FAULT; an
+ *    unmodeled signal -> refused via signals_denied; PT_INTERP -> ERR_INTERP.
  */
 #define _GNU_SOURCE
 #include "wemu.h"
 #include "wemu_usermode.h"
 
 #include <errno.h>
+#include <elf.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -262,11 +270,125 @@ static void test_old_mode_control(void) {
            old_ser_n, (long long)insns);
 }
 
+/* ---- 5/6. ET_DYN load bias + bounded guest signal delivery ----------- */
+/* Structural oracle: read the fixture ELF ourselves (independent of the
+ * native executor) so a fixture mix-up cannot fake a passing gate. */
+static void pie_elf_facts(const char *path, int *is_dyn, int *has_interp,
+                          uint64_t *entry) {
+    FILE *f = fopen(path, "rb");
+    if (!f) FAIL("cannot open PIE fixture %s\n", path);
+    Elf64_Ehdr eh;
+    if (fread(&eh, sizeof eh, 1, f) != 1) FAIL("short ELF header: %s\n", path);
+    *is_dyn = (eh.e_type == ET_DYN);
+    *entry = eh.e_entry;
+    *has_interp = 0;
+    if (eh.e_phoff && eh.e_phnum) {
+        if (fseek(f, (long)eh.e_phoff, SEEK_SET) != 0) FAIL("phoff: %s\n", path);
+        for (uint16_t i = 0; i < eh.e_phnum; i++) {
+            Elf64_Phdr ph;
+            if (fread(&ph, sizeof ph, 1, f) != 1) FAIL("short phdr: %s\n", path);
+            if (ph.p_type == PT_INTERP) *has_interp = 1;
+        }
+    }
+    fclose(f);
+}
+
+static void check_pie(const char *path, const char *want, unsigned want_sig) {
+    char *argv[] = { (char *)path, NULL };
+    WemuUmResult r;
+    int rc = wemu_um_run_elf(path, argv, GUEST_ENV, &r);
+    if (rc != WEMU_UM_OK)
+        FAIL("%s: native status=%s sigdel=%u sigden=%u out=[%s]\n", path,
+             wemu_um_status_name(rc), r.signals_delivered, r.signals_denied, r.out);
+    if (r.exit_code != 0) FAIL("%s: exit %d want 0\n", path, r.exit_code);
+    size_t n = strlen(want);
+    if (r.out_len != n || memcmp(r.out, want, n) != 0)
+        FAIL("%s: native out=[%s] want=[%s]\n", path, r.out, want);
+    if (r.signals_delivered != want_sig || r.signals_denied != 0 || r.denied != 0)
+        FAIL("%s: sigdel=%u sigden=%u denied=%llu want %u/0/0\n", path,
+             r.signals_delivered, r.signals_denied,
+             (unsigned long long)r.denied, want_sig);
+    Cap oracle;
+    int he = host_exec(path, argv, &oracle);
+    if (he != 0 || oracle.n != n || memcmp(oracle.b, want, n) != 0)
+        FAIL("%s: host oracle differs (exit=%d out=[%s])\n", path, he, oracle.b);
+    print_exact(path, r.out, r.out_len);
+    printf("        (ET_DYN load bias, sigdel=%u; == host execve)\n",
+           r.signals_delivered);
+}
+
+static void test_pie_and_signals(void) {
+    int dyn = 0, interp = 0;
+    uint64_t entry = 0;
+
+    pie_elf_facts("tests/pie_hello", &dyn, &interp, &entry);
+    if (!dyn || interp || entry > 0x100000)
+        FAIL("pie_hello fixture is not a low-entered static ET_DYN PIE\n");
+    check_pie("tests/pie_hello", "PIE-LOAD-BIAS-OK\n", 0);
+
+    /* Old usermode interpreter still refuses ET_DYN: load bias stays in the
+     * native fast path only. */
+    WemuMachine *m = wemu_machine_create(0x2000000, NULL, NULL);
+    if (!m) FAIL("machine create\n");
+    WemuCpu *cpu = wemu_machine_cpu(m);
+    char *oldargv[] = { (char *)"pie_hello", NULL };
+    if (wemu_cpu_load_elf(cpu, "tests/pie_hello", NULL, 0, oldargv) == 0)
+        FAIL("old interpreter accepted an ET_DYN PIE\n");
+    wemu_machine_destroy(m);
+    printf("ok: OLD usermode interpreter rejects ET_DYN (load bias is native-only)\n");
+
+    pie_elf_facts("tests/pie_signal", &dyn, &interp, &entry);
+    if (!dyn || interp) FAIL("pie_signal fixture is not a static ET_DYN PIE\n");
+    check_pie("tests/pie_signal", "PIE-SIGNAL-DELIVERED-OK\n", 1);
+    printf("ok: bounded SIGSEGV -> guest handler -> SA_RESTORER sigreturn -> "
+           "store retried, byte-exact vs host\n");
+
+    /* Fail closed: synchronous fault with no registered guest handler. */
+    WemuUmResult r;
+    int rc = wemu_um_run_elf("tests/pie_nohandler",
+                             (char *[]){ (char *)"pie_nohandler", NULL },
+                             GUEST_ENV, &r);
+    if (rc != WEMU_UM_ERR_FAULT || r.signals_delivered != 0 || r.signals_denied == 0)
+        FAIL("nohandler: status=%s sigdel=%u sigden=%u want FAULT/0/>=1\n",
+             wemu_um_status_name(rc), r.signals_delivered, r.signals_denied);
+    printf("ok: FAIL-CLOSED no-handler fault -> %s (sigdel=0, sigden=%u)\n",
+           wemu_um_status_name(rc), r.signals_denied);
+
+    /* Fail closed: unknown signal registrations are refused. */
+    rc = wemu_um_run_elf("tests/pie_unlisted",
+                         (char *[]){ (char *)"pie_unlisted", NULL },
+                         GUEST_ENV, &r);
+    if (rc != WEMU_UM_OK || strstr(r.out, "RC=0") != NULL || r.signals_denied == 0)
+        FAIL("unlisted: status=%s out=[%s] sigden=%u\n",
+             wemu_um_status_name(rc), r.out, r.signals_denied);
+    if (wemu_um_signal_modeled(SIGSEGV) != 1 ||
+        wemu_um_signal_modeled(SIGUSR1) != 0)
+        FAIL("signal whitelist wrong (SIGSEGV=%d SIGUSR1=%d)\n",
+             wemu_um_signal_modeled(SIGSEGV), wemu_um_signal_modeled(SIGUSR1));
+    printf("ok: FAIL-CLOSED unmodeled SIGUSR1 registration refused (%s), "
+           "sigden=%u; whitelist SIGSEGV=yes SIGUSR1=no\n",
+           strstr(r.out, "RC=-1") ? "rc=-1" : r.out, r.signals_denied);
+
+    /* Fail closed: a real dynamically linked PIE needs ld.so, which we do
+     * not model — refuse with ERR_INTERP rather than guessing. */
+    pie_elf_facts("tests/pie_dynamic", &dyn, &interp, &entry);
+    if (!dyn || !interp) FAIL("pie_dynamic fixture is not ET_DYN+PT_INTERP\n");
+    rc = wemu_um_run_elf("tests/pie_dynamic",
+                         (char *[]){ (char *)"pie_dynamic", NULL },
+                         GUEST_ENV, &r);
+    if (rc != WEMU_UM_ERR_INTERP)
+        FAIL("dynamic PIE: status=%s want ERR_INTERP\n", wemu_um_status_name(rc));
+    printf("ok: FAIL-CLOSED dynamically linked PIE (ET_DYN+PT_INTERP) -> %s\n",
+           wemu_um_status_name(rc));
+}
+
 int main(void) {
     audit_header("/usr/include/x86_64-linux-gnu/asm/unistd_64.h");
     test_applets();
     test_fail_closed();
     test_old_mode_control();
-    printf("WEMU NATIVE USERMODE GATE PASS (real static busybox, exact output, fail-closed)\n");
+    test_pie_and_signals();
+    printf("WEMU NATIVE USERMODE GATE PASS (static busybox, ET_DYN load bias, "
+           "bounded guest signals, fail-closed)\n");
     return 0;
 }

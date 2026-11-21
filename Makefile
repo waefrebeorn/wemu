@@ -17,6 +17,17 @@ TESTS = test_isa test_avx test_paging test_machine test_string test_cpuid \
 
 all: libwemu.a
 
+PIE_STATIC = tests/pie_hello tests/pie_signal tests/pie_nohandler tests/pie_unlisted
+PIE_DYN    = tests/pie_dynamic
+PIE_BINS   = $(PIE_STATIC) $(PIE_DYN)
+
+src/wemu_usermode.o: CFLAGS += -fno-stack-protector
+# The native user-mode signal handlers run on the guest stack after the guest
+# has set its own %fs base (arch_prctl ARCH_SET_FS, same ABI as the host).
+# glibc's -fstack-protector canary is read from %fs:0x28, which is then the
+# guest's canary slot, not the host's, so the handler epilogue aborts with a
+# false "stack smashing detected". Keep the default hardening everywhere else.
+
 libwemu.a: $(OBJ)
 	$(AR) rcs $@ $^
 
@@ -26,12 +37,22 @@ libwemu.a: $(OBJ)
 test_%: tests/test_%.c libwemu.a
 	$(CC) $(CFLAGS) -o $@ $< libwemu.a -lm
 
+test_usermode_native: $(PIE_BINS)
+
+# Self-relocating static PIE (ET_DYN, no PT_INTERP).
+tests/pie_%: tests/pie_%.c
+	$(CC) -static-pie -O2 -o $@ $<
+
+# Real dynamically linked PIE: ET_DYN WITH PT_INTERP, refused fail-closed.
+tests/pie_dynamic: tests/pie_dynamic.c
+	$(CC) -O2 -o $@ $<
+
 test: $(TESTS)
 	@for t in $(TESTS); do ./$$t || exit 1; done
 	@echo "ALL WEMU GATES PASS"
 
 clean:
-	rm -f $(OBJ) $(OBJ:.o=.d) libwemu.a $(TESTS)
+	rm -f $(OBJ) $(OBJ:.o=.d) libwemu.a $(TESTS) $(PIE_BINS)
 
 -include $(OBJ:.o=.d)
 .PHONY: all test clean

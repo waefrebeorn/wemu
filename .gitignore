@@ -9,3 +9,8 @@ test_lock_atomics
 test_exceptions
 test_isa_atomic_fence
 /test_*
+/tests/pie_hello
+/tests/pie_signal
+/tests/pie_nohandler
+/tests/pie_unlisted
+/tests/pie_dynamic

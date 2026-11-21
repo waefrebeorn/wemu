@@ -4,14 +4,24 @@
  * ABI boundary and the bounded run; VSL owns the numbering (the VSL_SYS_*
  * header is reused verbatim).  The interpreter in wemu_cpu.c is untouched.
  *
- * Mechanism: fork a child, map the static ET_EXEC at its link addresses,
- * build a SysV stack, install an IP-scoped seccomp-BPF filter that TRAPs
- * syscalls issued from the guest image, and setcontext() to e_entry.  The
- * SIGSYS handler reads RDI/RSI/RDX/R10/R8/R9 (siginfo carries no args),
- * looks the number up in a fail-closed table, and either runs the real host
- * syscall (same ABI, no marshalling), unwinds on exit, or refuses with
- * -ENOSYS.  Host-handler syscalls are outside the filter's IP window, so
- * they run for real without re-trapping.
+ * Mechanism: fork a child, map the ELF's PT_LOAD segments at their link
+ * addresses (ET_EXEC) or at a chosen load bias (ET_DYN / static PIE), build a
+ * SysV stack, install an IP-scoped seccomp-BPF filter that TRAPs syscalls
+ * issued from the guest image, and setcontext() to e_entry.  The SIGSYS
+ * handler reads RDI/RSI/RDX/R10/R8/R9 (siginfo carries no args), looks the
+ * number up in a fail-closed table, and either runs the real host syscall
+ * (same ABI, no marshalling), unwinds on exit, or refuses with -ENOSYS.
+ * Host-handler syscalls are outside the filter's IP window, so they run for
+ * real without re-trapping.
+ *
+ * Bounded guest signal delivery: rt_sigaction is intercepted into a small
+ * (WEMU_UM_SIG_NSIG) guest signal table instead of being passed to the host.
+ * A synchronous fault (SIGSEGV/SIGBUS/SIGILL/SIGFPE) raised from guest RIP is
+ * delivered to a registered guest handler by rewriting the ucontext; the
+ * handler's return address is the guest's own SA_RESTORER, so a normal
+ * sigreturn comes back through rt_sigreturn and restores the saved context.
+ * Delivery is bounded (WEMU_UM_MAX_SIGNALS, no nesting) and fails closed for
+ * unknown signals, unregistered handlers and faults outside the guest image.
  * License: WaefreBeorn Umbrella License v3.0. */
 #define _GNU_SOURCE
 #include "wemu_usermode.h"
@@ -48,6 +58,9 @@
 #define WEMU_UM_SYS_ARCH_PRCTL  158
 #define WEMU_UM_SYS_RSEQ        334
 #define WEMU_UM_SYS_TIME        201   /* busybox ls timestamp path */
+#define WEMU_UM_SYS_RT_SIGRETURN 15   /* not in the VSL table */
+#define SIG_DFL_ 0
+#define SIG_IGN_ 1
 
 /* ---- the one dispatch table (no implicit allow) --------------------- */
 static const WemuUmSyscallEntry um_table[] = {
@@ -60,7 +73,8 @@ static const WemuUmSyscallEntry um_table[] = {
     { VSL_SYS_MPROTECT,        "mprotect",        WEMU_UM_DISPATCH_EXEC_GUARD },
     { VSL_SYS_MUNMAP,          "munmap",          WEMU_UM_DISPATCH_HOST },
     { VSL_SYS_BRK,             "brk",             WEMU_UM_DISPATCH_HOST },
-    { VSL_SYS_RT_SIGACTION,    "rt_sigaction",    WEMU_UM_DISPATCH_HOST },
+    { VSL_SYS_RT_SIGACTION,    "rt_sigaction",    WEMU_UM_DISPATCH_SIGACTION },
+    { WEMU_UM_SYS_RT_SIGRETURN,"rt_sigreturn",    WEMU_UM_DISPATCH_SIGRETURN },
     { VSL_SYS_RT_SIGPROCMASK,  "rt_sigprocmask",  WEMU_UM_DISPATCH_HOST },
     { VSL_SYS_IOCTL,           "ioctl",           WEMU_UM_DISPATCH_HOST },
     { VSL_SYS_WRITEV,          "writev",          WEMU_UM_DISPATCH_HOST },
@@ -113,12 +127,17 @@ const char *wemu_um_status_name(int s) {
     case WEMU_UM_ERR_BUDGET:   return "ERR_BUDGET";
     case WEMU_UM_ERR_DENIED:   return "ERR_DENIED";
     case WEMU_UM_ERR_INTERNAL: return "ERR_INTERNAL";
+    case WEMU_UM_ERR_INTERP:   return "ERR_INTERP";
     default:                   return "ERR_UNKNOWN";
     }
 }
 
 /* ---- per-child run state -------------------------------------------- */
 enum { UM_WHY_EXIT = 1, UM_WHY_FAULT, UM_WHY_BUDGET, UM_WHY_ALARM };
+
+/* Number of general registers in mcontext_t (compile-time, no magic 23). */
+#define UM_NGREG \
+    (sizeof(((ucontext_t *)0)->uc_mcontext.gregs) / sizeof(greg_t))
 
 static struct {
     volatile sig_atomic_t active;
@@ -129,7 +148,29 @@ static struct {
     volatile uint64_t denied;
     uint64_t win_lo, win_hi;
     WemuUmResult *result;
+    /* bounded guest signal model (all touched only inside signal handlers) */
+    uint64_t sig_handler[WEMU_UM_SIG_NSIG];  /* guest handler RIP */
+    uint64_t sig_restorer[WEMU_UM_SIG_NSIG]; /* guest SA_RESTORER (sigreturn) */
+    uint32_t sig_flags[WEMU_UM_SIG_NSIG];
+    uint8_t  sig_valid[WEMU_UM_SIG_NSIG];
+    volatile uint32_t sig_deliveries;
+    volatile uint32_t sig_denied;
+    volatile int in_handler;         /* no nested delivery while one is live */
+    int saved_valid;                 /* a context is stashed for sigreturn */
+    greg_t saved_gregs[UM_NGREG];    /* register context at the delivered fault */
 } g_um;
+
+/* Only these synchronous-fault signals are ever registered or delivered.
+ * Everything else is refused by rt_sigaction and would unwind on fault. */
+static int um_sig_sync(int sig) {
+    return sig == SIGSEGV || sig == SIGBUS || sig == SIGILL || sig == SIGFPE;
+}
+
+int wemu_um_signal_modeled(int sig) { return um_sig_sync(sig); }
+
+static int um_sig_registered(int sig) {
+    return sig > 0 && sig < WEMU_UM_SIG_NSIG && g_um.sig_valid[sig];
+}
 
 static void um_finish(void) __attribute__((noreturn));
 
@@ -161,6 +202,61 @@ static void um_skip_syscall(greg_t *r) {
         r[REG_RIP] = (greg_t)((uint64_t)r[REG_RIP] + 2);
 }
 
+/* Kernel x86-64 rt_sigaction layout (glibc translates its own struct to
+ * this before the syscall): handler@0, flags@8, restorer@16, mask@24. */
+typedef struct {
+    uint64_t handler, flags, restorer, mask;
+} UmKernelSigaction;
+
+/* Guest rt_sigaction: record only a bounded set of synchronous signals in
+ * our own table; never install a host handler.  Unknown signals, bad sizes
+ * and out-of-image handlers are refused — there is no implied default. */
+static int64_t um_sigaction(const uint64_t a[6]) {
+    int sig = (int)a[0];
+    uint64_t act = a[1], oldact = a[2], ssz = a[3];
+    if (sig <= 0 || sig >= WEMU_UM_SIG_NSIG || ssz != 8 || !um_sig_sync(sig)) {
+        g_um.sig_denied++;
+        return -EINVAL;
+    }
+    UmKernelSigaction ksa;
+    if (act) memcpy(&ksa, (const void *)(uintptr_t)act, sizeof ksa);
+    else     memset(&ksa, 0, sizeof ksa);
+    if (oldact) {
+        UmKernelSigaction old = { g_um.sig_handler[sig], g_um.sig_flags[sig],
+                                  g_um.sig_restorer[sig], 0 };
+        memcpy((void *)(uintptr_t)oldact, &old, sizeof old);
+    }
+    if (ksa.handler == SIG_DFL_ || ksa.handler == SIG_IGN_) {
+        g_um.sig_valid[sig] = 0;             /* unregister */
+        return 0;
+    }
+    if (ksa.handler < g_um.win_lo || ksa.handler >= g_um.win_hi) {
+        g_um.sig_denied++;                    /* handler outside the image */
+        return -EINVAL;
+    }
+    g_um.sig_handler[sig]  = ksa.handler;
+    g_um.sig_restorer[sig] = ksa.restorer;
+    g_um.sig_flags[sig]    = (uint32_t)ksa.flags;
+    g_um.sig_valid[sig]    = 1;
+    return 0;
+}
+
+/* Guest rt_sigreturn: put the fault-time registers back.  The ucontext we
+ * are returning from is the SIGSYS one raised by this very syscall, so the
+ * kernel resumes at the restored RIP (the faulting instruction) on sigreturn. */
+static void um_sigreturn(greg_t *r) {
+    if (!g_um.in_handler || !g_um.saved_valid) {
+        g_um.sig_denied++;
+        r[REG_RAX] = (greg_t)-EINVAL;
+        um_skip_syscall(r);
+        return;
+    }
+    memcpy(r, g_um.saved_gregs, sizeof g_um.saved_gregs);
+    g_um.saved_valid = 0;
+    g_um.in_handler = 0;
+    /* Deliberately no um_skip_syscall: RIP is now the faulting instruction. */
+}
+
 static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
     (void)sig;
     if (!g_um.active) _exit(200);            /* never dispatch outside a run */
@@ -186,9 +282,15 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
         um_abort_to_finish(uc, UM_WHY_EXIT);
         return;
     }
+    if (e->kind == WEMU_UM_DISPATCH_SIGRETURN) {
+        um_sigreturn(r);                     /* resumes at the saved fault RIP */
+        return;
+    }
 
     int64_t ret = -EPERM;
-    if (e->kind == WEMU_UM_DISPATCH_EXEC_GUARD) {
+    if (e->kind == WEMU_UM_DISPATCH_SIGACTION) {
+        ret = um_sigaction(a);
+    } else if (e->kind == WEMU_UM_DISPATCH_EXEC_GUARD) {
         /* mmap(addr,len,prot,..) / mprotect(addr,len,prot): a guest may only
          * make executable memory inside the registered image window.  No
          * W^X escape into host text/heap via a dispatched syscall. */
@@ -221,10 +323,40 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
     }
 }
 
+/* A synchronous CPU fault inside the guest image is offered to a registered
+ * guest handler.  Everything else fails closed: unknown signal, no handler,
+ * a fault outside the guest window, a nested fault, or an exhausted budget. */
 static void um_fault(int sig, siginfo_t *si, void *ucv) {
-    (void)sig; (void)si;
     if (!g_um.active) _exit(201);
-    um_abort_to_finish((ucontext_t *)ucv, UM_WHY_FAULT);
+    ucontext_t *uc = (ucontext_t *)ucv;
+    greg_t *r = uc->uc_mcontext.gregs;
+    int signo = si ? si->si_signo : sig;
+    uint64_t rip = (uint64_t)r[REG_RIP];
+    int in_guest = rip >= g_um.win_lo && rip < g_um.win_hi;
+
+    if (!um_sig_sync(signo) || !in_guest || !um_sig_registered(signo) ||
+        g_um.in_handler || g_um.sig_deliveries >= WEMU_UM_MAX_SIGNALS) {
+        g_um.sig_denied++;                    /* fail closed, no delivery */
+        um_abort_to_finish(uc, UM_WHY_FAULT);
+        return;
+    }
+
+    /* Stash the fault-time registers (bounded: one live delivery at a time). */
+    memcpy(g_um.saved_gregs, r, sizeof g_um.saved_gregs);
+    g_um.saved_valid = 1;
+    g_um.in_handler = 1;
+    g_um.sig_deliveries++;
+
+    /* Minimal delivery frame: put the guest's SA_RESTORER where a C handler's
+     * epilogue will `ret`, with SysV stack alignment at handler entry.  We
+     * only supply signo in RDI; siginfo/ucontext args are not populated. */
+    greg_t sp = (r[REG_RSP] - 16) & ~(greg_t)15;
+    *(uint64_t *)(uintptr_t)(sp + 8) = g_um.sig_restorer[signo];
+    r[REG_RSP] = sp + 8;                        /* %16 == 8, [RSP]=restorer */
+    r[REG_RDI] = (greg_t)signo;
+    r[REG_RSI] = 0;
+    r[REG_RDX] = 0;
+    r[REG_RIP] = (greg_t)g_um.sig_handler[signo];
 }
 
 static void um_alarm(int sig, siginfo_t *si, void *ucv) {
@@ -237,10 +369,13 @@ static void um_alarm(int sig, siginfo_t *si, void *ucv) {
 typedef struct {
     uint8_t  *file;
     size_t    len;
-    uint64_t  entry;
-    uint64_t  phdr_va;
+    uint64_t  entry;      /* runtime entry (link e_entry + bias) */
+    uint64_t  phdr_va;    /* runtime AT_PHDR (link phdr vaddr + bias) */
     uint16_t  phnum;
-    uint64_t  lo, hi;            /* page-aligned guest image window */
+    uint64_t  bias;       /* 0 for ET_EXEC, chosen base for ET_DYN */
+    uint64_t  lo, hi;     /* page-aligned runtime guest image window */
+    uint8_t   is_dyn;
+    uint8_t   has_interp; /* PT_INTERP: needs ld.so — refused, not emulated */
 } UmImage;
 
 static uint8_t *um_read_file(const char *path, size_t *len) {
@@ -281,6 +416,23 @@ static int um_range_free(uint64_t lo, uint64_t hi) {
 
 #define UM_IMAGE_LIMIT 0x7fff0000ull     /* stay below the host stack/vDSO */
 
+/* Choose a collision-free load bias for an ET_DYN image whose link-time
+ * page-extent is [vlo,vhi).  Deterministic 256 MiB candidates below the
+ * host stack/vDSO ceiling; range-free is checked against /proc/self/maps. */
+static int um_pick_bias(uint64_t vlo, uint64_t vhi, uint64_t *out) {
+    for (uint64_t cand = 0x10000000ull; cand <= UM_IMAGE_LIMIT;
+         cand += 0x10000000ull) {
+        if (vhi > UM_IMAGE_LIMIT - cand) continue;   /* runtime window fits */
+        uint64_t lo = cand + vlo, hi = cand + vhi;
+        if (lo < 0x1000 || hi > UM_IMAGE_LIMIT) continue;
+        if (um_range_free(lo, hi)) { *out = cand; return 0; }
+    }
+    return -1;                                /* no free window */
+}
+
+/* Map an ET_EXEC at its link addresses, or an ET_DYN (PIE) at a chosen load
+ * bias.  A PT_INTERP image is flagged (not loaded) and refused by the caller:
+ * running ld.so / shared objects is deliberately out of scope. */
 static int um_load(const char *path, UmImage *im) {
     memset(im, 0, sizeof *im);
     im->file = um_read_file(path, &im->len);
@@ -292,36 +444,49 @@ static int um_load(const char *path, UmImage *im) {
         eh.e_ident[EI_CLASS] != ELFCLASS64 ||
         eh.e_ident[EI_DATA] != ELFDATA2LSB ||
         eh.e_ident[EI_VERSION] != EV_CURRENT ||
-        eh.e_type != ET_EXEC || eh.e_machine != EM_X86_64 ||
+        (eh.e_type != ET_EXEC && eh.e_type != ET_DYN) ||
+        eh.e_machine != EM_X86_64 ||
         eh.e_phentsize != sizeof(Elf64_Phdr) || eh.e_phnum == 0 ||
         (uint64_t)eh.e_phoff + (uint64_t)eh.e_phnum * eh.e_phentsize > im->len) {
         return -1;
     }
-    im->entry = eh.e_entry;
+    im->is_dyn = (eh.e_type == ET_DYN);
     im->phnum = eh.e_phnum;
 
-    uint64_t lo = UINT64_MAX, hi = 0;
+    uint64_t lo = UINT64_MAX, hi = 0;         /* link-time page extent */
+    uint64_t link_phdr = 0;
     for (unsigned i = 0; i < eh.e_phnum; i++) {
         Elf64_Phdr ph;
         memcpy(&ph, im->file + eh.e_phoff + (uint64_t)i * sizeof ph, sizeof ph);
-        if (ph.p_type != PT_LOAD) {
-            if (ph.p_type == PT_PHDR) im->phdr_va = ph.p_vaddr;
-            continue;
-        }
+        if (ph.p_type == PT_INTERP) { im->has_interp = 1; continue; }
+        if (ph.p_type == PT_PHDR) { link_phdr = ph.p_vaddr; continue; }
+        if (ph.p_type != PT_LOAD) continue;
         if (ph.p_memsz < ph.p_filesz ||
             ph.p_offset + ph.p_filesz > im->len ||
-            ph.p_vaddr + ph.p_memsz < ph.p_vaddr ||
-            ph.p_vaddr + ph.p_memsz > UM_IMAGE_LIMIT) return -1;
+            ph.p_vaddr + ph.p_memsz < ph.p_vaddr) return -1;
         uint64_t ps = ph.p_vaddr & ~0xfffull;
         uint64_t pe = (ph.p_vaddr + ph.p_memsz + 0xfffull) & ~0xfffull;
-        if (ps < 0x1000) return -1;
+        if (!im->is_dyn && ps < 0x1000) return -1;
         if (ps < lo) lo = ps;
         if (pe > hi) hi = pe;
-        if (ph.p_offset == 0 && !im->phdr_va) im->phdr_va = ph.p_vaddr + eh.e_phoff;
+        if (ph.p_offset == 0 && !link_phdr) link_phdr = ph.p_vaddr + eh.e_phoff;
     }
     if (hi <= lo || hi - lo > (256u << 20)) return -1;
-    im->lo = lo; im->hi = hi;
-    if (hi >= (1ull << 32) || !um_range_free(lo, hi)) return -2;
+
+    uint64_t bias = 0;
+    if (im->is_dyn) {
+        if (um_pick_bias(lo, hi, &bias) != 0) return -2;
+    } else {
+        /* ET_EXEC keeps the original hard link-address rules. */
+        if (hi >= (1ull << 32) || !um_range_free(lo, hi)) return -2;
+    }
+    if (eh.e_entry + bias < bias || eh.e_entry + bias > UM_IMAGE_LIMIT)
+        return -1;
+    im->bias = bias;
+    im->lo = lo + bias;
+    im->hi = hi + bias;
+    im->entry = eh.e_entry + bias;
+    im->phdr_va = link_phdr + bias;
 
     /* Pass 1: reserve every page range writable, then copy, then apply the
      * final protections (handles adjacent segments sharing a page). */
@@ -329,8 +494,8 @@ static int um_load(const char *path, UmImage *im) {
         Elf64_Phdr ph;
         memcpy(&ph, im->file + eh.e_phoff + (uint64_t)i * sizeof ph, sizeof ph);
         if (ph.p_type != PT_LOAD || !ph.p_memsz) continue;
-        uint64_t ps = ph.p_vaddr & ~0xfffull;
-        uint64_t pe = (ph.p_vaddr + ph.p_memsz + 0xfffull) & ~0xfffull;
+        uint64_t ps = bias + (ph.p_vaddr & ~0xfffull);
+        uint64_t pe = bias + ((ph.p_vaddr + ph.p_memsz + 0xfffull) & ~0xfffull);
         void *p = mmap((void *)(uintptr_t)ps, (size_t)(pe - ps),
                        PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
@@ -340,7 +505,7 @@ static int um_load(const char *path, UmImage *im) {
         Elf64_Phdr ph;
         memcpy(&ph, im->file + eh.e_phoff + (uint64_t)i * sizeof ph, sizeof ph);
         if (ph.p_type != PT_LOAD || !ph.p_memsz) continue;
-        uint8_t *dst = (uint8_t *)(uintptr_t)ph.p_vaddr;
+        uint8_t *dst = (uint8_t *)(uintptr_t)(bias + ph.p_vaddr);
         memcpy(dst, im->file + ph.p_offset, (size_t)ph.p_filesz);
         memset(dst + ph.p_filesz, 0, (size_t)(ph.p_memsz - ph.p_filesz));
     }
@@ -348,8 +513,8 @@ static int um_load(const char *path, UmImage *im) {
         Elf64_Phdr ph;
         memcpy(&ph, im->file + eh.e_phoff + (uint64_t)i * sizeof ph, sizeof ph);
         if (ph.p_type != PT_LOAD || !ph.p_memsz) continue;
-        uint64_t ps = ph.p_vaddr & ~0xfffull;
-        uint64_t pe = (ph.p_vaddr + ph.p_memsz + 0xfffull) & ~0xfffull;
+        uint64_t ps = bias + (ph.p_vaddr & ~0xfffull);
+        uint64_t pe = bias + ((ph.p_vaddr + ph.p_memsz + 0xfffull) & ~0xfffull);
         int prot = 0;
         if (ph.p_flags & PF_R) prot |= PROT_READ;
         if (ph.p_flags & PF_W) prot |= PROT_WRITE;
@@ -408,7 +573,7 @@ static uint64_t um_build_stack(char *const argv[], char *const envp[],
     uint64_t aux[UM_NAUX][2] = {
         { AT_PHDR_, im->phdr_va }, { AT_PHENT_, sizeof(Elf64_Phdr) },
         { AT_PHNUM_, im->phnum },  { AT_PAGESZ_, 4096 },
-        { AT_BASE_, 0 },           { AT_ENTRY_, im->entry },
+        { AT_BASE_, im->bias },    { AT_ENTRY_, im->entry },
         { AT_CLKTCK_, 100 },       { AT_SECURE_, 0 },
         { AT_RANDOM_, randp },
     };
@@ -456,6 +621,8 @@ static void um_finish(void) {
     alarm(0);
     shared->syscalls = g_um.syscalls;
     shared->denied = g_um.denied;
+    shared->signals_delivered = g_um.sig_deliveries;
+    shared->signals_denied = g_um.sig_denied;
     shared->exit_code = g_um.exit_code;
     switch (g_um.why) {
     case UM_WHY_EXIT:  shared->status = WEMU_UM_OK;          break;
@@ -486,6 +653,7 @@ static void um_child_run(const char *path, char *const argv[], char *const envp[
     int rc = um_load(path, &im);
     if (rc == -2) um_child_fail(shared, WEMU_UM_ERR_RANGE);
     if (rc != 0) um_child_fail(shared, WEMU_UM_ERR_FORMAT);
+    if (im.has_interp) um_child_fail(shared, WEMU_UM_ERR_INTERP);
     uint8_t *stack_mem;
     uint64_t rsp = um_build_stack(argv, envp, &im, &stack_mem);
     if (!rsp) um_child_fail(shared, WEMU_UM_ERR_INTERNAL);
@@ -508,7 +676,8 @@ static void um_child_run(const char *path, char *const argv[], char *const envp[
     sa.sa_flags = SA_SIGINFO;
     sigemptyset(&sa.sa_mask);
     sigaddset(&sa.sa_mask, SIGSYS);
-    if (sigaction(SIGSEGV, &sa, NULL) != 0 || sigaction(SIGBUS, &sa, NULL) != 0)
+    if (sigaction(SIGSEGV, &sa, NULL) != 0 || sigaction(SIGBUS, &sa, NULL) != 0 ||
+        sigaction(SIGILL, &sa, NULL) != 0 || sigaction(SIGFPE, &sa, NULL) != 0)
         um_child_fail(shared, WEMU_UM_ERR_TRAP);
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = um_alarm;
