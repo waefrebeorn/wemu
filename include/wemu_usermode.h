@@ -30,6 +30,14 @@ extern "C" {
 #define WEMU_UM_MAX_EXECS     4u       /* bounded image replacements/run */
 #define WEMU_UM_MAX_HOST_PAGES 8u      /* bounded host-only regions hidden/guest */
 
+/* CPU-enforced protection-key (MPK/pkeys) mode for the isolation path.
+ * AUTO uses x86-64 protection keys when the host supports them and falls
+ * closed to the munmap hide path when it does not.  FORCE_FALLBACK forces
+ * the munmap path even on a pkey-capable host (differential-gate control).
+ * The master on/off switch is wemu_um_set_isolation_enabled(). */
+#define WEMU_UM_PKEY_AUTO           0
+#define WEMU_UM_PKEY_FORCE_FALLBACK 1
+
 typedef enum {
     WEMU_UM_OK            =   0,
     WEMU_UM_ERR_ARGS      =  -1,
@@ -87,6 +95,20 @@ typedef struct {
      were unmapped from the GUEST child before it began executing. */
     uint64_t  arena_lo, arena_hi;/* registered MAP_SHARED guest arena (shared region) */
     uint32_t  host_pages_hidden; /* host pages removed from the guest process */
+    /* CPU-enforced memory-protection-key (MPK) evidence.  pkey_active=1 means
+     * the run used hardware keys: the guest arena stays in the default key 0
+     * (always accessible; signal handlers run on its stack), while registered
+     * host pages get a dedicated pkey that PKRU access-disables for the guest.
+     * pkey_fallback=1 means pkeys were unavailable (or forced off) and the
+     * munmap hide path was used instead.  fault_code/fault_pkey report the
+     * kernel's siginfo for a guest synchronous fault (SEGV_PKUERR + si_pkey
+     * proves a hardware key violation, not a plain unmapped-page fault). */
+    uint32_t  pkey_active;
+    uint32_t  pkey_fallback;
+    int       pkey_guest;        /* key assigned to arena, -1 if none */
+    int       pkey_host;         /* key assigned to host pages, -1 if none */
+    int       fault_code;        /* si_code of last guest sync fault, 0 if none */
+    int       fault_pkey;        /* si_pkey of a SEGV_PKUERR fault, -1 if none */
     uint32_t  out_len;       /* bytes captured from fd 1/2, <= OUT_MAX */
     char      out[WEMU_UM_OUT_MAX]; /* NUL-terminated if out_len < OUT_MAX */
 } WemuUmResult;
@@ -133,12 +155,13 @@ int wemu_um_execveat_modeled(long dirfd, uint64_t flags);
  * remainder = shared scratch).  Returns 0, or -1 on bad arguments. */
 int wemu_um_set_guest_arena(void *base, size_t len);
 
-/* Register a host-only region that the GUEST PROCESS must not be able to
- * observe.  The supervisor keeps its own mapping; the forked guest child
- * unmaps every registered region BEFORE it starts executing guest code, so
- * a direct guest load/store faults instead of reading host bytes, and the
- * syscall pointer validator refuses the same address.  At most
- * WEMU_UM_MAX_HOST_PAGES regions.  Returns 0, or -1 if the table is full. */
+/* Register a host-only region that the GUEST must not be able to observe.
+ * With MPK support the supervisor assigns these pages a dedicated protection
+ * key and access-disables that key via PKRU while guest code runs: a direct
+ * guest load/store raises a hardware SEGV_PKUERR (reported in WemuUmResult as
+ * fault_code/fault_pkey).  If the CPU lacks PKU or a pkey syscall fails, the
+ * run FAILS CLOSED by munmap()ing the region in the guest child instead.  At
+ * most WEMU_UM_MAX_HOST_PAGES regions.  Returns 0, or -1 if the table is full. */
 int wemu_um_isolate_host_pages(void *addr, size_t len);
 
 /* Clear the host-page hide list and the guest arena (reset between runs). */
@@ -149,6 +172,13 @@ void wemu_um_reset_isolation(void);
  * pre-isolation (shared-address-space) behaviour.  Isolation is ON by
  * default.  Returns 0, or -1 if the value was out of range. */
 int wemu_um_set_isolation_enabled(int enabled);
+
+/* Select the CPU-enforcement mode (WEMU_UM_PKEY_* above).  AUTO (default)
+ * uses x86-64 protection keys when the host supports them; if the CPU lacks
+ * PKU or pkey_alloc fails, isolation FAILS CLOSED by using the munmap hide
+ * path instead of running unprotected.  FORCE_FALLBACK forces that munmap
+ * path for the differential gate.  Returns 0, or -1 for an unknown mode. */
+int wemu_um_set_pkey_mode(int mode);
 
 /* Introspection for the gate: the table itself and a readable status name. */
 const WemuUmSyscallEntry *wemu_um_syscall_table(size_t *count);

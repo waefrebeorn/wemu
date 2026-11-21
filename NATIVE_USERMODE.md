@@ -59,19 +59,27 @@ untrusted-guest sandbox. Nothing here is enabled implicitly by `wemu_cpu_run`.
    the faulting instruction is retried. `wemu_usermode.c` is compiled without
    `-fstack-protector`: its handlers run on the guest stack with a
    guest-set `%fs`, so a TLS stack canary there is not the host's.
-9. **Process-per-guest address-space isolation.** `wemu_um_set_guest_arena()`
+9. **Process-per-guest isolation, now CPU-enforced with MPK/pkeys.** `wemu_um_set_guest_arena()`
    registers a supervisor-owned `MAP_SHARED` region; forked guest children
    build the SysV stack inside it, so the guest's writable world is a mapping
    the supervisor also holds and validates against. `wemu_um_isolate_host_pages()`
-   registers host-only regions (e.g. a supervisor secret) that the guest child
-   `munmap()`s **before its first instruction** — a direct guest load/store of
-   such a page faults instead of observing host bytes. Independently, every
-   host-syscall pointer is validated against the registered guest region
-   (image / shared arena stack / brk heap / admitted mmap); an out-of-region
-   pointer ends the run with `WEMU_UM_ERR_BADPTR` and no host dispatch.
-   `WemuUmResult` reports `arena_lo/hi` and `host_pages_hidden` as evidence.
-   `wemu_um_set_isolation_enabled(0)` is the differential-gate negative
-   control: it reproduces the old shared-address-space behaviour (leak).
+   registers host-only regions (e.g. a supervisor secret). When the CPU has
+   PKU, the child allocates a protection key for those pages with
+   `pkey_alloc`/`pkey_mprotect` and `wrpkru` access-disables that key while
+   guest code runs: a direct guest load/store raises a hardware
+   `SEGV_PKUERR` (`si_pkey == pkey_host`) instead of observing host bytes.
+   The arena stays in the default key 0 (always accessible) — a nonzero arena
+   key would fault every guest syscall/signal handler, which runs on the
+   arena stack because Linux resets PKRU on signal delivery. If PKU is absent
+   or a pkey syscall fails, the run **fails closed** to the original `munmap`
+   hide path (never unprotected). Independently, every host-syscall pointer is
+   validated against the registered guest regions; an out-of-region pointer
+   ends the run with `WEMU_UM_ERR_BADPTR` and no host dispatch. `WemuUmResult`
+   reports `arena_lo/hi`, `host_pages_hidden`, `pkey_active/pkey_fallback`,
+   `pkey_guest/pkey_host` and the fault's `fault_code/fault_pkey` as evidence.
+   `wemu_um_set_isolation_enabled(0)` and `wemu_um_set_pkey_mode()` are the
+   differential-gate controls: OFF reproduces the old shared-address-space
+   leak; FORCE_FALLBACK forces the munmap path.
 
 ## Bounded / fail-closed
 
@@ -201,12 +209,13 @@ table entry against the kernel's `asm/unistd_64.h`.
   payloads and ioctl request-specific layouts are not decoded; `ioctl` args
   that look like small scalars are passed through. A direct load/store that
   stays inside the guest image/stack/heap cannot be seen by the syscall
-  validator — only the host-page hide list removes host bytes from the guest
-  page table, and a host page NOT registered for hiding (or reachable via an
-  already-admitted guest mapping) is still observable. Pointer validation is
-  range checking plus a caller-managed hide list, not address-space isolation
-  enforced by the CPU (no EPT/MPK/pkeys); the avoid-leak guarantee holds only
-  for pages registered with `wemu_um_isolate_host_pages()` before the run.
+  validator — only the host-page protection removes host bytes from the
+  guest's accessible set (an MPK-disabled key, or an unmapped page in the
+  fail-closed fallback), and a host page NOT registered for protection (or
+  reachable via an already-admitted guest mapping) is still observable. With
+  MPK the protection is enforced by the CPU (pkeys/PKRU), not just a
+  caller-managed hide list; the avoid-leak guarantee holds only for pages
+  registered with `wemu_um_isolate_host_pages()` before the run.
 - The gate runs **45** real static busybox applets, each byte-exact against
   host `execve` of the same binary/args/env, plus static-PIE load-bias and
   SIGSEGV fixtures, a static-PIE fork/clone fixture (private COW children), a
@@ -216,7 +225,13 @@ table entry against the kernel's `asm/unistd_64.h`.
   brk), plus `tests/isolate_probe` in `test_usermode_isolate` for the four
   process-per-guest differentials (valid pointer byte-exact vs host oracle,
   MAP_SHARED arena pointer, out-of-region pointer refused, and a direct host
-  load that faults with isolation ON / leaks with isolation OFF). LTP,
+  load that faults with isolation ON / leaks with isolation OFF). `test_usermode_mpk`
+  adds the CPU-enforced differentials: byte-exact valid/arena accesses, a
+  direct host-page load that hardware-blocks with `SEGV_PKUERR`/`si_pkey`
+  (MPK active), the fail-closed munmap fallback with a plain `#PF`, and the
+  old-path negative control that leaks. `tools/mpk_negctl.sh` rebuilds the
+  unmodified 1b09ea3 executor to show the old path has no pkey evidence and
+  leaks when isolation is off. LTP,
   `pthread_create`, vfork sharing, clone3 pidfds and guest signal masks are
   not yet modelled. `execve` only replaces static
   ET_EXEC/ET_DYN images: PT_INTERP (ld.so), fd-relative `execveat`, exec from

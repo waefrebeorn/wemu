@@ -95,6 +95,30 @@
 #define SIG_DFL_ 0
 #define SIG_IGN_ 1
 
+/* x86-64 raw pkey syscalls (absent from some libc header sets).  Kept with
+ * the WEMU_UM_SYS_ prefix so a future VSL addition is visible, not silently
+ * duplicated.  Linux x86-64: pkey_mprotect=329, pkey_alloc=330, pkey_free=331. */
+#define WEMU_UM_SYS_PKEY_MPROTECT 329
+#define WEMU_UM_SYS_PKEY_ALLOC    330
+#define WEMU_UM_SYS_PKEY_FREE     331
+#define WEMU_PKU_CPUID_BIT        (1u << 3)   /* CPUID.(EAX=7,ECX=0).ECX.PKU */
+
+/* PKRU is per-thread register state; rdpkru/wrpkru require ECX=EDX=0. */
+static inline uint32_t um_rdpkru(void) {
+    uint32_t v;
+    __asm__ volatile("rdpkru" : "=a"(v) : "c"(0), "d"(0));
+    return v;
+}
+static inline void um_wrpkru(uint32_t v) {
+    __asm__ volatile("wrpkru" :: "a"(v), "c"(0), "d"(0) : "memory");
+}
+static int um_cpu_pkey_support(void) {
+    unsigned eax, ebx, ecx, edx;
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                     : "a"(7u), "c"(0u));
+    return (ecx & WEMU_PKU_CPUID_BIT) != 0;
+}
+
 /* ---- the one dispatch table (no implicit allow) --------------------- */
 static const WemuUmSyscallEntry um_table[] = {
     { VSL_SYS_READ,            "read",            WEMU_UM_DISPATCH_HOST },
@@ -250,6 +274,8 @@ static struct {
     volatile uint32_t bad_ptrs;    /* pointers refused before host dispatch */
     volatile uint32_t bad_ptr_nr;
     volatile uint64_t bad_ptr_va;
+    int      fault_code;           /* si_code of last guest sync fault */
+    int      fault_pkey;           /* si_pkey of a SEGV_PKUERR fault, -1 else */
     WemuUmResult *result;
     /* process-wide signal dispositions (CLONE_SIGHAND shares these) */
     uint64_t sig_handler[WEMU_UM_SIG_NSIG];
@@ -268,8 +294,18 @@ static struct {
     uint64_t hide_hi[WEMU_UM_MAX_HOST_PAGES];
     uint32_t n_hide;
     int enabled;
-} g_cfg = { .enabled = 1 };
+    int pkey_mode;               /* WEMU_UM_PKEY_AUTO or FORCE_FALLBACK */
+} g_cfg = { .enabled = 1, .pkey_mode = WEMU_UM_PKEY_AUTO };
 
+/* CPU-enforced protection-key state, built in the forked guest child before
+ * the first guest instruction.  PKRU is per-thread: the supervisor (parent)
+ * keeps its own value and full access to its pages. */
+static uint32_t g_host_pkru;      /* all guest/host keys enabled (handler state) */
+static uint32_t g_guest_pkru;     /* guest state: guest key on, host key denied */
+static int g_pkey_guest = -1;     /* pkey assigned to the guest arena */
+static int g_pkey_host  = -1;     /* pkey assigned to registered host pages */
+static uint32_t g_pkey_active;    /* 1 when hardware keys protect this run */
+static uint32_t g_pkey_fallback;  /* 1 when the munmap hide path was used */
 int wemu_um_set_guest_arena(void *base, size_t len) {
     uint64_t b = (uint64_t)(uintptr_t)base;
     if (!base || (b & 0xfffull) || len < (2u << 20) || b + len < b) return -1;
@@ -292,12 +328,121 @@ void wemu_um_reset_isolation(void) {
     g_cfg.arena_lo = g_cfg.arena_hi = 0;
     g_cfg.n_hide = 0;
     g_cfg.enabled = 1;
+    g_cfg.pkey_mode = WEMU_UM_PKEY_AUTO;
 }
 
 int wemu_um_set_isolation_enabled(int enabled) {
     if (enabled != 0 && enabled != 1) return -1;
     g_cfg.enabled = enabled;
     return 0;
+}
+
+int wemu_um_set_pkey_mode(int mode) {
+    if (mode != WEMU_UM_PKEY_AUTO && mode != WEMU_UM_PKEY_FORCE_FALLBACK) return -1;
+    g_cfg.pkey_mode = mode;
+    return 0;
+}
+
+/* Raw pkey syscalls (host context, RIP outside the guest image: not trapped). */
+/* Forward declarations: um_raw0/um_raw1 are defined with the other raw
+ * syscall helpers later in this file. */
+static int64_t um_raw0(long nr);
+static int64_t um_raw1(long nr, long a0);
+static uint32_t um_hide_host_pages(void);
+
+static int64_t um_raw_pkey_alloc(void) {
+    long ret;
+    /* pkey_alloc(unsigned long flags, unsigned long init): both args must be
+     * ZERO — um_raw0() leaves rdi/rsi undefined, which the kernel rejects. */
+    __asm__ volatile("syscall" : "=a"(ret)
+        : "a"((long)WEMU_UM_SYS_PKEY_ALLOC), "D"(0L), "S"(0L)
+        : "rcx", "r11", "memory");
+    return (int64_t)ret;
+}
+static int64_t um_raw_pkey_mprotect(uint64_t lo, uint64_t hi, int key) {
+    register long r10 __asm__("r10") = (long)key;
+    long ret;
+    __asm__ volatile("syscall" : "=a"(ret)
+        : "a"((long)WEMU_UM_SYS_PKEY_MPROTECT), "D"((long)lo),
+          "S"((long)(hi - lo)), "d"((long)(PROT_READ | PROT_WRITE)), "r"(r10)
+        : "rcx", "r11", "memory");
+    return (int64_t)ret;
+}
+/* Set up CPU-enforced protection of the registered host pages in the forked
+ * guest child, BEFORE its first guest instruction.  The guest arena gets one
+ * key (always accessible); registered host pages get another key whose AD bit
+ * is set in PKRU while the guest runs, so a direct guest load/store raises a
+ * hardware SEGV_PKUERR instead of observing host bytes.  If the host lacks
+ * PKU or a syscall fails, the run FAILS CLOSED to the munmap hide path — it
+ * is never left unprotected.  Returns 0, or -1 if even the fallback fails. */
+static int um_setup_pkeys(WemuUmResult *shared) {
+    g_pkey_guest = g_pkey_host = -1;
+    g_pkey_active = g_pkey_fallback = 0;
+    g_um.fault_code = 0;
+    g_um.fault_pkey = -1;
+    shared->pkey_active = 0;
+    shared->pkey_fallback = 0;
+    shared->pkey_guest = shared->pkey_host = -1;
+    shared->fault_code = 0;
+    shared->fault_pkey = -1;
+
+    /* No host pages registered: nothing to protect, nothing to hide. */
+    if (!g_cfg.n_hide) { g_host_pkru = um_rdpkru(); return 0; }
+
+    int try_pkey = (g_cfg.pkey_mode == WEMU_UM_PKEY_AUTO) &&
+                   um_cpu_pkey_support();
+    if (try_pkey) {
+        int64_t kh = um_raw_pkey_alloc();
+        if (kh >= 0) {
+            /* The arena stays in the DEFAULT key (0), which is always
+             * accessible.  A nonzero arena key would break every guest
+             * syscall/signal: Linux resets PKRU on signal delivery, and our
+             * handlers run on the guest stack inside the arena, so a keyed
+             * arena would fault on the handler's first stack access. */
+            g_pkey_host = (int)kh;
+            g_pkey_guest = 0;
+        }
+    }
+
+    if (g_pkey_host >= 0) {
+        /* Key allocated: the kernel cleared AD/WD for it in this thread's
+         * PKRU.  Stamp the arena with the default key and every host-only
+         * region with the dedicated host key.  All ranges are page-aligned
+         * by contract. */
+        int ok = 1;
+        if (g_cfg.arena_hi > g_cfg.arena_lo &&
+            um_raw_pkey_mprotect(g_cfg.arena_lo, g_cfg.arena_hi, 0) != 0)
+            ok = 0;
+        for (uint32_t i = 0; ok && i < g_cfg.n_hide; i++)
+            if (um_raw_pkey_mprotect(g_cfg.hide_lo[i], g_cfg.hide_hi[i],
+                                     g_pkey_host) != 0) ok = 0;
+        if (ok) {
+            /* Keep the key allocated (do not free: freeing would re-disable
+             * the stamped pages).  PKRU denies the host key only in the guest
+             * child; the supervisor parent retains full access. */
+            g_host_pkru = um_rdpkru();
+            g_guest_pkru = g_host_pkru |
+                           (1u << (2u * (unsigned)g_pkey_host));
+            g_guest_pkru &= ~3u;               /* keep key 0 (arena) enabled */
+            g_pkey_active = 1;
+            shared->pkey_active = 1;
+            shared->pkey_guest = g_pkey_guest;
+            shared->pkey_host  = g_pkey_host;
+            return 0;
+        }
+        /* mprotect failed after keys were stamped: fall through to munmap.
+         * Do NOT free the keys (that would lock out the stamped arena); the
+         * child exits shortly, reclaiming them with its mm. */
+    }
+
+    /* Fail-closed fallback: pkeys unsupported/unavailable/forced off.  Remove
+     * host pages from the guest page table — a plain #PF still blocks the
+     * read.  A short count fails the run closed. */
+    g_pkey_fallback = 1;
+    shared->pkey_fallback = 1;
+    g_host_pkru = um_rdpkru();
+    g_guest_pkru = g_host_pkru;
+    return (um_hide_host_pages() == g_cfg.n_hide) ? 0 : -1;
 }
 
 /* Called in the FORKED GUEST CHILD, after all host-side setup is complete and
@@ -1039,8 +1184,17 @@ static void um_fault(int sig, siginfo_t *si, void *ucv) {
     int signo = si ? si->si_signo : sig;
     uint64_t rip = (uint64_t)r[REG_RIP];
     int in_guest = rip >= g_um.win_lo && rip < g_um.win_hi;
+    /* Kernel siginfo: SEGV_PKUERR + si_pkey is hardware proof that a
+     * protection-key violation (not a plain unmapped-page fault) occurred. */
+    g_um.fault_code = si ? si->si_code : 0;
+    g_um.fault_pkey = (si && g_um.fault_code == SEGV_PKUERR)
+                          ? (int)si->si_pkey : -1;
+    int pku = (g_um.fault_code == SEGV_PKUERR);
 
-    if (!um_sig_sync(signo) || !in_guest || !um_sig_registered(signo) ||
+    /* A pkey violation is never offered to a guest handler: the bytes are
+     * unreadable by hardware, and retrying from a handler could only loop or
+     * brute-force the key.  Fail closed straight to the result page. */
+    if (pku || !um_sig_sync(signo) || !in_guest || !um_sig_registered(signo) ||
         th->in_handler || th->sig_deliveries >= WEMU_UM_MAX_SIGNALS) {
         th->sig_denied++;                     /* fail closed, no delivery */
         um_abort_to_finish(uc, th, UM_WHY_FAULT);
@@ -1359,6 +1513,12 @@ static void um_finish(void) {
     shared->bad_ptrs = g_um.bad_ptrs;
     shared->bad_ptr_nr = g_um.bad_ptr_nr;
     shared->bad_ptr_va = g_um.bad_ptr_va;
+    shared->pkey_active = g_pkey_active;
+    shared->pkey_fallback = g_pkey_fallback;
+    shared->pkey_guest = g_pkey_guest;
+    shared->pkey_host = g_pkey_host;
+    shared->fault_code = g_um.fault_code;
+    shared->fault_pkey = g_um.fault_pkey;
     shared->exit_code = th->exit_code;
     switch (th->why) {
     case UM_WHY_EXIT:  shared->status = WEMU_UM_OK;          break;
@@ -1422,6 +1582,10 @@ static void um_exec_continue(void) {
     WemuUmResult *shared = g_um.result;
     if (um_raw_set_fs(g_host_fs) != 0)
         um_child_fail(shared, WEMU_UM_ERR_INTERNAL);
+    /* Host context: restore the all-keys-enabled PKRU so glibc's loader
+     * (malloc/stdio/errno) runs with normal access.  Re-applied before the
+     * new image is entered below. */
+    if (g_pkey_active) um_wrpkru(g_host_pkru);
 
     g_exec.used = 0;
     g_exec.path = um_exec_str(g_exec.pathp, UM_EXEC_MAX_ARG);
@@ -1461,6 +1625,7 @@ static void um_exec_continue(void) {
     g_um.denied = 0;
     g_um.n_mmaps = 0;
     g_um.bad_ptrs = 0; g_um.bad_ptr_nr = 0; g_um.bad_ptr_va = 0;
+    g_um.fault_code = 0; g_um.fault_pkey = -1;
     memset(g_um.sig_handler, 0, sizeof g_um.sig_handler);
     memset(g_um.sig_restorer, 0, sizeof g_um.sig_restorer);
     memset(g_um.sig_flags, 0, sizeof g_um.sig_flags);
@@ -1469,6 +1634,7 @@ static void um_exec_continue(void) {
     shared->threads_created = 0;
     memset(shared->denied_nrs, 0, sizeof shared->denied_nrs);
     shared->bad_ptrs = 0; shared->bad_ptr_nr = 0; shared->bad_ptr_va = 0;
+    shared->fault_code = 0; shared->fault_pkey = -1;
     shared->execs++;                           /* monotonic: resets cannot reset it */
     for (unsigned i = 1; i < WEMU_UM_MAX_THREADS; i++)
         memset(&g_thr[i], 0, sizeof g_thr[i]);
@@ -1491,6 +1657,9 @@ static void um_exec_continue(void) {
     if (um_install_filter(im.lo, im.hi) != 0)
         um_child_fail(shared, WEMU_UM_ERR_TRAP);
 
+    /* As in um_child_run: getcontext snapshots PKRU, so arm the guest PKRU
+     * BEFORE it and let setcontext restore host-key denial on entry. */
+    if (g_pkey_active) um_wrpkru(g_guest_pkru);
     ucontext_t uc;
     if (getcontext(&uc) != 0) um_child_fail(shared, WEMU_UM_ERR_TRAP);
     uc.uc_mcontext.gregs[REG_RSP] = (greg_t)rsp;
@@ -1583,6 +1752,25 @@ static void um_child_run(const char *path, char *const argv[], char *const envp[
     if (um_install_filter(im.lo, im.hi) != 0)
         um_child_fail(shared, WEMU_UM_ERR_TRAP);
 
+    /* CPU-enforced guest memory protection, installed BEFORE the guest's
+     * first instruction.  With MPK support the arena and host pages are
+     * stamped with separate keys and PKRU denies the host key while the
+     * guest runs; if PKU is unavailable or a syscall fails, the run FAILS
+     * CLOSED to the munmap hide path.  Isolation OFF is the negative-control
+     * no-op that reproduces the old shared-address-space behaviour. */
+    uint32_t hidden = 0;
+    if (g_cfg.enabled) {
+        if (um_setup_pkeys(shared) != 0)
+            um_child_fail(shared, WEMU_UM_ERR_TRAP);
+        hidden = g_cfg.n_hide;   /* pages unreadable to the guest (unmap OR key) */
+    }
+    shared->host_pages_hidden = hidden;
+
+    /* getcontext() snapshots FPU/XSAVE state — INCLUDING PKRU.  Arm the guest
+     * PKRU before it, so setcontext() restores host-key denial on entry; a
+     * wrpkru() after getcontext would be overwritten by setcontext(). */
+    if (g_pkey_active) um_wrpkru(g_guest_pkru);
+
     ucontext_t uc;
     if (getcontext(&uc) != 0) um_child_fail(shared, WEMU_UM_ERR_TRAP);
     uc.uc_mcontext.gregs[REG_RSP] = (greg_t)rsp;
@@ -1591,24 +1779,13 @@ static void um_child_run(const char *path, char *const argv[], char *const envp[
     uc.uc_mcontext.gregs[REG_RDX] = 0;        /* rtld_fini */
     sigemptyset(&uc.uc_sigmask);             /* all signals live in the guest */
 
-    /* Process-per-guest isolation: strip host-only mappings from THIS process
-     * before the guest's first instruction.  The supervisor (parent) keeps
-     * its own copies.  A short count fails closed.  With the switch off this
-     * is a no-op, reproducing the old shared-address-space behaviour. */
-    uint32_t hidden = 0;
-    if (g_cfg.enabled) {
-        hidden = um_hide_host_pages();
-        if (hidden != g_cfg.n_hide) um_child_fail(shared, WEMU_UM_ERR_TRAP);
-    }
-    shared->host_pages_hidden = hidden;
-
     uintptr_t sp;
     __asm__ volatile ("mov %%rsp, %0" : "=r"(sp));
     root->child_rsp = (greg_t)sp;
     root->why = 0;
     root->active = 1;
     alarm(WEMU_UM_TIMEOUT_SEC);
-    (void)setcontext(&uc);                   /* transfers to e_entry */
+    (void)setcontext(&uc);                   /* transfers to e_entry (PKRU armed) */
     um_finish();                             /* only on setcontext failure */
 }
 
