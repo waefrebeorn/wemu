@@ -37,8 +37,10 @@ typedef enum {
     WEMU_UM_ERR_FAULT     =  -6,   /* guest faulted outside the ABI */
     WEMU_UM_ERR_BUDGET    =  -7,   /* syscall budget / timeout exceeded */
     WEMU_UM_ERR_DENIED    =  -8,   /* an unlisted syscall was attempted */
-    WEMU_UM_ERR_INTERNAL  =  -9,
-    WEMU_UM_ERR_INTERP    = -10    /* ET_DYN with PT_INTERP: no ld.so model */
+    WEMU_UM_ERR_INTERNAL  = -9,
+    WEMU_UM_ERR_INTERP    = -10,   /* ET_DYN with PT_INTERP: no ld.so model */
+    WEMU_UM_ERR_BADPTR    = -11    /* guest pointer outside the mapped ranges:
+                                    * the host syscall was NOT dispatched */
 } WemuUmStatus;
 
 /* Dispatch kinds.  A syscall absent from the table is NOT passed through:
@@ -52,7 +54,8 @@ typedef enum {
     WEMU_UM_DISPATCH_SIGRETURN,  /* rt_sigreturn: restore the saved context */
     WEMU_UM_DISPATCH_FORK,       /* fork/vfork: bounded COW guest child */
     WEMU_UM_DISPATCH_CLONE,      /* clone: same, but flags checked first */
-    WEMU_UM_DISPATCH_CLONE3      /* clone3: clone_args flags checked first */
+    WEMU_UM_DISPATCH_CLONE3,     /* clone3: clone_args flags checked first */
+    WEMU_UM_DISPATCH_BRK         /* brk: bounded heap growth, range tracked */
 } WemuUmDispatch;
 
 typedef struct {
@@ -70,6 +73,9 @@ typedef struct {
     uint32_t  signals_denied;    /* fail-closed signal registrations/deliveries */
     uint32_t  forks;             /* bounded COW children created this run */
     uint32_t  denied_nrs[8];     /* distinct unlisted/refused syscall numbers */
+    uint32_t  bad_ptrs;          /* guest pointers refused before host dispatch */
+    uint32_t  bad_ptr_nr;        /* syscall number of the last refused pointer */
+    uint64_t  bad_ptr_va;        /* the refused guest pointer (host-address-shaped) */
     uint32_t  out_len;       /* bytes captured from fd 1/2, <= OUT_MAX */
     char      out[WEMU_UM_OUT_MAX]; /* NUL-terminated if out_len < OUT_MAX */
 } WemuUmResult;

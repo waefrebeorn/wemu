@@ -525,6 +525,61 @@ static void test_fork_clone(void) {
            "fail-closed clone/clone3 flags\n");
 }
 
+/* ---- 8. sandbox differential: exec mappings + pointer validation ----- */
+/* The freestanding tests/sandbox_probe guest issues raw syscalls so every
+ * argument is controlled by the gate.  Assertions below are on the RESULT
+ * of wemu_um_run_elf, not on guest self-reports where possible. */
+static int run_probe(const char *mode, WemuUmResult *r) {
+    char *argv[] = { (char *)"sandbox_probe", (char *)mode, NULL };
+    return wemu_um_run_elf("tests/sandbox_probe", argv, GUEST_ENV, r);
+}
+
+static void test_sandbox(void) {
+    WemuUmResult r;
+
+    /* PROT_EXEC mmap with an in-window hint but no MAP_FIXED: pre-change
+     * admitted it and shellcode ran OUTSIDE the seccomp trap window. */
+    int rc = run_probe("exec", &r);
+    if (rc != WEMU_UM_OK)
+        FAIL("sandbox/exec: status=%s out=[%s]\n",
+             wemu_um_status_name(rc), r.out);
+    if (!strstr(r.out, "MMAP-REFUSED") || strstr(r.out, "SHELLCODE-RAN"))
+        FAIL("sandbox/exec: new PROT_EXEC map was admitted: [%s]\n", r.out);
+    printf("ok: FAIL-CLOSED PROT_EXEC mmap (in-window hint, no MAP_FIXED) "
+           "refused; shellcode did not run [%s]\n", r.out);
+
+    /* Regression guard: mprotect of a page outside the image window stays
+     * refused (this part was already closed before this increment). */
+    rc = run_probe("mprotect", &r);
+    if (rc != WEMU_UM_OK || strstr(r.out, "MPROTECT-REFUSED") == NULL)
+        FAIL("sandbox/mprotect: status=%s out=[%s]\n",
+             wemu_um_status_name(rc), r.out);
+    printf("ok: FAIL-CLOSED mprotect(RWX) outside image window refused [%s]\n",
+           r.out);
+
+    /* Out-of-range guest pointer: refuse BEFORE host dispatch, with the new
+     * ERR_BADPTR status and evidence of the exact syscall/VA. */
+    rc = run_probe("ptr", &r);
+    if (rc != WEMU_UM_ERR_BADPTR || r.bad_ptrs != 1 ||
+        r.bad_ptr_nr != 1 || r.bad_ptr_va != 0xDEAD0000ull || r.out_len != 0)
+        FAIL("sandbox/ptr: status=%s bad=%u/%u/0x%llx out=[%s]\n",
+             wemu_um_status_name(rc), r.bad_ptrs, r.bad_ptr_nr,
+             (unsigned long long)r.bad_ptr_va, r.out);
+    printf("ok: FAIL-CLOSED out-of-range write pointer -> %s "
+           "(syscall=%u, va=0x%llx, host write NOT dispatched)\n",
+           wemu_um_status_name(rc), r.bad_ptr_nr,
+           (unsigned long long)r.bad_ptr_va);
+
+    /* brk is bounded: the host kernel never sees the 1 GiB growth request. */
+    rc = run_probe("brk", &r);
+    if (rc != WEMU_UM_OK || strstr(r.out, "BRK-BOUNDED") == NULL ||
+        strstr(r.out, "BRK-GREW") != NULL)
+        FAIL("sandbox/brk: status=%s out=[%s]\n",
+             wemu_um_status_name(rc), r.out);
+    printf("ok: FAIL-CLOSED unbounded brk refused (break unchanged) [%s]\n",
+           r.out);
+}
+
 int main(void) {
     audit_header("/usr/include/x86_64-linux-gnu/asm/unistd_64.h");
     test_applets();
@@ -533,8 +588,9 @@ int main(void) {
     test_pie_and_signals();
     test_clone_policy();
     test_fork_clone();
+    test_sandbox();
     printf("WEMU NATIVE USERMODE GATE PASS (%d static busybox applets, "
-           "ET_DYN load bias, bounded signals, bounded fork/clone, fail-closed)\n",
+           "ET_DYN load bias, bounded signals/fork, fail-closed sandbox)\n",
            g_applets_checked);
     return 0;
 }

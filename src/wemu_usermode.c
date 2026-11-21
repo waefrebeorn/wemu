@@ -90,7 +90,7 @@ static const WemuUmSyscallEntry um_table[] = {
     { VSL_SYS_MMAP,            "mmap",            WEMU_UM_DISPATCH_EXEC_GUARD },
     { VSL_SYS_MPROTECT,        "mprotect",        WEMU_UM_DISPATCH_EXEC_GUARD },
     { VSL_SYS_MUNMAP,          "munmap",          WEMU_UM_DISPATCH_HOST },
-    { VSL_SYS_BRK,             "brk",             WEMU_UM_DISPATCH_HOST },
+    { VSL_SYS_BRK,             "brk",              WEMU_UM_DISPATCH_BRK },
     { VSL_SYS_RT_SIGACTION,    "rt_sigaction",    WEMU_UM_DISPATCH_SIGACTION },
     { WEMU_UM_SYS_RT_SIGRETURN,"rt_sigreturn",    WEMU_UM_DISPATCH_SIGRETURN },
     { VSL_SYS_RT_SIGPROCMASK,  "rt_sigprocmask",  WEMU_UM_DISPATCH_HOST },
@@ -156,12 +156,20 @@ const char *wemu_um_status_name(int s) {
     case WEMU_UM_ERR_DENIED:   return "ERR_DENIED";
     case WEMU_UM_ERR_INTERNAL: return "ERR_INTERNAL";
     case WEMU_UM_ERR_INTERP:   return "ERR_INTERP";
+    case WEMU_UM_ERR_BADPTR:   return "ERR_BADPTR";
     default:                   return "ERR_UNKNOWN";
     }
 }
 
 /* ---- per-child run state -------------------------------------------- */
-enum { UM_WHY_EXIT = 1, UM_WHY_FAULT, UM_WHY_BUDGET, UM_WHY_ALARM };
+enum { UM_WHY_EXIT = 1, UM_WHY_FAULT, UM_WHY_BUDGET, UM_WHY_ALARM, UM_WHY_BADPTR };
+
+/* Bounded guest address-space bookkeeping.  The native path shares the host
+ * address space with the guest, so "mapped guest ranges" are the ELF image
+ * window, the SysV stack, the bounded brk heap and guest mmap results.  A
+ * pointer outside ALL of them is refused before any host syscall sees it. */
+#define UM_MAX_MMAPS  16u
+#define UM_HEAP_MAX   (16u << 20)   /* max brk growth above the initial break */
 
 /* Number of general registers in mcontext_t (compile-time, no magic 23). */
 #define UM_NGREG \
@@ -175,7 +183,14 @@ static struct {
     volatile int exit_code;
     volatile uint64_t syscalls;
     volatile uint64_t denied;
-    uint64_t win_lo, win_hi;
+    uint64_t win_lo, win_hi;       /* guest ELF image window (PT_LOAD) */
+    uint64_t stack_lo, stack_hi;   /* SysV initial stack mapping */
+    uint64_t heap_lo, heap_hi;     /* bounded brk heap [initial break, current] */
+    uint64_t mmap_lo[UM_MAX_MMAPS], mmap_hi[UM_MAX_MMAPS];
+    uint32_t n_mmaps;
+    volatile uint32_t bad_ptrs;    /* pointers refused before host dispatch */
+    volatile uint32_t bad_ptr_nr;
+    volatile uint64_t bad_ptr_va;
     WemuUmResult *result;
     /* bounded guest signal model (all touched only inside signal handlers) */
     uint64_t sig_handler[WEMU_UM_SIG_NSIG];  /* guest handler RIP */
@@ -253,6 +268,119 @@ static int64_t um_raw1(long nr, long a0) {
     __asm__ volatile("syscall" : "=a"(ret) : "a"(nr), "D"(a0)
                      : "rcx", "r11", "memory");
     return (int64_t)ret;
+}
+
+/* ---- mapped-range guest pointer validation -------------------------- */
+/* The native path shares the host address space with the guest, so a guest
+ * pointer is a host pointer.  Before a host syscall may see one it must lie
+ * wholly inside a range the executor registered as guest-mapped: the ELF
+ * image, the SysV stack, the bounded brk heap, or an admitted guest mmap.
+ * Anything else fails closed with NO host syscall dispatched. */
+static int um_range_has(uint64_t lo, uint64_t hi, uint64_t ptr, uint64_t len) {
+    if (hi <= lo || ptr < lo || ptr >= hi) return 0;
+    if (len == 0) return 1;
+    return len <= hi - ptr;                 /* no wrap */
+}
+
+static int um_ptr_ok(uint64_t ptr, uint64_t len) {
+    if (ptr == 0) return 1;                 /* NULL: absent/optional buffer */
+    if (um_range_has(g_um.win_lo, g_um.win_hi, ptr, len)) return 1;
+    if (um_range_has(g_um.stack_lo, g_um.stack_hi, ptr, len)) return 1;
+    if (um_range_has(g_um.heap_lo, g_um.heap_hi, ptr, len)) return 1;
+    for (uint32_t i = 0; i < g_um.n_mmaps; i++)
+        if (um_range_has(g_um.mmap_lo[i], g_um.mmap_hi[i], ptr, len)) return 1;
+    return 0;
+}
+
+/* Path pointer: first byte must be mapped and the NUL must be found inside
+ * the SAME registered range (bounded to 4096 bytes). */
+static int um_str_ok(uint64_t ptr) {
+    if (ptr == 0) return 1;
+    uint64_t end = 0;
+    if (ptr >= g_um.win_lo && ptr < g_um.win_hi) end = g_um.win_hi;
+    else if (ptr >= g_um.stack_lo && ptr < g_um.stack_hi) end = g_um.stack_hi;
+    else if (ptr >= g_um.heap_lo && ptr < g_um.heap_hi) end = g_um.heap_hi;
+    else for (uint32_t i = 0; i < g_um.n_mmaps; i++)
+        if (ptr >= g_um.mmap_lo[i] && ptr < g_um.mmap_hi[i]) {
+            end = g_um.mmap_hi[i]; break;
+        }
+    if (!end) return 0;
+    uint64_t span = end - ptr;
+    uint64_t limit = span < 4096 ? span : 4096;
+    const uint8_t *s = (const uint8_t *)(uintptr_t)ptr;
+    for (uint64_t i = 0; i < limit; i++) if (s[i] == 0) return 1;
+    return 0;
+}
+
+static int um_bad(uint64_t nr, uint64_t va) {
+    g_um.bad_ptrs++;
+    g_um.bad_ptr_nr = (uint32_t)nr;
+    g_um.bad_ptr_va = va;
+    return 0;
+}
+
+static int um_chk(uint64_t nr, uint64_t ptr, uint64_t len) {
+    return um_ptr_ok(ptr, len) ? 1 : um_bad(nr, ptr);
+}
+
+static int um_chk_str(uint64_t nr, uint64_t ptr) {
+    return um_str_ok(ptr) ? 1 : um_bad(nr, ptr);
+}
+
+/* Every syscall in um_table that makes the HOST kernel dereference a guest
+ * pointer is listed here.  Scalar-only calls (exit, getpid, lseek, ...), the
+ * exec guard (mmap/mprotect addr is a hint/value, not dereferenced) and
+ * pointer-STORE calls (set_tid_address / set_robust_list: the kernel stores
+ * the value, it never follows it) are intentionally absent — validating
+ * their scalar args would break the guest ABI. */
+static int um_ptr_args_ok(uint64_t nr, const uint64_t a[6]) {
+    switch (nr) {
+    case VSL_SYS_READ: case VSL_SYS_WRITE: case 17: case 18: /* pread/pwrite */
+        return um_chk(nr, a[1], a[2]);
+    case VSL_SYS_WRITEV:
+        if (a[2] > 1024) return um_bad(nr, a[1]);
+        return um_chk(nr, a[1], a[2] * 16ull);
+    case VSL_SYS_IOCTL:
+        if (a[2] && a[2] < 0x1000) return 1;  /* request-encoded scalar */
+        return um_chk(nr, a[2], 8);
+    case VSL_SYS_GETCWD:
+        return um_chk(nr, a[0], a[1]);
+    case VSL_SYS_READLINK:
+        return um_chk_str(nr, a[0]) && um_chk(nr, a[1], a[2]);
+    case VSL_SYS_READLINKAT:
+        return um_chk_str(nr, a[1]) && um_chk(nr, a[2], a[3]);
+    case VSL_SYS_FSTAT:
+        return um_chk(nr, a[1], 144);
+    case VSL_SYS_NEWFSTATAT:
+        return um_chk_str(nr, a[1]) && um_chk(nr, a[2], 144);
+    case VSL_SYS_STATX:
+        return um_chk_str(nr, a[1]) && um_chk(nr, a[4], 256);
+    case VSL_SYS_GETDENTS64:
+        return um_chk(nr, a[1], a[2]);
+    case VSL_SYS_UNAME:
+        return um_chk(nr, a[0], 512);
+    case VSL_SYS_GETRANDOM:
+        return um_chk(nr, a[0], a[1]);
+    case VSL_SYS_CLOCK_GETTIME:
+        return um_chk(nr, a[1], 16);
+    case VSL_SYS_FUTEX:
+        return um_chk(nr, a[0], 4);
+    case VSL_SYS_RT_SIGACTION:
+        return um_chk(nr, a[1], 32) && um_chk(nr, a[2], 32);
+    case VSL_SYS_RT_SIGPROCMASK:
+        return um_chk(nr, a[1], 8) && um_chk(nr, a[2], 8);
+    case VSL_SYS_PRLIMIT64:
+        return um_chk(nr, a[2], 16) && um_chk(nr, a[3], 16);
+    case WEMU_UM_SYS_SENDFILE:
+        return um_chk(nr, a[2], 8);           /* optional loff_t *offset */
+    case WEMU_UM_SYS_ARCH_PRCTL:
+        if (a[0] == 0x1003 || a[0] == 0x1004) return um_chk(nr, a[1], 8);
+        return 1;                              /* SET_FS/SET_GS take a value */
+    case VSL_SYS_OPENAT: case VSL_SYS_FACCESSAT:
+        return um_chk_str(nr, a[1]);
+    default:
+        return 1;                              /* no host-dereferenced pointer */
+    }
 }
 
 /* On this kernel SIGSYS arrives with RIP already past the 2-byte syscall;
@@ -406,6 +534,15 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
         return;
     }
 
+    /* Fail closed BEFORE any host syscall: the guest shares our address
+     * space, so an unvalidated pointer is a host pointer.  A bad one ends
+     * the run with WEMU_UM_ERR_BADPTR; no host handler sees it. */
+    if (!um_ptr_args_ok(nr, a)) {
+        r[REG_RAX] = (greg_t)-EFAULT;
+        um_abort_to_finish(uc, UM_WHY_BADPTR);
+        return;
+    }
+
     if (e->kind == WEMU_UM_DISPATCH_FORK ||
         e->kind == WEMU_UM_DISPATCH_CLONE ||
         e->kind == WEMU_UM_DISPATCH_CLONE3) {
@@ -436,14 +573,48 @@ static void um_sigsys(int sig, siginfo_t *si, void *ucv) {
     if (e->kind == WEMU_UM_DISPATCH_SIGACTION) {
         ret = um_sigaction(a);
     } else if (e->kind == WEMU_UM_DISPATCH_EXEC_GUARD) {
-        /* mmap(addr,len,prot,..) / mprotect(addr,len,prot): a guest may only
-         * make executable memory inside the registered image window.  No
-         * W^X escape into host text/heap via a dispatched syscall. */
-        int wants_exec = (int)(a[2] & PROT_EXEC) != 0;
-        int in_window = a[0] >= g_um.win_lo &&
-                        a[0] < g_um.win_hi &&
+        /* mmap(addr,len,prot,flags,..) / mprotect(addr,len,prot): a guest may
+         * only make executable memory inside the registered image window,
+         * which is the ONLY range the seccomp filter traps.  No W^X escape
+         * into host text/heap via a dispatched syscall. */
+        int wants_exec = (a[2] & PROT_EXEC) != 0;
+        int in_window = a[0] >= g_um.win_lo && a[0] < g_um.win_hi &&
                         a[1] <= g_um.win_hi - a[0];
-        if (!wants_exec || in_window) ret = um_host(nr, a);
+        if (!wants_exec) {
+            ret = um_host(nr, a);
+            /* Remember admitted mappings so their buffers pass pointer
+             * validation; bounded table, bounded size. */
+            if (nr == VSL_SYS_MMAP && ret >= 0 && a[1] &&
+                a[1] < (1ull << 40) && g_um.n_mmaps < UM_MAX_MMAPS) {
+                uint64_t base = (uint64_t)ret;
+                g_um.mmap_lo[g_um.n_mmaps] = base;
+                g_um.mmap_hi[g_um.n_mmaps] = base + a[1];
+                g_um.n_mmaps++;
+            }
+        } else if (nr == VSL_SYS_MMAP) {
+            /* A non-MAP_FIXED mmap may land ANYWHERE — the addr argument is
+             * only a hint, so an in-window hint does NOT admit the result.
+             * Tighten: only a MAP_FIXED range wholly inside the trapped
+             * image window is admitted; all other PROT_EXEC maps refused. */
+            int fixed = (a[3] & MAP_FIXED) != 0;
+            if (fixed && in_window) ret = um_host(nr, a);
+        } else if (in_window) {
+            ret = um_host(nr, a);            /* mprotect: already trapped */
+        }
+    } else if (e->kind == WEMU_UM_DISPATCH_BRK) {
+        /* Bounded heap growth.  brk() failure semantics: return the current
+         * break, never move it.  The heap range is tracked so legitimate
+         * guest heap pointers pass validation. */
+        uint64_t cur = g_um.heap_hi;
+        if (a[0] == 0) {
+            ret = (int64_t)cur;              /* query: current break */
+        } else if (a[0] < g_um.heap_lo ||
+                   a[0] > g_um.heap_lo + UM_HEAP_MAX) {
+            ret = (int64_t)cur;              /* out of bounds: refuse */
+        } else {
+            ret = um_host(nr, a);
+            if (ret > 0) g_um.heap_hi = (uint64_t)ret;
+        }
     } else if ((nr == VSL_SYS_WRITE || nr == VSL_SYS_WRITEV ||
                 WEMU_UM_SYS_SENDFILE == nr) && (a[0] == 1 || a[0] == 2)) {
         /* Bound output bookkeeping; the pipe read in the parent is the
@@ -683,7 +854,8 @@ static int um_load(const char *path, UmImage *im) {
 #define AT_RANDOM_ 25
 
 static uint64_t um_build_stack(char *const argv[], char *const envp[],
-                               const UmImage *im, uint8_t **mem_out) {
+                               const UmImage *im, uint8_t **mem_out,
+                               uint64_t *lo_out, uint64_t *hi_out) {
     size_t argc = 0, envc = 0, strsz = 0;
     while (argv && argv[argc]) strsz += strlen(argv[argc++]) + 1;
     while (envp && envp[envc]) strsz += strlen(envp[envc++]) + 1;
@@ -731,6 +903,8 @@ static uint64_t um_build_stack(char *const argv[], char *const envp[],
         mem[randp - base + (size_t)i] = (uint8_t)seed;
     }
     *mem_out = mem;
+    *lo_out = base;                          /* registered guest stack range */
+    *hi_out = top;
     return p;                                /* 16-byte aligned at entry */
 }
 
@@ -773,11 +947,15 @@ static void um_finish(void) {
     shared->denied = g_um.denied;
     shared->signals_delivered = g_um.sig_deliveries;
     shared->signals_denied = g_um.sig_denied;
+    shared->bad_ptrs = g_um.bad_ptrs;
+    shared->bad_ptr_nr = g_um.bad_ptr_nr;
+    shared->bad_ptr_va = g_um.bad_ptr_va;
     shared->exit_code = g_um.exit_code;
     switch (g_um.why) {
     case UM_WHY_EXIT:  shared->status = WEMU_UM_OK;          break;
     case UM_WHY_FAULT: shared->status = WEMU_UM_ERR_FAULT;    break;
     case UM_WHY_ALARM: shared->status = WEMU_UM_ERR_BUDGET;   break;
+    case UM_WHY_BADPTR: shared->status = WEMU_UM_ERR_BADPTR;  break;
     case UM_WHY_BUDGET:
         shared->status = g_um.denied > 8 ? WEMU_UM_ERR_DENIED
                                          : WEMU_UM_ERR_BUDGET;
@@ -816,7 +994,9 @@ static void um_child_run(const char *path, char *const argv[], char *const envp[
     if (rc != 0) um_child_fail(shared, WEMU_UM_ERR_FORMAT);
     if (im.has_interp) um_child_fail(shared, WEMU_UM_ERR_INTERP);
     uint8_t *stack_mem;
-    uint64_t rsp = um_build_stack(argv, envp, &im, &stack_mem);
+    uint64_t stack_lo = 0, stack_hi = 0;
+    uint64_t rsp = um_build_stack(argv, envp, &im, &stack_mem,
+                                  &stack_lo, &stack_hi);
     if (!rsp) um_child_fail(shared, WEMU_UM_ERR_INTERNAL);
     free(im.file);
 
@@ -825,6 +1005,12 @@ static void um_child_run(const char *path, char *const argv[], char *const envp[
     g_um.result = shared;
     g_um.win_lo = im.lo;
     g_um.win_hi = im.hi;
+    g_um.stack_lo = stack_lo;
+    g_um.stack_hi = stack_hi;
+    /* The initial brk is the floor of the bounded guest heap; query it
+     * BEFORE the trap filter is installed (host code, never trapped). */
+    g_um.heap_lo = (uint64_t)(int64_t)syscall(SYS_brk, 0);
+    g_um.heap_hi = g_um.heap_lo;
 
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);

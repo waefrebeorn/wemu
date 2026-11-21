@@ -75,10 +75,20 @@ untrusted-guest sandbox. Nothing here is enabled implicitly by `wemu_cpu_run`.
   `newfstatat("/etc/busybox.conf")` became a pointer and crashed `head`,
   `tail`, `seq`, `expr`, `cut`, `awk`, `id`, ... before their first output.
   `um_host()` is now an inline `syscall` instruction returning raw `-errno`.
-- **Exec guard**: guest `mmap`/`mprotect` with `PROT_EXEC` is refused unless
-  the whole range lies in the registered image window.
-- 200,000-syscall budget per process, 10-second wall-clock alarm per process,
-  64 KiB output cap, `WEMU_UM_MAX_FORKS` children per run.
+- **Exec guard**: guest `mprotect` with `PROT_EXEC` is refused unless the
+  whole range lies in the trapped ELF image window. Guest `mmap` with
+  `PROT_EXEC` is admitted ONLY when `MAP_FIXED` *and* the whole range lies in
+  that window — a non-`MAP_FIXED` hint is not a guarantee (the kernel may
+  return a page anywhere, outside the seccomp window). `brk` growth is
+  bounded to 16 MiB above the initial break; the heap stays non-executable.
+- **Guest pointer validation**: before a host syscall is dispatched, every
+  pointer argument the host kernel would dereference must lie wholly inside
+  a registered guest range (ELF image, SysV stack, bounded brk heap, or an
+  admitted guest mmap). A bad pointer ends the run with `WEMU_UM_ERR_BADPTR`;
+  NO host syscall sees it. The result reports `bad_ptrs`, `bad_ptr_nr` and
+  `bad_ptr_va` as evidence.
+- 200,000-syscall budget, 10-second wall-clock alarm, 64 KiB output cap,
+  `WEMU_UM_MAX_FORKS` children per run.
 
 ## Ownership
 
@@ -102,17 +112,21 @@ table entry against the kernel's `asm/unistd_64.h`.
   nesting, and needs the guest's `SA_RESTORER` for a C handler to return.
   Asynchronous signals (kill/tgkill/timers) and guest-owned signal masks are
   not modelled; `rt_sigprocmask` still passes through to the host.
-- The filter window covers ELF PT_LOAD mappings. Code executed from host
-  `brk`/heap memory is outside it; this is not a sandbox for hostile guests.
-- Guest pointers are host pointers (same ABI) and are not validated: a host
-  syscall receives whatever address the guest supplies. Bounded execution is
-  not address-space isolation.
-- The gate runs **45** real static busybox applets (echo, uname, cat, ls,
-  true, false, head, tail, grep, sort, sed, seq, expr, wc, cut, awk, md5sum,
-  sha256sum, base64, pwd, id, test x2, date, hostname, basename, dirname, rev,
-  tac, uniq, stat, realpath, readlink, env, which, whoami, nproc, od, xxd,
-  hexdump, nl, paste, expand, fold, sh), each byte-exact against host `execve`
-  of the same binary/args/env, plus a static-PIE fork/clone fixture and PIE
-  load-bias / SIGSEGV fixtures.  LTP and applets that need `execve`/vfork
-  sharing (e.g. `timeout`), `clone3` pidfds, threads, or guest signal masks
-  are not yet modelled.
+- The filter window covers ELF PT_LOAD mappings. The stack and the bounded
+  brk heap are registered for **pointer validation**, but code fetched from
+  them is not trapped (making them executable is refused, and non-`MAP_FIXED`
+  `PROT_EXEC` mmap is refused outright). This path shares the host address
+  space; it is still not a sandbox for hostile guests.
+- Guest pointers are host pointers (same ABI) but are now **validated**
+  against the registered guest ranges before dispatch. Validation is a
+  per-syscall table: a newly added pointer-taking syscall must be added to
+  `um_ptr_args_ok()` or it is not checked. `prctl` option-specific pointer
+  payloads and ioctl request-specific layouts are not decoded; `ioctl` args
+  that look like small scalars are passed through. Pointer validation is
+  range checking, not address-space isolation.
+- The gate runs **45** real static busybox applets, each byte-exact against
+  host `execve` of the same binary/args/env, plus static-PIE load-bias and
+  SIGSEGV fixtures, a static-PIE fork/clone fixture (private COW children),
+  and `tests/sandbox_probe` for the four sandbox differentials (RWX mmap,
+  mprotect, out-of-range pointer, brk). LTP, threads, `execve`/vfork sharing,
+  clone3 pidfds and guest signal masks are not yet modelled.

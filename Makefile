@@ -21,6 +21,7 @@ PIE_STATIC = tests/pie_hello tests/pie_signal tests/pie_nohandler tests/pie_unli
 PIE_DYN    = tests/pie_dynamic
 FORK_FIX   = tests/fork_clone
 PIE_BINS   = $(PIE_STATIC) $(PIE_DYN) $(FORK_FIX)
+SANDBOX_BIN = tests/sandbox_probe
 
 src/wemu_usermode.o: CFLAGS += -fno-stack-protector
 # The native user-mode signal handlers run on the guest stack after the guest
@@ -38,7 +39,11 @@ libwemu.a: $(OBJ)
 test_%: tests/test_%.c libwemu.a
 	$(CC) $(CFLAGS) -o $@ $< libwemu.a -lm
 
-test_usermode_native: $(PIE_BINS)
+test_usermode_native: $(PIE_BINS) $(SANDBOX_BIN)
+
+# Freestanding sandbox differential guest (raw syscalls, no libc).
+tests/sandbox_probe: tests/sandbox_probe.c
+	$(CC) -static -nostdlib -no-pie -ffreestanding -fno-builtin -O2 -o $@ $<
 
 # Self-relocating static PIE (ET_DYN, no PT_INTERP) — also the fork/clone fixture.
 tests/pie_%: tests/pie_%.c
@@ -56,7 +61,7 @@ test: $(TESTS)
 	@echo "ALL WEMU GATES PASS"
 
 clean:
-	rm -f $(OBJ) $(OBJ:.o=.d) libwemu.a $(TESTS) $(PIE_BINS)
+	rm -f $(OBJ) $(OBJ:.o=.d) libwemu.a $(TESTS) $(PIE_BINS) $(SANDBOX_BIN)
 
 -include $(OBJ:.o=.d)
 .PHONY: all test clean
