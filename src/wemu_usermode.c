@@ -3861,8 +3861,11 @@ int wemu_um_run_elf(const char *path, char *const argv[],
     memcpy(final.out, out->out, WEMU_UM_OUT_MAX);
     final.out_len = (uint32_t)n;
     final.out[n] = '\0';
-    if (!WIFEXITED(wst) && final.status == WEMU_UM_OK)
+    if (!WIFEXITED(wst) && final.status == WEMU_UM_OK) {
+        fprintf(stderr, "[wemu_um] child signaled %d (status 0x%x)\n",
+                WIFSIGNALED(wst) ? WTERMSIG(wst) : -1, wst);
         final.status = WEMU_UM_ERR_INTERNAL;
+    }
     *out = final;
     munmap(shared, sizeof *shared);
     return final.status;
