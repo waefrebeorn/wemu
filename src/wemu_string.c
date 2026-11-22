@@ -30,7 +30,6 @@ int wemu_exec_string(WemuCpu *c, const WemuInsn *in) {
     uint64_t count = 1;
     int rep = in->rep != 0;
     if (rep) count = c->r[1] & (in->addrsize == 4 ? 0xffffffffull : ~0ull);
-    uint64_t done = 0;
     for (uint64_t i = 0; i < count; i++) {
         uint64_t di = c->r[7];
         uint64_t si = c->r[6];
@@ -66,13 +65,16 @@ int wemu_exec_string(WemuCpu *c, const WemuInsn *in) {
             c->r[6] += (uint64_t)step;
             break;
         }
-        done++;
+        /* Commit the count for THIS iteration, not once after the loop:
+         * a fault on a later iteration returns -1 from inside the loop,
+         * and the SDM requires RCX/RSI/RDI to describe the iterations
+         * already completed so the instruction can be restarted. */
+        if (rep) c->r[1]--;
         if (rep && (kind == 1 || kind == 3)) {
             int zf = (c->rflags & WF_ZF) != 0;
             if (in->rep == 0xF3 && !zf) break;  /* repe: stop on mismatch */
             if (in->rep == 0xF2 && zf) break;   /* repne: stop on match */
         }
     }
-    if (rep) c->r[1] -= done;
     return 1;
 }
