@@ -37,6 +37,18 @@ static void write_reg8(WemuCpu *c, int i, int has_rex, uint64_t v) {
     write_reg(c, i, 1, v);
 }
 
+/* One-operand MUL/DIV/IDIV double the operand with an implicit high half:
+ * AH (bits 8..15 of RAX) for byte operands, DX/EDX/RDX otherwise (SDM
+ * F6 /4 /6 /7).  Reaching the byte high half through r[2] hits DL and
+ * silently corrupts both AX and the divisor register. */
+static uint64_t muldiv_hi_read(WemuCpu *c, int bytes) {
+    return bytes == 1 ? (c->r[0] >> 8) & 0xff : wemu_mask(c->r[2], bytes);
+}
+static void muldiv_hi_write(WemuCpu *c, int bytes, uint64_t v) {
+    if (bytes == 1) c->r[0] = (c->r[0] & ~0xff00ull) | ((v & 0xff) << 8);
+    else write_reg(c, 2, bytes, v);
+}
+
 /* effective address for mod!=3 — shared owner in wemu_mem.c */
 static uint64_t eff_addr(WemuCpu *c, const WemuInsn *in) {
     return wemu_eff_addr(c, in);
@@ -594,7 +606,7 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
                 uint64_t p = wemu_mask(c->r[0], bytes) * a;
                 lo = wemu_mask(p, bytes); hi = p >> (bytes * 8);
             }
-            write_reg(c, 0, bytes, lo); write_reg(c, 2, bytes, hi);
+            write_reg(c, 0, bytes, lo); muldiv_hi_write(c, bytes, hi);
             uint64_t f = c->rflags & ~(WF_CF | WF_OF);
             if (hi) f |= WF_CF | WF_OF;
             c->rflags = f;
@@ -625,11 +637,11 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
                 if (n / a > 0xffffffffffffffffull) { c->fault = 0; return -1; }
                 write_reg(c, 0, 8, q); write_reg(c, 2, 8, rem);
             } else {
-                uint64_t n = (wemu_mask(c->r[2], bytes) << (bytes * 8)) |
+                uint64_t n = (muldiv_hi_read(c, bytes) << (bytes * 8)) |
                              wemu_mask(c->r[0], bytes);
                 uint64_t q = n / a;
                 if (q >> (bytes * 8)) { c->fault = 0; return -1; }
-                write_reg(c, 0, bytes, q); write_reg(c, 2, bytes, n % a);
+                write_reg(c, 0, bytes, q); muldiv_hi_write(c, bytes, n % a);
             }
         } else { /* idiv */
             if (!a) { c->fault = 0; return -1; }
@@ -641,7 +653,7 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
                 write_reg(c, 2, 8, (uint64_t)(n % (int64_t)a));
             } else {
                 int bits = bytes * 8;
-                int64_t n = (int64_t)((wemu_mask(c->r[2], bytes) << bits) |
+                int64_t n = (int64_t)((muldiv_hi_read(c, bytes) << bits) |
                                       wemu_mask(c->r[0], bytes));
                 n = (n << (64 - bits * 2)) >> (64 - bits * 2);
                 int64_t av = (int64_t)(a << (64 - bits)) >> (64 - bits);
@@ -650,7 +662,7 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
                     c->fault = 0; return -1;
                 }
                 write_reg(c, 0, bytes, wemu_mask((uint64_t)q, bytes));
-                write_reg(c, 2, bytes, wemu_mask((uint64_t)(n % av), bytes));
+                muldiv_hi_write(c, bytes, wemu_mask((uint64_t)(n % av), bytes));
             }
         }
         break;
