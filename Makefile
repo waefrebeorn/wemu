@@ -165,6 +165,13 @@ test: $(TESTS) $(BUSYBOX_FIXTURE)
 	done
 	@echo "ALL WEMU GATES PASS"
 
+STATIC_SRCS := $(wildcard src/*.c)
+static_check:
+	@set -e; for f in $(STATIC_SRCS); do \
+	    gcc -std=c11 -fanalyzer -Werror -fsyntax-only -Iinclude $$f; \
+	done
+	@echo "STATIC CHECK PASS: gcc -fanalyzer over $(words $(STATIC_SRCS)) WEMU sources"
+
 # Rebuild every object, archive and test binary before running the gates.
 # Negative controls must never pass on a stale libwemu.a or stale runner.
 test-clean:
@@ -175,4 +182,4 @@ clean:
 	rm -f $(OBJ) $(OBJ:.o=.d) libwemu.a $(TESTS) $(PIE_BINS) $(C3_FIX) $(SANDBOX_BIN) $(ISOLATE_BIN) $(BUSYBOX_FIXTURE)
 
 -include $(OBJ:.o=.d)
-.PHONY: all test test-clean clean
+.PHONY: all test test-clean clean static_check
