@@ -143,7 +143,16 @@ tests/clone3_thread: tests/clone3_thread.c
 tests/pie_dynamic: tests/pie_dynamic.c
 	$(CC) -O2 -o $@ $<
 
-test: $(TESTS)
+BUSYBOX_DEB   = busybox-static_1%3a1.36.1-6ubuntu3.1_amd64.deb
+BUSYBOX_FIXTURE = tests/busybox-static
+
+$(BUSYBOX_FIXTURE): $(BUSYBOX_DEB)
+	dpkg-deb -x $< tests/.bb-extract
+	cp tests/.bb-extract/usr/bin/busybox $@
+	chmod +x $@
+	rm -rf tests/.bb-extract
+
+test: $(TESTS) $(BUSYBOX_FIXTURE)
 	@for t in $(TESTS); do ./$$t || exit 1; done
 	@echo "ALL WEMU GATES PASS"
 
@@ -154,7 +163,7 @@ test-clean:
 	$(MAKE) test
 
 clean:
-	rm -f $(OBJ) $(OBJ:.o=.d) libwemu.a $(TESTS) $(PIE_BINS) $(C3_FIX) $(SANDBOX_BIN) $(ISOLATE_BIN)
+	rm -f $(OBJ) $(OBJ:.o=.d) libwemu.a $(TESTS) $(PIE_BINS) $(C3_FIX) $(SANDBOX_BIN) $(ISOLATE_BIN) $(BUSYBOX_FIXTURE)
 
 -include $(OBJ:.o=.d)
 .PHONY: all test test-clean clean

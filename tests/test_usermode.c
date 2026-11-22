@@ -475,7 +475,7 @@ static int64_t probe_hook(WemuCpu *cpu, uint64_t nr,
 
 static void test_real_busybox(void) {
     const char *path = getenv("WEMU_BUSYBOX");
-    if (!path) path = "/home/wubu/opt/busybox-static/usr/bin/busybox";
+    if (!path) path = "tests/busybox-static";
     WemuCpu *cpu = wemu_cpu_create(64ull << 20);
     if (!cpu) FAIL("cpu create 64MB\n");
     char *argv[] = { "busybox", "echo", "gate", NULL };

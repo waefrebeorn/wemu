@@ -10,6 +10,7 @@ test_exceptions
 test_isa_atomic_fence
 /test_*
 /tests/pie_hello
+/tests/busybox-static
 /tests/pie_signal
 /tests/pie_nohandler
 /tests/pie_unlisted

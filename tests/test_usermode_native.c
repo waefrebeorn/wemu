@@ -41,7 +41,7 @@
 
 static const char *BUSYBOX(void) {
     const char *p = getenv("WEMU_BUSYBOX");
-    return p ? p : "/home/wubu/opt/busybox-static/usr/bin/busybox";
+    return p ? p : "tests/busybox-static";
 }
 
 static char *const GUEST_ENV[] = { (char *)"PATH=/usr/bin:/bin", NULL };
