@@ -147,8 +147,14 @@ test: $(TESTS)
 	@for t in $(TESTS); do ./$$t || exit 1; done
 	@echo "ALL WEMU GATES PASS"
 
+# Rebuild every object, archive and test binary before running the gates.
+# Negative controls must never pass on a stale libwemu.a or stale runner.
+test-clean:
+	$(MAKE) clean
+	$(MAKE) test
+
 clean:
 	rm -f $(OBJ) $(OBJ:.o=.d) libwemu.a $(TESTS) $(PIE_BINS) $(C3_FIX) $(SANDBOX_BIN) $(ISOLATE_BIN)
 
 -include $(OBJ:.o=.d)
-.PHONY: all test clean
+.PHONY: all test test-clean clean
