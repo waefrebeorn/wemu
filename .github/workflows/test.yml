@@ -16,6 +16,7 @@ jobs:
           make -j"$(nproc)" test-clean 2>&1 | tee /tmp/wemu-gates.log
           rc=${PIPESTATUS[0]}
           if [ "$rc" -ne 0 ]; then
-            echo "::error::WEMU gates failed rc=$rc: $(tail -c 1600 /tmp/wemu-gates.log | tr '\n' ' ')"
+            echo "::error::WEMU gates failed rc=$rc HEAD: $(head -c 1200 /tmp/wemu-gates.log | tr '\n' ' ')"
+            echo "::error::WEMU gates failed rc=$rc TAIL: $(tail -c 1600 /tmp/wemu-gates.log | tr '\n' ' ')"
           fi
           exit "$rc"
