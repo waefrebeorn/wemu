@@ -854,17 +854,25 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
             else if (op == 7) { if (is_rmw) rmw_write(c, in, os, eff_locked, a ^ (1ull << bit));
                                 else write_rm(c, in, os, a ^ (1ull << bit)); }
         } else if (full == 0x1A3 || full == 0x1AB || full == 0x1B3 || full == 0x1BB) {
-            a = is_rmw ? rmw_read(c, in, os, eff_locked) : read_rm(c, in, os);
-            uint64_t bit = read_regop(c, in, os) & (os * 8 - 1);
+            uint64_t off = read_regop(c, in, os);
+            /* SDM Vol.2A BT/BTS/BTR/BTC: a REGISTER bit base takes
+             * BitOffset modulo the operand size, but a MEMORY bit base
+             * addresses the unit at EA + os*(BitOffset DIV (os*8)).
+             * Fold that displacement into a copy of the decoded operand
+             * so read_rm/write_rm (and the LOCK observer) keep one owner. */
+            WemuInsn adj = *in;
+            if ((in->modrm >> 6) != 3) adj.disp += (int64_t)(os * (off / (os * 8)));
+            a = is_rmw ? rmw_read(c, &adj, os, eff_locked) : read_rm(c, &adj, os);
+            uint64_t bit = off & (os * 8 - 1);
             uint64_t f = c->rflags & ~WF_CF;
             if ((a >> bit) & 1) f |= WF_CF;
             c->rflags = f;
-            if (full == 0x1AB) { if (is_rmw) rmw_write(c, in, os, eff_locked, a | (1ull << bit));
-                                 else write_rm(c, in, os, a | (1ull << bit)); }
-            else if (full == 0x1B3) { if (is_rmw) rmw_write(c, in, os, eff_locked, a & ~(1ull << bit));
-                                      else write_rm(c, in, os, a & ~(1ull << bit)); }
-            else if (full == 0x1BB) { if (is_rmw) rmw_write(c, in, os, eff_locked, a ^ (1ull << bit));
-                                      else write_rm(c, in, os, a ^ (1ull << bit)); }
+            if (full == 0x1AB) { if (is_rmw) rmw_write(c, &adj, os, eff_locked, a | (1ull << bit));
+                                 else write_rm(c, &adj, os, a | (1ull << bit)); }
+            else if (full == 0x1B3) { if (is_rmw) rmw_write(c, &adj, os, eff_locked, a & ~(1ull << bit));
+                                      else write_rm(c, &adj, os, a & ~(1ull << bit)); }
+            else if (full == 0x1BB) { if (is_rmw) rmw_write(c, &adj, os, eff_locked, a ^ (1ull << bit));
+                                      else write_rm(c, &adj, os, a ^ (1ull << bit)); }
         } else if (full == 0x1A2) { /* cpuid: claim ONLY what we execute.
             * CPUID outputs: EAX->r0 EBX->r3 ECX->r1 EDX->r2 */
             uint64_t leaf = c->r[0];
