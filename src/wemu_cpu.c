@@ -33,8 +33,15 @@ void wemu_set_add_flags(WemuCpu *cpu, uint64_t a, uint64_t b, uint64_t res,
     if (!m) f |= WF_ZF;
     if (m >> (bits - 1)) f |= WF_SF;
     if (wemu_parity(m)) f |= WF_PF;
-    /* AF: carry out of bit 3 */
-    if (((ma & 0xf) + (mb & 0xf) + carry_in) & 0x10) f |= WF_AF;
+    /* AF: carry out of bit 3 for ADD, borrow out of bit 3 for SUB.
+     * SDM Vol.1 3-16: AF is set on a carry OR a borrow out of bit 3.
+     * The old shared formula always used the ADD carry, so subtraction
+     * (CMP/CMPS/SCAS/SUB/SBB) reported AF for the wrong inputs. */
+    if (is_sub) {
+        if ((ma & 0xf) < ((mb & 0xf) + (uint64_t)carry_in)) f |= WF_AF;
+    } else {
+        if (((ma & 0xf) + (mb & 0xf) + carry_in) & 0x10) f |= WF_AF;
+    }
     if (is_sub) {
         /* CF = borrow: a < b + carry_in (unsigned, masked) */
         if (ma < mb + (uint64_t)carry_in) f |= WF_CF;
