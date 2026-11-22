@@ -153,7 +153,16 @@ $(BUSYBOX_FIXTURE): $(BUSYBOX_DEB)
 	rm -rf tests/.bb-extract
 
 test: $(TESTS) $(BUSYBOX_FIXTURE)
-	@for t in $(TESTS); do ./$$t || exit 1; done
+	@for t in $(TESTS); do \
+	    case "$$t" in \
+	      test_usermode_native|test_usermode_*) \
+	        if [ -n "$$WEMU_SKIP_NATIVE" ]; then \
+	          echo "SKIP: $$t (host-native SIGSYS leg needs the supervisor kernel ABI)"; \
+	          continue; \
+	        fi ;; \
+	    esac; \
+	    ./$$t || exit 1; \
+	done
 	@echo "ALL WEMU GATES PASS"
 
 # Rebuild every object, archive and test binary before running the gates.
