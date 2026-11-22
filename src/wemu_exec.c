@@ -774,8 +774,13 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
                 if (!r) f |= WF_ZF;
                 if (r >> (bits - 1)) f |= WF_SF;
                 if (wemu_parity(r)) f |= WF_PF;
+                /* SDM Vol.2B SHLD/SHRD "Flags Affected": if the count
+                 * operand is 0, the flags are NOT affected. Rebuilding
+                 * RFLAGS outside this branch cleared CF/OF/ZF/SF/PF on a
+                 * zero (or masked-to-zero) count — STC; SHLD $0 turned
+                 * into CLC. https://www.felixcloutier.com/x86/shld */
+                c->rflags = f;
             }
-            c->rflags = f;
             write_rm(c, in, os, r);
         } else if (full == 0x1B7 || full == 0x1BF) { /* movzx/movsx r, rm16 */
             a = read_rm(c, in, 2);
