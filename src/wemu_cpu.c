@@ -43,8 +43,11 @@ void wemu_set_add_flags(WemuCpu *cpu, uint64_t a, uint64_t b, uint64_t res,
         if (((ma & 0xf) + (mb & 0xf) + carry_in) & 0x10) f |= WF_AF;
     }
     if (is_sub) {
-        /* CF = borrow: a < b + carry_in (unsigned, masked) */
-        if (ma < mb + (uint64_t)carry_in) f |= WF_CF;
+        /* CF = borrow: a < b + carry_in.  Written as a <= b for CF=1
+         * because b + 1 wraps to 0 for SBB r64, r64 with b = ~0 and
+         * CF=1 (SDM: DEST <- DEST - (SRC + CF)); the wrapped sum made
+         * WEMU clear CF where hardware sets it. */
+        if (ma < mb || (carry_in && ma == mb)) f |= WF_CF;
         /* OF: sign(a) != sign(b) && sign(res) != sign(a) */
         uint64_t sa = ma >> (bits - 1), sb = mb >> (bits - 1),
                  sr = m >> (bits - 1);
