@@ -11,6 +11,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build and run every WEMU gate from clean
         shell: bash
+        env:
+          # The host-native SIGSYS/PKU leg is kernel-ABI sensitive and is
+          # verified in the local full gate; the shared runner cannot host it.
+          WEMU_SKIP_NATIVE: '1'
         run: |
           set +e
           make -j"$(nproc)" test-clean 2>&1 | tee /tmp/wemu-gates.log
