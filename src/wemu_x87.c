@@ -42,7 +42,9 @@ static void x87_compare(WemuCpu *c, double a, double b) {
     else set_cc(c, 0, 0, 1);
 }
 static void x87_comi_flags(WemuCpu *c, double a, double b) {
-    uint64_t f = c->rflags & ~(WF_ZF | WF_PF | WF_CF);
+    /* SDM Vol 2A FCOMI/FCOMIP/FUCOMI/FUCOMIP: OF, SF and AF are
+     * cleared regardless of the comparison or exception. */
+    uint64_t f = c->rflags & ~(WF_ZF | WF_PF | WF_CF | WF_OF | WF_SF | WF_AF);
     if (isnan(a) || isnan(b)) f |= WF_ZF | WF_PF | WF_CF;
     else if (a < b) f |= WF_CF;
     else if (a == b) f |= WF_ZF;
