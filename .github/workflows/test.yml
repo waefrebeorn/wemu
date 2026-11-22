@@ -10,4 +10,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build and run every WEMU gate from clean
-        run: make -j"$(nproc)" test-clean
+        shell: bash
+        run: |
+          set +e
+          make -j"$(nproc)" test-clean 2>&1 | tee /tmp/wemu-gates.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::WEMU gates failed rc=$rc: $(tail -c 1600 /tmp/wemu-gates.log | tr '\n' ' ')"
+          fi
+          exit "$rc"
