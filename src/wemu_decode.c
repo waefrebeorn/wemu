@@ -111,8 +111,13 @@ int wemu_decode(WemuCpu *cpu, WemuInsn *in) {
         else break;
         rex = 0; /* REX must be last prefix */
     }
-    uint8_t b = peek(&f);
-    if (b >= 0x40 && b <= 0x4F) { rex = take(&f); b = peek(&f); }
+    uint8_t b;
+    /* Only the REX prefix immediately before the opcode is effective;
+     * hardware accepts redundant REX bytes and uses the last one (the
+     * SDM allows only one, but a second one must not become an opcode).
+     * Consume them all so 0F BA /r operand size/bit-index width follows
+     * the same REX the host CPU applies. */
+    while ((b = peek(&f)) >= 0x40 && b <= 0x4F) rex = take(&f);
     in->rex = rex;
     if (rex & 8) in->opsize = 8;
 
