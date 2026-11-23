@@ -227,6 +227,20 @@ int wemu_exec_sse(WemuCpu *c, const WemuInsn *in) {
         else memset(c->ymm_hi[dst], 0, 16);
         return 1;
     }
+    if (full == 0x1C4 && (sse66 || vex)) { /* (v)pinsrw xmm, r/m16, imm8 */
+        uint16_t word = 0;
+        if ((in->modrm >> 6) == 3) {
+            int rm = (in->modrm & 7) | (REX_B(in) << 3);
+            word = (uint16_t)c->r[rm];
+        } else {
+            uint64_t addr = wemu_eff_addr(c, in);
+            if (wemu_mem_read(c, addr, &word, 2) != 0) return -1;
+        }
+        unsigned idx = (unsigned)(in->imm & (vex ? 7u : 7u));
+        memcpy(c->xmm[dst] + 2u * idx, &word, 2);
+        if (vex) memset(c->ymm_hi[dst], 0, 16);
+        return 1;
+    }
     if (full == 0x1C5) { /* (v)pextrw r/m32, xmm, imm8 */
         int xr = (in->modrm & 7) | (REX_B(in) << 3);
         uint16_t word = 0;
