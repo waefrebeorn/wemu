@@ -17,7 +17,7 @@ TESTS = test_isa test_avx test_paging test_machine test_string test_cpuid \
         test_usermode_mpk test_usermode_exec2 test_usermode_execfd \
         test_usermode_threadexec test_usermode_clone3 test_usermode_timer \
         test_usermode_nested test_btmem test_btimm test_string_diff test_rep_fault_restart test_flag_diff \
-        test_imul_flags test_rotate_flags
+        test_imul_flags test_rotate_flags test_grp8_ud
 
 all: libwemu.a
 

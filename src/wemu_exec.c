@@ -903,6 +903,11 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
             }
         } else if (full == 0x1BA) { /* bt/bts/btr/btc imm8 */
             int op = REG(in);
+            /* Group 8 extension: /4 BT, /5 BTS, /6 BTR, /7 BTC.  Digits
+             * /0-/3 are undefined (#UD on hardware).  Without this guard
+             * they fell through the writeback chain as a silent read-only
+             * BT: destination unchanged, CF rebuilt, RIP advanced. */
+            if (op < 4) goto ud;
             a = is_rmw ? rmw_read(c, in, os, eff_locked) : read_rm(c, in, os);
             uint64_t bit = in->imm & (os * 8 - 1);
             uint64_t f = c->rflags & ~WF_CF;
