@@ -165,12 +165,20 @@ static void check_family(int family) {
         uint64_t hr = 0, er = 0, erip = 0;
         host_ud(family, d, rax, &hud, &hr);
         emu_bytes(code, n, rax, &efault, &er, &erip);
-        if (hud) {
+        /* The architecturally defined set is a SDM property, NOT a
+         * property of whichever CPU runs the CI job. A host that decodes
+         * an otherwise-undefined opcode differently must not turn the
+         * gate into a false positive/negative. */
+        int arch_undefined = (family == 0xFE) ? (d >= 2) : (d >= 1);
+        CHECK(arch_undefined == hud, "host opcode oracle disagrees with SDM");
+        printf("%02X /%d: host %s arch %s WEMU fault=%d\n", family, d,
+               hud ? "#UD" : "ok", arch_undefined ? "#UD" : "ok", efault);
+        if (arch_undefined) {
             CHECK(efault == 6, "undefined ModRM.reg digit did not raise #UD");
             CHECK(er == rax, "undefined ModRM.reg digit wrote the destination");
             CHECK(erip == 0x1000, "undefined ModRM.reg digit advanced RIP");
         } else {
-            CHECK(efault == 0, "WEMU faulted on a host-valid ModRM.reg digit");
+            CHECK(efault == 0, "WEMU faulted on a defined ModRM.reg digit");
             CHECK(er == hr, "defined ModRM.reg digit result differs from host");
         }
     }
