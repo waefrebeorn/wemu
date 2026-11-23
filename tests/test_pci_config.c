@@ -34,6 +34,10 @@ int main(void) {
     CHECK(read_cfg(0x80000000u) == 0x10421af4u, "wrong vendor/device ID");
     CHECK(read_cfg(0x80000008u) == 0x01800000u, "wrong class code");
     CHECK((read_cfg(0x80000034u) & 0xffu) == 0x40u, "wrong capability pointer");
+    CHECK(read_cfg(0x80000040u) == 0x01105009u, "common cap next/len wrong");
+    CHECK(read_cfg(0x80000048u) == 0u, "common cap offset must be BAR+0");
+    CHECK(read_cfg(0x80000050u) == 0x02147009u, "notify cap next/len wrong");
+    CHECK(read_cfg(0x80000088u) == 0x3000u, "device cap offset wrong");
     CHECK(read_cfg(0x80000800u) == 0xffffffffu, "empty function not all-ones");
     printf("test_pci_config: PASS (1af4:1042, class 01:80, caps @40)\n");
     return 0;

@@ -6,6 +6,8 @@
  */
 #include "wemu_internal.h"
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <stdlib.h>
 
 #define VIRTIO_BAR_BASE 0x0F000000ull
@@ -16,6 +18,12 @@
 #define VIRTIO_BLK_T_IN  0u
 #define VIRTIO_BLK_T_OUT 1u
 #define VIRTIO_BLK_T_FLUSH 4u
+
+static int trace_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("WEMU_VIRTIO_TRACE") != NULL;
+    return cached;
+}
 
 static struct {
     uint32_t dev_feat_sel, drv_feat_sel;
@@ -103,6 +111,8 @@ static void gpa_w16(WemuCpu *cpu, uint64_t gpa, uint16_t v16) {
 }
 
 static void process_queue(WemuCpu *cpu) {
+    if (trace_enabled()) fprintf(stderr, "VTRACE kick en=%u avail=%u used=%u\n",
+                                 v.queue_enable, gpa_r16(cpu, v.driver + 2), v.used_idx);
     if (!v.queue_enable || !v.desc || !v.driver || !v.device || !v.disk) return;
     uint16_t avail_idx = gpa_r16(cpu, v.driver + 2);
     uint32_t guard = 0;
@@ -164,6 +174,9 @@ int wemu_virtio_mmio_read(WemuCpu *cpu, uint64_t gpa, void *dst, size_t len) {
     if (gpa < VIRTIO_BAR_BASE || gpa >= VIRTIO_BAR_BASE + VIRTIO_BAR_LEN)
         return 1;
     if (len > VIRTIO_BAR_BASE + VIRTIO_BAR_LEN - gpa) return -1;
+    if (trace_enabled() && (gpa - VIRTIO_BAR_BASE) < 0x40)
+        fprintf(stderr, "VTRACE rd off=%02x len=%zu\n",
+                (unsigned)(gpa - VIRTIO_BAR_BASE), len);
     uint8_t *out = dst;
     for (size_t i = 0; i < len; i++) {
         unsigned off = (unsigned)(gpa + i - VIRTIO_BAR_BASE);
@@ -181,6 +194,11 @@ int wemu_virtio_mmio_write(WemuCpu *cpu, uint64_t gpa, const void *src, size_t l
         return 1;
     if (len > VIRTIO_BAR_BASE + VIRTIO_BAR_LEN - gpa) return -1;
     const uint8_t *in = src;
+    if (trace_enabled()) {
+        unsigned off0 = (unsigned)(gpa - VIRTIO_BAR_BASE);
+        if (off0 < 0x40 || (off0 >= 0x1000 && off0 < 0x1002))
+            fprintf(stderr, "VTRACE wr off=%02x len=%zu val=%02x\n", off0, len, len ? in[0] : 0);
+    }
     for (size_t i = 0; i < len; i++) {
         unsigned off = (unsigned)(gpa + i - VIRTIO_BAR_BASE);
         if (off < 0x40) common_write8(off, in[i]);

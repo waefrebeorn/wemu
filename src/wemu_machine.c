@@ -2,6 +2,7 @@
  * devices and their port I/O. Bare CPUs (no machine) ignore port I/O. */
 #include "wemu_internal.h"
 #include <stdlib.h>
+#include <stdio.h>
 
 #define COM1_RX_SIZE 256u
 #define PCI_CONFIG_ADDR 0xCF8u
@@ -55,16 +56,33 @@ static void pci_cfg_init(uint8_t *cfg) {
     pci_cfg_put32(cfg, 0x08, 0x01800000u); /* mass-storage, subclass 0x80 (other) */
     cfg[0x0C] = 0x00;                    /* header type 0 */
     pci_cfg_put32(cfg, 0x20, 0x0F000000u); /* BAR4: 16 KiB MMIO at 0x0F000000 */
-    cfg[0x34] = 0x40;                    /* capability list head */
-    /* virtio vendor caps: common, notify, isr, device configuration */
-    pci_cfg_put32(cfg, 0x40, 0x01100909u); cfg[0x44] = 4;
-    pci_cfg_put32(cfg, 0x48, 0x00001000u); pci_cfg_put32(cfg, 0x4C, 0x1000u);
-    pci_cfg_put32(cfg, 0x50, 0x02141009u); cfg[0x54] = 4;
-    pci_cfg_put32(cfg, 0x58, 0x00001000u); pci_cfg_put32(cfg, 0x5C, 0x1000u);
-    pci_cfg_put32(cfg, 0x60, 0x03101009u); cfg[0x64] = 4;
-    pci_cfg_put32(cfg, 0x68, 0x00002000u); pci_cfg_put32(cfg, 0x6C, 0x1000u);
-    pci_cfg_put32(cfg, 0x70, 0x04101009u); cfg[0x74] = 4;
-    pci_cfg_put32(cfg, 0x78, 0x00003000u); pci_cfg_put32(cfg, 0x7C, 0x1000u);
+    pci_cfg_put32(cfg, 0x34, 0x40u);                    /* capability list head */
+    /* virtio vendor caps: common @40 (16B), notify @50 (20B, so its
+     * multiplier lives at 0x60 and the next cap is 0x70), ISR @70 (16B),
+     * device config @80 (16B). cap_next values are ABSOLUTE offsets. */
+    pci_cfg_put32(cfg, 0x40, 0x01105009u); /* 09 50 10 01 */
+    pci_cfg_put32(cfg, 0x44, 4u);           /* bar 4 */
+    pci_cfg_put32(cfg, 0x48, 0x00000000u);  /* common offset */
+    pci_cfg_put32(cfg, 0x4C, 0x1000u);      /* common length */
+    pci_cfg_put32(cfg, 0x50, 0x02147009u); /* 09 70 14 02 */
+    pci_cfg_put32(cfg, 0x54, 4u);           /* bar 4 */
+    pci_cfg_put32(cfg, 0x58, 0x00001000u);  /* notify offset */
+    pci_cfg_put32(cfg, 0x5C, 0x1000u);      /* notify length */
+    pci_cfg_put32(cfg, 0x60, 0u);           /* notify multiplier = 0 */
+    pci_cfg_put32(cfg, 0x70, 0x03108009u); /* 09 80 10 03 */
+    pci_cfg_put32(cfg, 0x74, 4u);
+    pci_cfg_put32(cfg, 0x78, 0x00002000u);
+    pci_cfg_put32(cfg, 0x7C, 0x1000u);
+    pci_cfg_put32(cfg, 0x80, 0x04100009u); /* 09 00 10 04 */
+    pci_cfg_put32(cfg, 0x84, 4u);
+    pci_cfg_put32(cfg, 0x88, 0x00003000u);
+    pci_cfg_put32(cfg, 0x8C, 0x1000u);
+}
+
+static int pci_trace(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("WEMU_PCI_TRACE") != NULL;
+    return cached;
 }
 
 static int pci_selected(const WemuMachine *m) {
@@ -77,9 +95,14 @@ static int pci_selected(const WemuMachine *m) {
 void wemu_port_out(WemuCpu *cpu, uint16_t port, uint32_t val, int bytes) {
     WemuMachine *m = (WemuMachine *)cpu->machine_ud;
     (void)bytes;
-    if (port == PCI_CONFIG_ADDR) { if (m) m->pci_addr = val; return; }
+    if (port == PCI_CONFIG_ADDR) {
+        if (m) m->pci_addr = val;
+        if (pci_trace()) fprintf(stderr, "PTRACE addr=%08x\n", val);
+        return;
+    }
     if (port == PCI_CONFIG_DATA && m && pci_selected(m)) {
         unsigned off = m->pci_addr & 0xFCu;
+        if (pci_trace()) fprintf(stderr, "PTRACE wr off=%02x val=%08x\n", off, val);
         if (off == 0x20) val = (val & 0xFFFFC000u) | 0x4u; /* 16 KiB memory BAR */
         pci_cfg_put32(m->pci_cfg, off, val);
         return;
@@ -99,8 +122,14 @@ uint32_t wemu_port_in(WemuCpu *cpu, uint16_t port, int bytes) {
         return b;
     }
     if (port == PCI_CONFIG_DATA) {
-        if (!m || !pci_selected(m)) return 0xffffffffu;
-        return pci_cfg_get32(m->pci_cfg, m->pci_addr & 0xFCu);
+        if (!m || !pci_selected(m)) {
+            if (pci_trace()) fprintf(stderr, "PTRACE rd EMPTY addr=%08x\n", m ? m->pci_addr : 0);
+            return 0xffffffffu;
+        }
+        uint32_t v = pci_cfg_get32(m->pci_cfg, m->pci_addr & 0xFCu);
+        if (pci_trace()) fprintf(stderr, "PTRACE rd off=%02x val=%08x\n",
+                                 m->pci_addr & 0xFCu, v);
+        return v;
     }
     if (port == PS2_DATA || port == PS2_STATUS) return 0;
     return bytes == 1 ? 0xff : bytes == 2 ? 0xffff : 0xffffffffu;
