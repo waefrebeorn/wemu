@@ -81,6 +81,8 @@ struct WemuCpu {
     void *serial_ud;
 };
 
+int wemu_cpu_gdt_load(WemuCpu *cpu, uint64_t base, uint16_t limit);
+
 /* flags bits */
 #define WF_CF 0x001
 #define WF_PF 0x004

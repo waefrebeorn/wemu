@@ -17,7 +17,7 @@ TESTS = test_isa test_avx test_paging test_machine test_string test_cpuid \
         test_usermode_mpk test_usermode_exec2 test_usermode_execfd \
         test_usermode_threadexec test_usermode_clone3 test_usermode_timer \
         test_usermode_nested test_btmem test_btimm test_string_diff test_rep_fault_restart test_flag_diff \
-        test_imul_flags test_rotate_flags test_group_ud
+        test_imul_flags test_rotate_flags test_group_ud test_highhalf_paging test_control_regs
 
 all: libwemu.a
 
@@ -171,7 +171,7 @@ test: $(TESTS) $(BUSYBOX_FIXTURE)
 # a separate native-execution concern.
 SAN_CFLAGS := -std=gnu11 -O1 -g -Wall -Wextra -fno-omit-frame-pointer \
               -fsanitize=address,undefined -fno-sanitize-recover=all
-SAN_TESTS := test_imul_flags test_flag_diff test_string_diff test_shld test_divmul test_rotate_flags test_group_ud
+SAN_TESTS := test_imul_flags test_flag_diff test_string_diff test_shld test_divmul test_rotate_flags test_group_ud test_highhalf_paging test_control_regs
 # Deeper opt-in sweep: ten more pure ISA gates were run clean under
 # ASan+UBSan. Kept out of the default gate so tandem_check stays fast.
 SAN_ALL_TESTS := $(SAN_TESTS) test_isa test_avx test_paging test_machine \

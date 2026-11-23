@@ -459,7 +459,47 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
         return 0;
     }
 
+    /* LGDT/LIDT (0F 01 /1,/2) decode with ModRM but need their own
+     * descriptor load. Kept here, before the SSE leaf and the switch, so
+     * reg=2 with mod=3 is XGETBV, which still reaches its own handler. */
+    if (full == 0x101 && (in->modrm >> 6) != 3 &&
+        (REG(in) == 1 || REG(in) == 2)) {
+        uint8_t raw[10] = {0};
+        uint64_t addr = wemu_eff_addr(c, in);
+        if (wemu_mem_read(c, addr, raw, sizeof raw) != 0) return -1;
+        uint16_t limit = (uint16_t)(raw[0] | (raw[1] << 8));
+        uint64_t base = 0;
+        for (int i = 0; i < 8; i++) base |= (uint64_t)raw[2 + i] << (8 * i);
+        int rc = REG(in) == 1 ? wemu_cpu_gdt_load(c, base, limit)
+                              : wemu_cpu_idt_load(c, base, limit);
+        if (rc != 0) { c->fault = 13; return -1; }
+        c->rip += in->len;
+        return 0;
+    }
+
     switch (full) {
+    /* LGDT/LIDT: kernel boot loads its own descriptor tables. */
+    /* Control registers: kernel boot needs MOV CRn <-> GPR. The decoder
+     * already reads ModRM for 0F 20/22; only the handlers were missing. */
+    case 0x120: { /* MOV r64, CRn — reg=GPR, rm=CRn */
+        int cr = in->modrm & 7;
+        if (cr == 1 || cr == 5 || cr == 6 || cr == 7) goto ud;
+        uint64_t v = cr == 0 ? c->cr0 : cr == 2 ? c->cr2 :
+                     cr == 3 ? c->cr3 : cr == 4 ? c->cr4 : c->efer;
+        write_reg(c, REG(in), 8, v);
+        break;
+    }
+    case 0x122: { /* MOV CRn, r64 — reg=CRn, rm=GPR */
+        int cr = REG(in);
+        if (cr == 1 || cr == 5 || cr == 6 || cr == 7) goto ud;
+        uint64_t v = c->r[in->modrm & 7];
+        if (cr == 0) c->cr0 = v;
+        else if (cr == 2) c->cr2 = v;
+        else if (cr == 3) c->cr3 = v & 0x000ffffffffff000ull;
+        else if (cr == 4) c->cr4 = v;
+        else c->efer = v;
+        break;
+    }
     case 0x50: case 0x51: case 0x52: case 0x53:
     case 0x54: case 0x55: case 0x56: case 0x57:
         push64(c, c->r[(o - 0x50) | (REX_B(in) << 3)]);

@@ -72,7 +72,11 @@ uint64_t wemu_translate_ex(WemuCpu *cpu, uint64_t va, int is_write,
     *fault = 0;
     if (!(cpu->cr0 & 0x80000000ull)) /* PG clear: identity */
         return va;
-    if (va >> 47) { /* non-canonical: #GP, no selector error code */
+    /* 48-bit canonical: bits 63:47 are all zero (low half) or all one
+     * (high half). `va >> 47` alone is 0x1ffff for every high-half VA and
+     * must NOT be treated as non-canonical. */
+    uint64_t high = va >> 47;
+    if (high != 0 && high != 0x1ffffull) { /* non-canonical: #GP */
         cpu->fault_error = 0;
         *fault = 13;
         return 0;
