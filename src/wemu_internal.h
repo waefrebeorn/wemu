@@ -24,6 +24,8 @@ struct WemuCpu {
     uint64_t ram_size;
     int halted;
     void *machine_ud;        /* owning WemuMachine, for port-I/O devices */
+    int (*mmio_read)(WemuCpu *cpu, uint64_t gpa, void *dst, size_t len);
+    int (*mmio_write)(WemuCpu *cpu, uint64_t gpa, const void *src, size_t len);
     int fault;               /* x86 exception vector, 0 = none */
     uint64_t fault_error;    /* error code accompanying a pending fault */
     /* exception delivery (wemu_exception.c owns these): a minimal IDT of
@@ -142,6 +144,11 @@ uint64_t wemu_translate(WemuCpu *cpu, uint64_t va, int is_write, int is_user,
                         int *fault);
 /* Instruction-fetch read (wemu_decode.c): same walk with is_fetch=1. */
 int wemu_mem_fetch(WemuCpu *cpu, uint64_t va, void *dst, size_t len);
+
+/* machine-attached MMIO regions: return 0 handled, 1 not ours, -1 fault */
+void wemu_virtio_reset(void);
+int wemu_virtio_mmio_read(WemuCpu *cpu, uint64_t gpa, void *dst, size_t len);
+int wemu_virtio_mmio_write(WemuCpu *cpu, uint64_t gpa, const void *src, size_t len);
 
 /* effective address for a ModRM memory operand (one owner: exec + sse) */
 uint64_t wemu_eff_addr(WemuCpu *cpu, const WemuInsn *in);

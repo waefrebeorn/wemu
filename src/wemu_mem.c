@@ -4,6 +4,10 @@
 #include <stdlib.h>
 
 int wemu_gpa_read(WemuCpu *cpu, uint64_t gpa, void *dst, size_t len) {
+    if (cpu->mmio_read) {
+        int rc = cpu->mmio_read(cpu, gpa, dst, len);
+        if (rc <= 0) return rc;
+    }
     if (gpa > cpu->ram_size || len > cpu->ram_size - gpa) {
         cpu->fault = 13; /* #GP: outside guest RAM */
         return -1;
@@ -13,6 +17,10 @@ int wemu_gpa_read(WemuCpu *cpu, uint64_t gpa, void *dst, size_t len) {
 }
 
 int wemu_gpa_write(WemuCpu *cpu, uint64_t gpa, const void *src, size_t len) {
+    if (cpu->mmio_write) {
+        int rc = cpu->mmio_write(cpu, gpa, src, len);
+        if (rc <= 0) return rc;
+    }
     if (gpa > cpu->ram_size || len > cpu->ram_size - gpa) {
         cpu->fault = 13;
         return -1;
