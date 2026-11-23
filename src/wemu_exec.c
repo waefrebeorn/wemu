@@ -262,49 +262,75 @@ static void do_shift(WemuCpu *c, int op, uint64_t val, uint64_t cnt,
                      int bytes, uint64_t *out) {
     int bits = bytes * 8;
     cnt &= (bits == 64) ? 63 : 31;
+    /* A zero count is a no-op for the whole group: not even CF is
+     * touched.  Clearing flags here was observable on real hardware. */
+    if (!cnt) { *out = val; return; }
     uint64_t r = val;
     uint64_t f = c->rflags & ~(WF_CF | WF_OF | WF_ZF | WF_SF | WF_PF);
-    if (cnt) {
-        uint64_t cf = 0, of = 0;
-        switch (op) {
-        case 0: case 1: /* rol/ror: CF only, flags otherwise untouched */
-            cnt %= (uint64_t)bits;
-            if (cnt) {
-                r = op == 0 ? (val << cnt) | (val >> (bits - cnt))
-                            : (val >> cnt) | (val << (bits - cnt));
-                r = wemu_mask(r, bytes);
-                cf = op == 0 ? (r & 1) : (r >> (bits - 1));
-                if (cf) f |= WF_CF;
-                if (cnt == 1) {
-                    of = op == 0 ? ((r >> (bits - 1)) ^ cf)
-                                 : ((r >> (bits - 1)) ^ ((r >> (bits - 2)) & 1));
-                    if (of) f |= WF_OF;
-                }
-            }
-            c->rflags = f; *out = r; return;
-        case 4: case 6: /* shl/sal */
-            cf = (val >> (bits - cnt)) & 1;
-            r = wemu_mask(val << cnt, bytes);
-            if (cnt == 1) of = (r >> (bits - 1)) ^ cf;
-            break;
-        case 5: /* shr */
-            cf = (val >> (cnt - 1)) & 1;
-            r = val >> cnt;
-            if (cnt == 1) of = val >> (bits - 1);
-            break;
-        case 7: /* sar */
-            cf = (val >> (cnt - 1)) & 1;
-            r = (uint64_t)((int64_t)(val << (64 - bits)) >> (64 - bits) >> cnt);
+    uint64_t cf = 0, of = 0;
+    switch (op) {
+    case 0: case 1: /* rol/ror: CF only, flags otherwise untouched */
+        cnt %= (uint64_t)bits;
+        if (!cnt) { *out = val; return; }
+        {
+            r = op == 0 ? (val << cnt) | (val >> (bits - cnt))
+                        : (val >> cnt) | (val << (bits - cnt));
             r = wemu_mask(r, bytes);
-            of = 0;
-            break;
+            cf = op == 0 ? (r & 1) : (r >> (bits - 1));
+            if (cf) f |= WF_CF;
+            if (cnt == 1) {
+                of = op == 0 ? ((r >> (bits - 1)) ^ cf)
+                             : ((r >> (bits - 1)) ^ ((r >> (bits - 2)) & 1));
+                if (of) f |= WF_OF;
+            }
         }
-        if (cf) f |= WF_CF;
-        if (of) f |= WF_OF;
-        if (!r) f |= WF_ZF;
-        if (r >> (bits - 1)) f |= WF_SF;
-        if (wemu_parity(r)) f |= WF_PF;
+        c->rflags = f; *out = r; return;
+    case 2: case 3: { /* rcl/rcr: rotate a bits+1 ring that includes CF */
+        int width = bits + 1;
+        unsigned n = (unsigned)(cnt % (uint64_t)width);
+        uint64_t mask = wemu_mask(~0ull, bytes);
+        uint64_t value = wemu_mask(val, bytes);
+        __uint128_t ring = ((__uint128_t)value << 1) |
+                           (uint64_t)((c->rflags & WF_CF) ? 1 : 0);
+        __uint128_t ring_mask = (((__uint128_t)1 << width) - 1);
+        if (n) {
+            ring = op == 2 ? ((ring << n) | (ring >> (width - (int)n))) & ring_mask
+                           : ((ring >> n) | (ring << (width - (int)n))) & ring_mask;
+        }
+        uint64_t new_cf = (uint64_t)(ring & 1);
+        r = (uint64_t)(ring >> 1) & mask;
+        /* Rotates affect CF and (for count 1) OF only. */
+        f = c->rflags & ~(WF_CF | WF_OF);
+        if (new_cf) f |= WF_CF;
+        if (cnt == 1) {
+            of = op == 2 ? ((r >> (bits - 1)) & 1) ^ new_cf
+                         : ((r >> (bits - 1)) & 1) ^ ((r >> (bits - 2)) & 1);
+            if (of) f |= WF_OF;
+        }
+        c->rflags = f; *out = r; return;
     }
+    case 4: case 6: /* shl/sal */
+        cf = (val >> (bits - cnt)) & 1;
+        r = wemu_mask(val << cnt, bytes);
+        if (cnt == 1) of = (r >> (bits - 1)) ^ cf;
+        break;
+    case 5: /* shr */
+        cf = (val >> (cnt - 1)) & 1;
+        r = val >> cnt;
+        if (cnt == 1) of = val >> (bits - 1);
+        break;
+    case 7: /* sar */
+        cf = (val >> (cnt - 1)) & 1;
+        r = (uint64_t)((int64_t)(val << (64 - bits)) >> (64 - bits) >> cnt);
+        r = wemu_mask(r, bytes);
+        of = 0;
+        break;
+    }
+    if (cf) f |= WF_CF;
+    if (of) f |= WF_OF;
+    if (!r) f |= WF_ZF;
+    if (r >> (bits - 1)) f |= WF_SF;
+    if (wemu_parity(r)) f |= WF_PF;
     c->rflags = f;
     *out = r;
 }
