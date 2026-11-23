@@ -33,6 +33,7 @@ static struct {
     uint64_t desc, driver, device;
     uint16_t last_avail, used_idx;
     uint8_t *disk;
+    FILE *disk_file;
 } v;
 
 static uint8_t common_read8(unsigned off) {
@@ -97,6 +98,17 @@ void wemu_virtio_reset(void) {
     v.queue_size = VQ_SIZE;
     v.queue_notify = 0;
     if (!v.disk) v.disk = calloc((size_t)BLK_SECTORS, BLK_SECTOR_BYTES);
+    if (v.disk_file) { fclose(v.disk_file); v.disk_file = NULL; }
+    const char *path = getenv("WEMU_VIRTIO_DISK");
+    if (path && *path) {
+        v.disk_file = fopen(path, "r+b");
+        if (!v.disk_file) v.disk_file = fopen(path, "w+b");
+        if (v.disk_file) {
+            size_t got = fread(v.disk, BLK_SECTOR_BYTES, BLK_SECTORS, v.disk_file);
+            (void)got;
+            rewind(v.disk_file);
+        }
+    }
 }
 
 static uint16_t gpa_r16(WemuCpu *cpu, uint64_t gpa) {
@@ -151,6 +163,10 @@ static void process_queue(WemuCpu *cpu) {
                    off <= (uint64_t)BLK_SECTORS * BLK_SECTOR_BYTES &&
                    data_len <= (uint64_t)BLK_SECTORS * BLK_SECTOR_BYTES - off) {
             if (wemu_gpa_read(cpu, data, v.disk + off, data_len) != 0) return;
+            if (v.disk_file && fseek(v.disk_file, (long)off, SEEK_SET) == 0) {
+                (void)fwrite(v.disk + off, 1, data_len, v.disk_file);
+                fflush(v.disk_file);
+            }
         }
         if (status) {
             uint8_t ok = 0;
