@@ -362,16 +362,15 @@ int main(void) {
             check("strcmp-pandn-vex", out, want, L ? 32 : 16);
         }
     }
-    /* Named regression: 66 0F 73 shift-count group. glibc __strcmp_sse2
-     * aligns with pslldq $7 / $15 (/7 = BYTE shift left). The old decode
-     * ran /7 as per-qword BIT shift (psllq) and /6 as pslldq — busybox
-     * applet search miscompared "false" vs "fdflush"/"fdformat". Gate
-     * every digit: /2 psrlw, /3 psrldq, /4 psraw, /6 psllw, /7 pslldq,
-     * legacy + VEX.128/256, edge counts 0/16/255. */
+    /* Named regression: immediate shift groups. SDM: 0F 71 is WORD
+     * (/2 psrlw, /4 psraw, /6 psllw), 0F 72 is DWORD, 0F 73 is QWORD
+     * (/2 psrlq, /6 psllq) plus /3 psrldq and /7 pslldq (BYTE shifts).
+     * An earlier gate encoded the word ops on 0F 73 and hid the bug that
+     #UD'd gcc14-vectorized kernel memset in boot-verify #148. */
     {
         uint8_t a[32], out[32], want[32], insn[16];
         for (int i = 0; i < 32; i++) a[i] = (uint8_t)(i * 7 + 3);
-        const int cnts[] = { 0, 1, 7, 15, 16, 255 };
+        const int cnts[] = { 0, 1, 7, 15, 16, 31, 32, 63, 64, 255 };
         for (int L = 0; L < 2; L++) {
             int nb = L ? 32 : 16;
             for (size_t ci = 0; ci < sizeof cnts / sizeof cnts[0]; ci++) {
@@ -395,7 +394,7 @@ int main(void) {
                     run_vec(insn, 5, L, a, a, out, NULL);
                     check("shiftgrp-psdq-vex", out, want, nb);
                 }
-                /* psllw /6, psrlw /2, psraw /4: per-word bit oracle */
+                /* psllw /6, psrlw /2, psraw /4 — 0F 71 WORD group */
                 for (int digit = 2; digit <= 6; digit += 2) {
                     for (int w = 0; w < nb / 2; w++) {
                         uint16_t v = (uint16_t)(a[2*w] | (a[2*w+1] << 8));
@@ -406,10 +405,27 @@ int main(void) {
                                r = cnt >= 16 ? (uint16_t)(s >> 15) : (uint16_t)(s >> cnt); }
                         want[2*w] = (uint8_t)r; want[2*w+1] = (uint8_t)(r >> 8);
                     }
-                    insn[0]=0x66; insn[1]=0x0F; insn[2]=0x73;
+                    insn[0]=0x66; insn[1]=0x0F; insn[2]=0x71;
                     insn[3]=(uint8_t)(0xC0 | (digit << 3)); insn[4]=(uint8_t)cnt;
                     run_vec(insn, 5, 0, a, a, out, NULL);
                     check("shiftgrp-psw-legacy", out, want, 16);
+                }
+                /* psllq /6, psrlq /2 — 0F 73 QWORD group (not word) */
+                for (int digit = 2; digit <= 6; digit += 4) {
+                    for (int q = 0; q < 2; q++) {
+                        uint64_t v = (uint64_t)a[8*q] | ((uint64_t)a[8*q+1]<<8) |
+                            ((uint64_t)a[8*q+2]<<16) | ((uint64_t)a[8*q+3]<<24) |
+                            ((uint64_t)a[8*q+4]<<32) | ((uint64_t)a[8*q+5]<<40) |
+                            ((uint64_t)a[8*q+6]<<48) | ((uint64_t)a[8*q+7]<<56);
+                        uint64_t r = digit == 6 ? (cnt >= 64 ? 0 : v << cnt)
+                                                : (cnt >= 64 ? 0 : v >> cnt);
+                        for (int k = 0; k < 8; k++)
+                            want[8*q+k] = (uint8_t)(r >> (8*k));
+                    }
+                    insn[0]=0x66; insn[1]=0x0F; insn[2]=0x73;
+                    insn[3]=(uint8_t)(0xC0 | (digit << 3)); insn[4]=(uint8_t)cnt;
+                    run_vec(insn, 5, 0, a, a, out, NULL);
+                    check("shiftgrp-psq-legacy", out, want, 16);
                 }
             }
         }
