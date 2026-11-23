@@ -32,9 +32,13 @@ int main(void) {
     CHECK(c->cr3 == 0x12345000ull, "mov cr3,rax wrong value");
 
     wemu_cpu_set_reg(c, 0, 0);
-    { const uint8_t code[] = { 0x48, 0x0f, 0x20, 0xc3 }; /* mov rax,cr3 */
+    { const uint8_t code[] = { 0x48, 0x0f, 0x20, 0xd8 }; /* CR3 -> RAX */
       run(c, code, sizeof code, "mov rax,cr3 faulted"); }
     CHECK(wemu_cpu_reg(c, 0) == 0x12345000ull, "mov rax,cr3 wrong value");
+    wemu_cpu_set_reg(c, 1, 0);
+    { const uint8_t code[] = { 0x48, 0x0f, 0x20, 0xd9 }; /* CR3 -> RBX */
+      run(c, code, sizeof code, "mov rbx,cr3 faulted"); }
+    CHECK(wemu_cpu_reg(c, 1) == 0x12345000ull, "mov rbx,cr3 wrong value");
 
     /* LGDT [rax] reads the 16:64 descriptor and loads GDTR. */
     uint8_t desc[10] = { 0x17, 0x00 };
@@ -42,10 +46,14 @@ int main(void) {
     for (int i = 0; i < 8; i++) desc[2 + i] = (uint8_t)(base >> (8 * i));
     CHECK(wemu_mem_write(c, 0x2000, desc, sizeof desc) == 0, "write GDT descriptor");
     wemu_cpu_set_reg(c, 0, 0x2000);
-    { const uint8_t code[] = { 0x48, 0x0f, 0x01, 0x08 };
+    { const uint8_t code[] = { 0x48, 0x0f, 0x01, 0x10 }; /* LGDT /2 */
       run(c, code, sizeof code, "lgdt faulted"); }
     CHECK(c->gdt.configured && c->gdt.limit == 0x17 && c->gdt.base == base,
           "lgdt loaded wrong descriptor");
+    { const uint8_t code[] = { 0x48, 0x0f, 0x01, 0x18 }; /* LIDT /3 */
+      run(c, code, sizeof code, "lidt faulted"); }
+    CHECK(c->idtr.configured && c->idtr.limit == 0x17 && c->idtr.base == base,
+          "lidt loaded wrong descriptor");
 
     /* MOV DS/SS, ax — the next 32-bit crt0 step after LGDT. */
     wemu_cpu_set_reg(c, 0, 0x10);
@@ -57,7 +65,21 @@ int main(void) {
       run(c, code, sizeof code, "mov ss,ax faulted"); }
     CHECK(c->ss_selector == 0x18, "mov ss,ax wrong selector");
 
-    printf("test_control_regs: %s (CR0/CR3, LGDT, DS/SS loads)\n", fails ? "FAIL" : "PASS");
+    /* IA32_APIC_BASE MSR: apic_init reads and rewrites it. */
+    wemu_cpu_set_reg(c, 1, 0x1B); /* RCX */
+    { const uint8_t code[] = { 0x0f, 0x32 }; /* rdmsr */
+      run(c, code, sizeof code, "rdmsr faulted"); }
+    CHECK((uint32_t)wemu_cpu_reg(c, 0) == 0xfee00000u, "rdmsr APIC base low");
+    CHECK((uint32_t)wemu_cpu_reg(c, 2) == 0, "rdmsr APIC base high");
+    wemu_cpu_set_reg(c, 0, 0xfee00800ull);
+    wemu_cpu_set_reg(c, 2, 0);
+    { const uint8_t code[] = { 0x0f, 0x30 }; /* wrmsr */
+      run(c, code, sizeof code, "wrmsr faulted"); }
+    { const uint8_t code[] = { 0x0f, 0x32 };
+      run(c, code, sizeof code, "rdmsr after wrmsr faulted"); }
+    CHECK(wemu_cpu_reg(c, 0) == 0xfee00800ull, "msr round trip");
+
+    printf("test_control_regs: %s (CR0/CR3, LGDT/LIDT, DS/SS, MSR)\n", fails ? "FAIL" : "PASS");
     wemu_cpu_destroy(c);
     return fails ? 1 : 0;
 }

@@ -459,19 +459,24 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
         return 0;
     }
 
-    /* LGDT/LIDT (0F 01 /1,/2) decode with ModRM but need their own
-     * descriptor load. Kept here, before the SSE leaf and the switch, so
-     * reg=2 with mod=3 is XGETBV, which still reaches its own handler. */
+    /* 0F 01 extension: /2 LGDT, /3 LIDT (memory operand only).
+     * Kept before the SSE leaf so reg=2 with mod=3 (XGETBV) still reaches
+     * its own handler. */
     if (full == 0x101 && (in->modrm >> 6) != 3 &&
-        (REG(in) == 1 || REG(in) == 2)) {
+        (REG(in) == 2 || REG(in) == 3)) {
         uint8_t raw[10] = {0};
         uint64_t addr = wemu_eff_addr(c, in);
         if (wemu_mem_read(c, addr, raw, sizeof raw) != 0) return -1;
         uint16_t limit = (uint16_t)(raw[0] | (raw[1] << 8));
         uint64_t base = 0;
         for (int i = 0; i < 8; i++) base |= (uint64_t)raw[2 + i] << (8 * i);
-        int rc = REG(in) == 1 ? wemu_cpu_gdt_load(c, base, limit)
-                              : wemu_cpu_idt_load(c, base, limit);
+        /* The descriptor holds a guest VIRTUAL base; table loaders store
+         * physical addresses. Translate it with the active page tables. */
+        int pf = 0;
+        uint64_t phys = wemu_translate_ex(c, base, 0, 0, 0, &pf);
+        if (pf) { c->fault = pf; return -1; }
+        int rc = REG(in) == 2 ? wemu_cpu_gdt_load(c, phys, limit)
+                              : wemu_cpu_idt_load(c, phys, limit);
         if (rc != 0) { c->fault = 13; return -1; }
         c->rip += in->len;
         return 0;
@@ -481,12 +486,12 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
     /* LGDT/LIDT: kernel boot loads its own descriptor tables. */
     /* Control registers: kernel boot needs MOV CRn <-> GPR. The decoder
      * already reads ModRM for 0F 20/22; only the handlers were missing. */
-    case 0x120: { /* MOV r64, CRn — reg=GPR, rm=CRn */
-        int cr = in->modrm & 7;
+    case 0x120: { /* MOV r64, CRn — reg=CRn, rm=GPR */
+        int cr = REG(in);
         if (cr == 1 || cr == 5 || cr == 6 || cr == 7) goto ud;
         uint64_t v = cr == 0 ? c->cr0 : cr == 2 ? c->cr2 :
                      cr == 3 ? c->cr3 : cr == 4 ? c->cr4 : c->efer;
-        write_reg(c, REG(in), 8, v);
+        write_reg(c, in->modrm & 7, 8, v);
         break;
     }
     case 0x122: { /* MOV CRn, r64 — reg=CRn, rm=GPR */
@@ -1029,6 +1034,19 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
                 c->r[0] = 0x7; /* XCR0: x87+SSE+AVX state enabled */
                 c->r[2] = 0;
             } else { c->r[0] = 0; c->r[2] = 0; }
+        } else if (full == 0x130) { /* wrmsr: ECX=msr, EDX:EAX=value */
+            uint32_t msr = (uint32_t)c->r[1];
+            uint64_t v = ((uint64_t)(uint32_t)c->r[2] << 32) | (uint32_t)c->r[0];
+            if (msr == 0x1B) c->apic_base_msr = v;
+            else if (msr == 0xC0000080ull) c->efer = v;
+            else goto ud; /* honest: only the MSRs we model */
+        } else if (full == 0x132) { /* rdmsr: ECX=msr -> EDX:EAX */
+            uint32_t msr = (uint32_t)c->r[1];
+            uint64_t v;
+            if (msr == 0x1B) v = c->apic_base_msr;
+            else if (msr == 0xC0000080ull) v = c->efer;
+            else goto ud;
+            c->r[0] = (uint32_t)v; c->r[2] = (uint32_t)(v >> 32);
         } else if (full == 0x131) { /* rdtsc */
             static uint64_t tsc;
             tsc += 100;

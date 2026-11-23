@@ -72,6 +72,7 @@ WemuCpu *wemu_cpu_create(uint64_t ram_size) {
     cpu->rflags = 2;
     cpu->cr0 = 0x11; /* PE|MP: long mode ready, paging OFF until enabled */
     cpu->efer = 0xd00;        /* LME|LMA|NXE */
+    cpu->apic_base_msr = 0xfee00000ull; /* IA32_APIC_BASE reset */
     cpu->cs_selector = 0x28;  /* reset CS: 64-bit code selector */
     cpu->ss_selector = 0;     /* legacy frame convention: SS slot reads 0 */
     cpu->x87_cw = 0x037F;     /* x87 reset: all exceptions masked, round-nearest */
