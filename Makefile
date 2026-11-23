@@ -9,7 +9,7 @@ SRC = src/wemu_cpu.c src/wemu_mem.c src/wemu_decode.c src/wemu_exec.c \
       src/wemu_x87.c src/wemu_exception.c src/wemu_usermode.c
 OBJ = $(SRC:.c=.o)
 TESTS = test_isa test_avx test_paging test_machine test_string test_cpuid \
-        test_sse2 test_sse_shift_imm test_shufps test_packuswb test_pextrw test_usermode test_shld test_x87 test_fcomi_flags test_divmul test_lock_atomics \
+        test_sse2 test_sse_shift_imm test_shufps test_packuswb test_pextrw test_ps2_ports test_pushf test_invlpg test_sse_pd_conv test_fxsave test_usermode test_shld test_x87 test_fcomi_flags test_divmul test_lock_atomics \
         test_exceptions test_isa_atomic_fence test_idt test_priv test_faults \
         test_segments test_cpl test_iret test_tss test_task_switch \
         test_task_gates test_ldt test_call_gate_priv test_task_gpr \
@@ -171,7 +171,7 @@ test: $(TESTS) $(BUSYBOX_FIXTURE)
 # a separate native-execution concern.
 SAN_CFLAGS := -std=gnu11 -O1 -g -Wall -Wextra -fno-omit-frame-pointer \
               -fsanitize=address,undefined -fno-sanitize-recover=all
-SAN_TESTS := test_imul_flags test_flag_diff test_string_diff test_shld test_divmul test_rotate_flags test_group_ud test_highhalf_paging test_control_regs test_sse_shift_imm test_shufps test_packuswb test_pextrw
+SAN_TESTS := test_imul_flags test_flag_diff test_string_diff test_shld test_divmul test_rotate_flags test_group_ud test_highhalf_paging test_control_regs test_sse_shift_imm test_shufps test_packuswb test_pextrw test_sse_pd_conv
 # Deeper opt-in sweep: ten more pure ISA gates were run clean under
 # ASan+UBSan. Kept out of the default gate so tandem_check stays fast.
 SAN_ALL_TESTS := $(SAN_TESTS) test_isa test_avx test_paging test_machine \

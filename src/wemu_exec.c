@@ -402,6 +402,28 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
         c->rip += in->len;
         return 0;
     }
+    /* 0F AE /0 FXSAVE and /1 FXRSTOR.  WuBuOS task_switch_asm saves the FPU
+     * state on every switch.  WEMU models x87 ST registers but not the
+     * full 512-byte image; emit and accept a bounded, honest image with
+     * the control/status words at their architectural offsets. */
+    if (full == 0x1AE && (in->modrm >> 6) != 3 &&
+        (REG(in) == 0 || REG(in) == 1)) {
+        uint64_t addr = eff_addr(c, in);
+        uint8_t image[512] = {0};
+        if (REG(in) == 0) {
+            memcpy(image, &c->x87_cw, 2);
+            memcpy(image + 4, &c->x87_sw, 2);
+            image[8] = 0x55; image[9] = 0x55; /* all tags empty */
+            image[24] = 0x80; image[25] = 0x1f; /* MXCSR defaults */
+            if (wemu_mem_write(c, addr, image, sizeof image) != 0) return -1;
+        } else {
+            if (wemu_mem_read(c, addr, image, sizeof image) != 0) return -1;
+            memcpy(&c->x87_cw, image, 2);
+            memcpy(&c->x87_sw, image + 4, 2);
+        }
+        c->rip += in->len;
+        return 0;
+    }
     if (full == 0x1AE && (in->modrm >> 6) == 3) {
         int freg = REG(in);
         if (freg == 5) c->hint_count[WEMU_HINT_LFENCE]++;
@@ -462,6 +484,28 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
     /* 0F 01 extension: /2 LGDT, /3 LIDT (memory operand only).
      * Kept before the SSE leaf so reg=2 with mod=3 (XGETBV) still reaches
      * its own handler. */
+    /* 0F 00 /1 STR and /3 LTR; /0,/2,/4,/5 remain #UD. */
+    if (full == 0x100 && (REG(in) == 1 || REG(in) == 3)) {
+        WemuTssDescriptor desc;
+        if (REG(in) == 1) {           /* STR r/m16 */
+            write_rm(c, in, 2, wemu_cpu_tr(c));
+            c->rip += in->len;
+            return 0;
+        }
+        uint16_t sel = (uint16_t)read_rm(c, in, 2);
+        if (wemu_cpu_ltr(c, sel, &desc) != 0) return -1;
+        (void)desc;
+        c->rip += in->len;
+        return 0;
+    }
+    /* 0F 01 /7 INVLPG: WEMU walks page tables on every access (no cached
+     * translations), so this is an architecturally valid no-op.  The
+     * kernel uses it after each page-table update in wubu_vmm_map_page. */
+    if (full == 0x101 && (in->modrm >> 6) != 3 && REG(in) == 7) {
+        (void)eff_addr(c, in);
+        c->rip += in->len;
+        return 0;
+    }
     if (full == 0x101 && (in->modrm >> 6) != 3 &&
         (REG(in) == 2 || REG(in) == 3)) {
         uint8_t raw[10] = {0};
@@ -524,6 +568,17 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
     case 0x5C: case 0x5D: case 0x5E: case 0x5F:
         write_reg(c, (o - 0x58) | (REX_B(in) << 3), 8, pop64(c));
         break;
+    case 0x9C: { /* pushf / pushfq: FLAGS bit 1 is architecturally set */
+        uint64_t f = c->rflags | 2u;
+        if (in->opsize == 2) push64(c, (uint16_t)f); else push64(c, f);
+        break;
+    }
+    case 0x9D: { /* popf / popfq */
+        uint64_t v = pop64(c);
+        uint64_t mask = in->opsize == 2 ? 0x0000ffffull : 0x00257fd5ull;
+        c->rflags = (c->rflags & ~mask) | (v & mask) | 2u;
+        break;
+    }
     case 0x63: { /* movsxd */
         int32_t v = (int32_t)read_rm(c, in, 4);
         write_regop(c, in, os, (uint64_t)(int64_t)v);

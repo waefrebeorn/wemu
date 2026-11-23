@@ -385,21 +385,31 @@ int wemu_cpu_ltr(WemuCpu *cpu, uint16_t selector, WemuTssDescriptor *out) {
     uint32_t limit = (uint32_t)d[0] | ((uint32_t)d[1] << 8) |
                      ((uint32_t)(d[6] & 0x0fu) << 16);
 
+    /* The descriptor base is a LINEAR address.  WuBuOS emits a higher-half
+     * TSS base, so translate it through the guest page tables before the
+     * RAM bounds check; low physical bases (bare tests) pass through. */
+    uint64_t phys_base = base;
+    if (base > cpu->ram_size) {
+        int pf = 0;
+        phys_base = wemu_translate_ex(cpu, base, 0, 0, 0, &pf);
+        if (pf) return -1;
+    }
+
     /* Bounded TSS: the limit must cover the fields loaded below and the
      * whole image must fit in guest RAM.  A bad TSS limit is #TS(selector). */
-    if (limit < TSS_MIN_LIMIT || base > cpu->ram_size ||
-        (uint64_t)limit > cpu->ram_size - base) {
+    if (limit < TSS_MIN_LIMIT || phys_base > cpu->ram_size ||
+        (uint64_t)limit > cpu->ram_size - phys_base) {
         cpu->fault = 10; cpu->fault_error = sel_err; return -1;
     }
 
     uint64_t rsp0, rsp1, rsp2;
     uint16_t ss0, ss1, ss2;
-    memcpy(&rsp0, cpu->ram + base + TSS_RSP0_OFF, 8);
-    memcpy(&rsp1, cpu->ram + base + TSS_RSP1_OFF, 8);
-    memcpy(&rsp2, cpu->ram + base + TSS_RSP2_OFF, 8);
-    memcpy(&ss0,  cpu->ram + base + TSS_SS0_OFF, 2);
-    memcpy(&ss1,  cpu->ram + base + TSS_SS1_OFF, 2);
-    memcpy(&ss2,  cpu->ram + base + TSS_SS2_OFF, 2);
+    memcpy(&rsp0, cpu->ram + phys_base + TSS_RSP0_OFF, 8);
+    memcpy(&rsp1, cpu->ram + phys_base + TSS_RSP1_OFF, 8);
+    memcpy(&rsp2, cpu->ram + phys_base + TSS_RSP2_OFF, 8);
+    memcpy(&ss0,  cpu->ram + phys_base + TSS_SS0_OFF, 2);
+    memcpy(&ss1,  cpu->ram + phys_base + TSS_SS1_OFF, 2);
+    memcpy(&ss2,  cpu->ram + phys_base + TSS_SS2_OFF, 2);
     cpu->tss_rsp[0] = rsp0; cpu->tss_rsp[1] = rsp1; cpu->tss_rsp[2] = rsp2;
     cpu->tss_ss[0]  = ss0;  cpu->tss_ss[1]  = ss1;  cpu->tss_ss[2]  = ss2;
 

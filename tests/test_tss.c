@@ -258,9 +258,28 @@ static void test_bad_descriptors(void) {
     expect_ltr_fault(c, TSS_SEL, 13, 0x00, "CPL != 0");
 }
 
+static void test_ltr_str_opcodes(void) {
+    WemuCpu *c = boot();
+    /* mov ax,TSS_SEL; ltr ax; str ax; hlt — exercises the actual 0F 00
+     * /3 and /1 opcodes the kernel uses (host wemu_cpu_ltr is not enough). */
+    uint8_t code[] = {
+        0x66,0xB8,(uint8_t)TSS_SEL,(uint8_t)(TSS_SEL >> 8),
+        0x0F,0x00,0xD8,             /* LTR AX */
+        0x0F,0x00,0xC8,             /* STR AX */
+        0xF4
+    };
+    wemu_cpu_load(c, CODE, code, sizeof code);
+    wemu_cpu_run(c, 12);
+    CHECK(wemu_cpu_fault(c) == 0, "LTR/STR opcodes faulted");
+    CHECK((uint16_t)wemu_cpu_reg(c, 0) == TSS_SEL,
+          "STR did not report the loaded TSS selector");
+    wemu_cpu_destroy(c);
+}
+
 int main(void) {
     test_tss_drives_ring0_switch();
     test_bad_descriptors();
+    test_ltr_str_opcodes();
     if (fails) {
         printf("test_tss: %d/%d CHECK(S) FAILED\n", fails, checks);
         return 1;

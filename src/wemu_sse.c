@@ -4,6 +4,7 @@
  * executes them instead of dying. One concern: vector register ops. */
 #include "wemu_internal.h"
 #include <math.h>
+#include <stdint.h>
 
 #define REX_R(in) (((in)->rex >> 2) & 1)
 #define REX_B(in) ((in)->rex & 1)
@@ -237,6 +238,41 @@ int wemu_exec_sse(WemuCpu *c, const WemuInsn *in) {
         } else {
             if (wemu_mem_write(c, wemu_eff_addr(c, in), &v, 4) != 0) return -1;
         }
+        return 1;
+    }
+    if (full == 0x114 && (sse66 || vex)) { /* (v)unpcklpd: interleave low qwords */
+        if (rm_vec(c, in, b, b + 16, nb) != 0) return -1;
+        memcpy(a, c->xmm[dst], 16);
+        if (L) memcpy(a + 16, c->ymm_hi[dst], 16);
+        for (int lane = 0; lane < (L ? 2 : 1); lane++) {
+            int base = lane * 16;
+            memcpy(d + base, a + base, 8);
+            memcpy(d + base + 8, b + base, 8);
+        }
+        memcpy(c->xmm[dst], d, 16);
+        if (L) memcpy(c->ymm_hi[dst], d + 16, 16);
+        else if (vex) memset(c->ymm_hi[dst], 0, 16);
+        return 1;
+    }
+    if (full == 0x1E6 && (sse66 || in->rep == 0xF2)) {
+        /* 66 0F E6 CVTTPD2DQ truncates; F2 0F E6 CVTPD2DQ rounds per
+         * MXCSR.  The kernel's GAAD math uses the 66 (truncating) form. */
+        if (rm_vec(c, in, b, b + 16, nb) != 0) return -1;
+        int32_t q[4] = {0, 0, 0, 0};
+        int n = L ? 4 : 2;
+        for (int i = 0; i < n; i++) {
+            double v;
+            memcpy(&v, b + i * 8, 8);
+            if (!isfinite(v) || v >= 2147483648.0 || v < -2147483648.0)
+                q[i] = INT32_MIN;
+            else
+                q[i] = sse66 ? (int32_t)v : (int32_t)nearbyint(v);
+        }
+        memcpy(d, q, 16);
+        memset(c->xmm[dst], 0, 16);
+        memcpy(c->xmm[dst], d, 16);
+        if (L) { memset(c->ymm_hi[dst], 0, 16); memcpy(c->ymm_hi[dst], d + 16, 16); }
+        else if (vex) memset(c->ymm_hi[dst], 0, 16);
         return 1;
     }
     if (full == 0x167) { /* (v)packuswb: signed words -> unsigned bytes */
