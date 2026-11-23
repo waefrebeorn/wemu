@@ -721,7 +721,7 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
     case 0xEE: wemu_port_out(c, (uint16_t)c->r[2], (uint32_t)c->r[0], 1); break;
     case 0xEF: wemu_port_out(c, (uint16_t)c->r[2], (uint32_t)c->r[0], os); break;
     case 0xE4: write_reg(c, 0, 1, wemu_port_in(c, (uint16_t)(in->imm & 0xff), 1)); break;
-    case 0xE5: write_reg(c, 0, os, wemu_port_in(c, (uint16_t)(in->imm & 0xff), os)); break;
+    case 0xE5: write_reg(c, 0, os, wemu_port_in(c, (uint16_t)in->imm, os)); break; /* imm16 port */
     case 0xEC: write_reg(c, 0, 1, wemu_port_in(c, (uint16_t)c->r[2], 1)); break;
     case 0xED: write_reg(c, 0, os, wemu_port_in(c, (uint16_t)c->r[2], os)); break;
     case 0xF6: case 0xF7: {

@@ -23,6 +23,7 @@ struct WemuCpu {
     uint8_t *ram;
     uint64_t ram_size;
     int halted;
+    void *machine_ud;        /* owning WemuMachine, for port-I/O devices */
     int fault;               /* x86 exception vector, 0 = none */
     uint64_t fault_error;    /* error code accompanying a pending fault */
     /* exception delivery (wemu_exception.c owns these): a minimal IDT of

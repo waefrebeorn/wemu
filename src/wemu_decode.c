@@ -54,7 +54,7 @@ static int imm_len_for(uint32_t op, int opsize, uint8_t modrm_reg,
     if (op >= 0xB0 && op <= 0xB7) return 1;
     if (op >= 0xA0 && op <= 0xA3) return addrsize; /* mov moffs */
     if (op == 0xE4 || op == 0xE6) return 1;        /* in/out imm8 */
-    if (op == 0xE5 || op == 0xE7) return opsize == 2 ? 2 : 4;
+    if (op == 0xE5 || op == 0xE7) return 2;            /* imm16 port */
     switch (op) {
     case 0x04: case 0x0C: case 0x14: case 0x1C:
     case 0x24: case 0x2C: case 0x34: case 0x3C:
