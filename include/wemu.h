@@ -568,6 +568,7 @@ WemuCpu *wemu_machine_cpu(WemuMachine *m);
 /* Queue bytes for the guest's COM1 RX FIFO (0x3F8 data, 0x3FD LSR bit 0).
  * Returns the number of bytes accepted; drops new bytes when full. */
 size_t wemu_machine_queue_input(WemuMachine *m, const void *data, size_t len);
+size_t wemu_machine_queue_keyboard(WemuMachine *m, const char *text);
 
 #ifdef __cplusplus
 }

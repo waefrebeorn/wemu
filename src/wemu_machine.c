@@ -17,6 +17,56 @@ struct WemuMachine {
     uint8_t pci_cfg[256];
 };
 
+/* WEMU_KBD_SEND feeds a minimal PS/2 scancode stream: port 0x64 reports
+ * output-buffer-full, port 0x60 pops make/break pairs. No IRQ is faked;
+ * the guest polls it via ps2_poll_keyboard(). */
+static uint8_t kbd_q[64];
+static unsigned kbd_head, kbd_count;
+
+static int kbd_trace_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("WEMU_KBD_TRACE") != NULL;
+    return cached;
+}
+
+static uint8_t ascii_scancode(unsigned char c) {
+    switch (c) {
+    case 'a': return 0x1e; case 'b': return 0x30; case 'c': return 0x2e;
+    case 'd': return 0x20; case 'e': return 0x12; case 'f': return 0x21;
+    case 'g': return 0x22; case 'h': return 0x23; case 'i': return 0x17;
+    case 'j': return 0x24; case 'k': return 0x25; case 'l': return 0x26;
+    case 'm': return 0x32; case 'n': return 0x31; case 'o': return 0x18;
+    case 'p': return 0x19; case 'q': return 0x10; case 'r': return 0x13;
+    case 's': return 0x1f; case 't': return 0x14; case 'u': return 0x1a;
+    case 'v': return 0x2b; case 'w': return 0x11; case 'x': return 0x2d;
+    case 'y': return 0x15; case 'z': return 0x2c;
+    case '0': return 0x0b; case '1': return 0x02; case '2': return 0x03;
+    case '3': return 0x04; case '4': return 0x05; case '5': return 0x06;
+    case '6': return 0x07; case '7': return 0x08; case '8': return 0x09;
+    case '9': return 0x0a;
+    case ' ': return 0x39; case '\n': return 0x1c; case '\r': return 0x1c;
+    default: return 0;
+    }
+}
+static void kbd_push(uint8_t sc) {
+    if (kbd_count >= sizeof kbd_q) return;
+    kbd_q[(kbd_head + kbd_count) % sizeof kbd_q] = sc;
+    kbd_count++;
+}
+
+size_t wemu_machine_queue_keyboard(WemuMachine *m, const char *text) {
+    (void)m;
+    if (!text || !*text) return 0;
+    kbd_head = kbd_count = 0;
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+        uint8_t sc = ascii_scancode(*p);
+        if (sc) { kbd_push(sc); kbd_push((uint8_t)(sc | 0x80)); }
+    }
+    kbd_push(0x1c); kbd_push(0x9c);
+    if (kbd_trace_enabled()) fprintf(stderr, "KBD queued=%u text=%s\n", kbd_count, text);
+    return kbd_count;
+}
+
 static int rx_pop(WemuMachine *m, uint8_t *out) {
     if (!m || m->count == 0) return 0;
     *out = m->rx[m->tail];
@@ -131,7 +181,18 @@ uint32_t wemu_port_in(WemuCpu *cpu, uint16_t port, int bytes) {
                                  m->pci_addr & 0xFCu, v);
         return v;
     }
-    if (port == PS2_DATA || port == PS2_STATUS) return 0;
+    if (port == PS2_STATUS) {
+        if (kbd_trace_enabled()) fprintf(stderr, "KBD rd status=%u\n", kbd_count);
+        return (uint8_t)(kbd_count ? 1u : 0u);
+    }
+    if (port == PS2_DATA) {
+        if (kbd_trace_enabled()) fprintf(stderr, "KBD rd data count=%u\n", kbd_count);
+        if (!kbd_count) return 0;
+        uint8_t sc = kbd_q[kbd_head];
+        kbd_head = (kbd_head + 1) % sizeof kbd_q;
+        kbd_count--;
+        return sc;
+    }
     return bytes == 1 ? 0xff : bytes == 2 ? 0xffff : 0xffffffffu;
 }
 
