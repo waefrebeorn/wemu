@@ -581,8 +581,10 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
     case 0xC2: c->rip = pop64(c); c->r[4] += in->imm & 0xffff;
         return 0;
     case 0xC3: c->rip = pop64(c); return 0;
-    case 0xC6: write_rm(c, in, 1, in->imm & 0xff); break;
-    case 0xC7: write_rm(c, in, os, os == 2 ? (uint64_t)(uint16_t)in->imm : (uint64_t)(int64_t)(int32_t)in->imm); break;
+    case 0xC6: if (REG(in) != 0) goto ud; /* /1-/7 are undefined */
+        write_rm(c, in, 1, in->imm & 0xff); break;
+    case 0xC7: if (REG(in) != 0) goto ud; /* /1-/7 are undefined */
+        write_rm(c, in, os, os == 2 ? (uint64_t)(uint16_t)in->imm : (uint64_t)(int64_t)(int32_t)in->imm); break;
     case 0xC9: /* leave */
         c->r[4] = c->r[5];
         c->r[5] = pop64(c);
@@ -709,10 +711,12 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
         break;
     }
     case 0xFE: {
+        int digit = REG(in);
+        if (digit > 1) goto ud; /* only /0 INC and /1 DEC are defined */
         a = is_rmw ? rmw_read(c, in, 1, eff_locked) : read_rm(c, in, 1);
-        r = wemu_mask(a + (REG(in) == 0 ? 1 : -1), 1);
+        r = wemu_mask(a + (digit == 0 ? 1 : -1), 1);
         uint64_t cf = c->rflags & WF_CF;
-        wemu_set_add_flags(c, a, 1, r, 1, 0, REG(in) != 0);
+        wemu_set_add_flags(c, a, 1, r, 1, 0, digit != 0);
         c->rflags = (c->rflags & ~WF_CF) | cf;
         if (is_rmw) rmw_write(c, in, 1, eff_locked, r);
         else write_rm(c, in, 1, r);
