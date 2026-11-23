@@ -457,10 +457,13 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
          * +4294967295: the truncated destination is unchanged but CF/OF
          * report overflow for products that fit (and vice versa). */
         int64_t av = (int64_t)(read_rm(c, in, os) << (64 - os * 8)) >> (64 - os * 8);
-        uint64_t res = wemu_mask((uint64_t)(av * sv), os);
-        int64_t full_res = av * sv;
+        /* A 64-bit signed product can overflow before truncation, so the
+         * overflow test needs a product wider than the destination. */
+        __int128 wide = (__int128)av * (__int128)sv;
+        uint64_t res = wemu_mask((uint64_t)(uint64_t)wide, os);
+        int64_t sext = (int64_t)(res << (64 - os * 8)) >> (64 - os * 8);
         uint64_t f = c->rflags & ~(WF_CF | WF_OF);
-        if (full_res != (int64_t)(res << (64 - os * 8)) >> (64 - os * 8))
+        if (wide != (__int128)sext)
             f |= WF_CF | WF_OF;
         c->rflags = f;
         write_regop(c, in, os, res);

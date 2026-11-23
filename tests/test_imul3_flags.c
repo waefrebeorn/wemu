@@ -129,12 +129,12 @@ static void one(int bytes, int op, uint64_t src, uint64_t imm_raw) {
 }
 
 int main(void) {
-    /* This gate targets ONE bug: missing SIGN EXTENSION of the r/m source
-     * in 3-operand IMUL at operand sizes below 64 bits.  REX.W (os=8) needs
-     * no sign extension, so it is deliberately out of scope here; its
-     * CF/OF use a separate shared formula with an independent issue. */
+    /* Full width coverage: 16/32-bit sign extension plus REX.W 64-bit
+     * overflow detection, which needs a product wider than 64 bits. */
     one(4, 0x69, 0xffffffffull, 2);
     one(2, 0x69, 0xffffull, 2);
+    one(8, 0x69, 0xffffffffffffffffull, 2);
+    one(8, 0x6B, 0x8000000000000000ull, 0x7f);
 
     static const uint64_t srcs[] = {
         0, 1, 2, 0x7f, 0x80, 0xff, 0x100, 0x7fff, 0x8000, 0xffff,
@@ -146,9 +146,9 @@ int main(void) {
         0, 1, 2, 3, 7, 0x7f, 0x80, 0xff, 0x7fff, 0x8000,
         0xffff, 0x7fffffff, 0x80000000, 0xffffffff
     };
-    const int widths[2] = { 2, 4 };
+    const int widths[3] = { 2, 4, 8 };
     const int ops[2] = { 0x69, 0x6B };
-    for (int w = 0; w < 2; w++) {
+    for (int w = 0; w < 3; w++) {
         int bytes = widths[w];
         uint64_t mask = bytes == 8 ? ~0ull : ((1ull << (bytes * 8)) - 1);
         for (unsigned i = 0; i < sizeof srcs / sizeof srcs[0]; i++)
@@ -165,7 +165,7 @@ int main(void) {
         printf("test_imul3_flags: %d FAILURES / %ld cases\n", fails, cases);
         return 1;
     }
-    printf("test_imul3_flags: PASS (%ld cases vs host CPU; 16/32-bit,"
+    printf("test_imul3_flags: PASS (%ld cases vs host CPU; 16/32/64-bit,"
            " 69/6B; CF/OF + full dest GPR)\n", cases);
     return 0;
 }
