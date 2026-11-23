@@ -6,11 +6,16 @@
  */
 #include "wemu_internal.h"
 #include <string.h>
+#include <stdlib.h>
 
 #define VIRTIO_BAR_BASE 0x0F000000ull
 #define VIRTIO_BAR_LEN  0x00004000ull
 #define VQ_SIZE         256u
 #define BLK_SECTORS     2048ull
+#define BLK_SECTOR_BYTES 512u
+#define VIRTIO_BLK_T_IN  0u
+#define VIRTIO_BLK_T_OUT 1u
+#define VIRTIO_BLK_T_FLUSH 4u
 
 static struct {
     uint32_t dev_feat_sel, drv_feat_sel;
@@ -18,6 +23,8 @@ static struct {
     uint8_t status;
     uint16_t queue_sel, queue_size, queue_enable, queue_notify;
     uint64_t desc, driver, device;
+    uint16_t last_avail, used_idx;
+    uint8_t *disk;
 } v;
 
 static uint8_t common_read8(unsigned off) {
@@ -81,6 +88,75 @@ void wemu_virtio_reset(void) {
     v.dev_feat[1] = 1u;      /* VIRTIO_F_VERSION_1 */
     v.queue_size = VQ_SIZE;
     v.queue_notify = 0;
+    if (!v.disk) v.disk = calloc((size_t)BLK_SECTORS, BLK_SECTOR_BYTES);
+}
+
+static uint16_t gpa_r16(WemuCpu *cpu, uint64_t gpa) {
+    uint8_t b[2] = {0, 0};
+    if (wemu_gpa_read(cpu, gpa, b, 2) != 0) return 0;
+    return (uint16_t)(b[0] | ((uint16_t)b[1] << 8));
+}
+
+static void gpa_w16(WemuCpu *cpu, uint64_t gpa, uint16_t v16) {
+    uint8_t b[2] = {(uint8_t)v16, (uint8_t)(v16 >> 8)};
+    (void)wemu_gpa_write(cpu, gpa, b, 2);
+}
+
+static void process_queue(WemuCpu *cpu) {
+    if (!v.queue_enable || !v.desc || !v.driver || !v.device || !v.disk) return;
+    uint16_t avail_idx = gpa_r16(cpu, v.driver + 2);
+    uint32_t guard = 0;
+    while (v.last_avail != avail_idx && guard++ < VQ_SIZE) {
+        uint16_t slot = (uint16_t)(v.last_avail % v.queue_size);
+        uint16_t head = gpa_r16(cpu, v.driver + 4 + (uint64_t)slot * 2);
+        uint64_t hdr = 0, data = 0, status = 0;
+        uint32_t data_len = 0;
+        uint32_t type = 0;
+        uint64_t sector = 0;
+        uint16_t cur = head, next_guard = 0;
+        while (cur < v.queue_size && next_guard++ < 8) {
+            uint8_t d[16];
+            if (wemu_gpa_read(cpu, v.desc + (uint64_t)cur * 16, d, 16) != 0) return;
+            uint64_t addr; uint32_t len; uint16_t flags, next;
+            memcpy(&addr, d, 8); memcpy(&len, d + 8, 4);
+            memcpy(&flags, d + 12, 2); memcpy(&next, d + 14, 2);
+            if (hdr == 0) {
+                uint8_t h[16] = {0};
+                if (wemu_gpa_read(cpu, addr, h, 16) != 0) return;
+                memcpy(&type, h, 4); memcpy(&sector, h + 8, 8);
+                hdr = addr;
+            } else if (data == 0 && (flags & 2u)) {
+                if (status == 0 && len == 1) { status = addr; }
+                else { data = addr; data_len = len; }
+            } else if (status == 0 && len == 1) status = addr;
+            if (!(flags & 1u)) break;
+            cur = next;
+        }
+        uint64_t off = sector * BLK_SECTOR_BYTES;
+        if (type == VIRTIO_BLK_T_IN && data && data_len &&
+            off <= (uint64_t)BLK_SECTORS * BLK_SECTOR_BYTES &&
+            data_len <= (uint64_t)BLK_SECTORS * BLK_SECTOR_BYTES - off) {
+            if (wemu_gpa_write(cpu, data, v.disk + off, data_len) != 0) return;
+        } else if (type == VIRTIO_BLK_T_OUT && data && data_len &&
+                   off <= (uint64_t)BLK_SECTORS * BLK_SECTOR_BYTES &&
+                   data_len <= (uint64_t)BLK_SECTORS * BLK_SECTOR_BYTES - off) {
+            if (wemu_gpa_read(cpu, data, v.disk + off, data_len) != 0) return;
+        }
+        if (status) {
+            uint8_t ok = 0;
+            if (type != VIRTIO_BLK_T_IN && type != VIRTIO_BLK_T_OUT &&
+                type != VIRTIO_BLK_T_FLUSH) ok = 1;
+            (void)wemu_gpa_write(cpu, status, &ok, 1);
+        }
+        uint8_t ue[8] = {0};
+        memcpy(ue, &head, 2); /* id = head (u32, low half) */
+        (void)wemu_gpa_write(cpu,
+                             v.device + 4 + (uint64_t)(v.used_idx % v.queue_size) * 8,
+                             ue, 8);
+        v.used_idx++;
+        gpa_w16(cpu, v.device + 2, v.used_idx);
+        v.last_avail++;
+    }
 }
 
 int wemu_virtio_mmio_read(WemuCpu *cpu, uint64_t gpa, void *dst, size_t len) {
@@ -108,7 +184,7 @@ int wemu_virtio_mmio_write(WemuCpu *cpu, uint64_t gpa, const void *src, size_t l
     for (size_t i = 0; i < len; i++) {
         unsigned off = (unsigned)(gpa + i - VIRTIO_BAR_BASE);
         if (off < 0x40) common_write8(off, in[i]);
-        /* notify writes are acknowledged but do not process virtqueues yet */
+        else if (off >= 0x1000 && off < 0x1002 && i == 0) process_queue(cpu);
     }
     return 0;
 }
