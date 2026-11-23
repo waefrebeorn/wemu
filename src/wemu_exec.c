@@ -748,10 +748,13 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
         } else if (full == 0x1AF) { /* imul r, rm */
             int64_t av = (int64_t)(read_regop(c, in, os) << (64 - os * 8)) >> (64 - os * 8);
             int64_t bv = (int64_t)(read_rm(c, in, os) << (64 - os * 8)) >> (64 - os * 8);
-            int64_t pr = av * bv;
+            /* A 64-bit signed product can overflow before truncation;
+             * use a wide product for the CF/OF fit test. */
+            __int128 pr = (__int128)av * (__int128)bv;
             uint64_t f = c->rflags & ~(WF_CF | WF_OF);
             int64_t trunc = (int64_t)(wemu_mask((uint64_t)pr, os) << (64 - os * 8)) >> (64 - os * 8);
-            if (pr != trunc) f |= WF_CF | WF_OF;
+            if (pr != (__int128)trunc)
+                f |= WF_CF | WF_OF;
             c->rflags = f;
             write_regop(c, in, os, wemu_mask((uint64_t)pr, os));
         } else if (full == 0x1B6 || full == 0x1BE) { /* movzx/movsx r, rm8 */

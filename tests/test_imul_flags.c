@@ -1,4 +1,4 @@
-/* test_imul3_flags.c — host-CPU differential gate for 3-operand IMUL.
+/* test_imul_flags.c — host-CPU differential gate for 3-operand IMUL.
  *
  * WEMU bug under test: the 0x69 / 0x6B handler reads the r/m source with
  * (int64_t)read_rm(c, in, os).  read_rm returns the operand ZERO-extended to
@@ -103,6 +103,20 @@ static uint64_t emu_imul(int bytes, int op, uint64_t src, uint64_t imm,
 static int fails, shown;
 static long cases;
 
+static void record(const char *tag, uint64_t src, uint64_t imm,
+                   uint64_t hr, uint64_t er, uint64_t hf, uint64_t ef) {
+    cases++;
+    if (er == hr && (ef & F_MASK) == (hf & F_MASK)) return;
+    fails++;
+    if (shown++ < 40) {
+        printf("FAIL: %s src=%llx imm=%llx | got %llx want %llx | "
+               "CF got %d want %d, OF got %d want %d\n",
+               tag, (unsigned long long)src, (unsigned long long)imm,
+               (unsigned long long)er, (unsigned long long)hr,
+               !!(ef & F_CF), !!(hf & F_CF), !!(ef & F_OF), !!(hf & F_OF));
+    }
+}
+
 static void one(int bytes, int op, uint64_t src, uint64_t imm_raw) {
     uint64_t mask = bytes == 8 ? ~0ull : ((1ull << (bytes * 8)) - 1);
     src &= mask;
@@ -115,17 +129,52 @@ static void one(int bytes, int op, uint64_t src, uint64_t imm_raw) {
     uint64_t hf, ef, hr, er;
     hr = host_imul(bytes, src, mul, &hf);
     er = emu_imul(bytes, op, src, imm_raw, &ef);
-    cases++;
-    if (er == hr && (ef & F_MASK) == (hf & F_MASK)) return;
-    fails++;
-    if (shown++ < 40) {
-        printf("FAIL: imul%s r%d,rax,imm src=%llx imm=%llx | rcx got %llx "
-               "want %llx | CF got %d want %d, OF got %d want %d\n",
-               op == 0x6B ? "8" : (bytes == 8 ? "64" : (bytes == 4 ? "32" : "16")),
-               bytes * 8, (unsigned long long)src, (unsigned long long)imm_raw,
-               (unsigned long long)er, (unsigned long long)hr,
-               !!(ef & F_CF), !!(hf & F_CF), !!(ef & F_OF), !!(hf & F_OF));
+    char tag[64];
+    snprintf(tag, sizeof tag, "imul%s r%d,rax,imm",
+             op == 0x6B ? "8" : (bytes == 8 ? "64" : (bytes == 4 ? "32" : "16")),
+             bytes * 8);
+    record(tag, src, imm_raw, hr, er, hf, ef);
+}
+
+/* 2-operand form: 0F AF /r.  modrm C1 = dest RAX, src RCX. */
+static uint64_t emu_imul2(int bytes, uint64_t src, uint64_t mul, uint64_t *fl) {
+    WemuCpu *c = wemu_cpu_create(1 << 20);
+    uint64_t mask = bytes == 8 ? ~0ull : ((1ull << (bytes * 8)) - 1);
+    uint64_t poison = 0xA5A5A5A5A5A5A5A5ull;
+    uint64_t dst = (poison & ~mask) | (src & mask);
+    uint8_t code[96]; int n = 0;
+    code[n++] = 0x48; code[n++] = 0xB8; /* mov rax, dst */
+    for (int i = 0; i < 8; i++) code[n++] = (uint8_t)(dst >> (8 * i));
+    code[n++] = 0x48; code[n++] = 0xB9; /* mov rcx, mul */
+    for (int i = 0; i < 8; i++) code[n++] = (uint8_t)(mul >> (8 * i));
+    if (bytes == 2) code[n++] = 0x66;
+    if (bytes == 8) code[n++] = 0x48;
+    code[n++] = 0x0F; code[n++] = 0xAF; code[n++] = 0xC1;
+    code[n++] = 0xF4;
+    wemu_cpu_load(c, 0x1000, code, (size_t)n);
+    wemu_cpu_set_rip(c, 0x1000);
+    wemu_cpu_set_rsp(c, 0x80000);
+    int64_t steps = wemu_cpu_run(c, 32);
+    if (steps < 0 || wemu_cpu_fault(c)) {
+        printf("FAIL: emu fault %d steps %lld (imul2 bytes=%d)\n",
+               wemu_cpu_fault(c), (long long)steps, bytes);
+        wemu_cpu_destroy(c);
+        exit(1);
     }
+    uint64_t r = wemu_cpu_reg(c, 0), f = wemu_cpu_rflags(c);
+    wemu_cpu_destroy(c);
+    *fl = f;
+    return r;
+}
+
+static void one2(int bytes, uint64_t src, uint64_t mul) {
+    uint64_t mask = bytes == 8 ? ~0ull : ((1ull << (bytes * 8)) - 1);
+    src &= mask; mul &= mask;
+    uint64_t hf, ef, hr = host_imul(bytes, src, mul, &hf);
+    uint64_t er = emu_imul2(bytes, src, mul, &ef);
+    char tag[64];
+    snprintf(tag, sizeof tag, "imul2 r%d,rax,rcx", bytes * 8);
+    record(tag, src, mul, hr, er, hf, ef);
 }
 
 int main(void) {
@@ -152,20 +201,23 @@ int main(void) {
         int bytes = widths[w];
         uint64_t mask = bytes == 8 ? ~0ull : ((1ull << (bytes * 8)) - 1);
         for (unsigned i = 0; i < sizeof srcs / sizeof srcs[0]; i++)
-            for (unsigned j = 0; j < sizeof imms / sizeof imms[0]; j++)
+            for (unsigned j = 0; j < sizeof imms / sizeof imms[0]; j++) {
                 for (int k = 0; k < 2; k++)
                     one(bytes, ops[k], srcs[i] & mask, imms[j] & 0xff);
+                one2(bytes, srcs[i] & mask, imms[j] & mask);
+            }
         for (int t = 0; t < 300; t++) {
             uint64_t s = rnd() & mask, m = rnd() & 0xff;
             if (t % 3 == 0) s = srcs[rnd() % (sizeof srcs / sizeof srcs[0])] & mask;
             for (int k = 0; k < 2; k++) one(bytes, ops[k], s, m);
+            one2(bytes, s, m);
         }
     }
     if (fails) {
-        printf("test_imul3_flags: %d FAILURES / %ld cases\n", fails, cases);
+        printf("test_imul_flags: %d FAILURES / %ld cases\n", fails, cases);
         return 1;
     }
-    printf("test_imul3_flags: PASS (%ld cases vs host CPU; 16/32/64-bit,"
-           " 69/6B; CF/OF + full dest GPR)\n", cases);
+    printf("test_imul_flags: PASS (%ld cases vs host CPU; 16/32/64-bit,"
+           " 69/6B/AF; CF/OF + full dest GPR)\n", cases);
     return 0;
 }
