@@ -110,6 +110,34 @@ static int host_backed_read(void) {
     uint8_t got[512] = {0};
     CHECK(wemu_mem_read(c, data, got, sizeof got) == 0, "data read");
     CHECK(memcmp(got, pattern, sizeof pattern) == 0, "host image bytes differ");
+
+    /* T_OUT uses a device-READABLE data descriptor. The pre-fix parser
+     * only accepted device-writable descriptors as data, so this write
+     * was silently dropped. Round-trip it through the same queue. */
+    uint8_t written[512];
+    for (size_t i = 0; i < sizeof written; i++) written[i] = (uint8_t)(255u - (unsigned)i);
+    CHECK(wemu_mem_write(c, data, written, sizeof written) == 0, "staging write");
+    uint8_t desc1_out[16];
+    CHECK(wemu_mem_read(c, desc + 16, desc1_out, 16) == 0, "desc1 read");
+    desc1_out[12] = 1; desc1_out[13] = 0; /* device-READABLE: T_OUT data */
+    CHECK(wemu_mem_write(c, desc + 16, desc1_out, 16) == 0, "OUT data flags");
+    memset(d, 0, sizeof d); d[0] = 1; d[8] = 1; /* T_OUT, sector 1 */
+    CHECK(wemu_mem_write(c, hdr, d, 16) == 0, "OUT header");
+    uint16_t idx = 2, ring = 0;
+    CHECK(wemu_mem_write(c, avail + 2, &idx, 2) == 0, "OUT idx");
+    CHECK(wemu_mem_write(c, avail + 6, &ring, 2) == 0, "OUT ring");
+    CHECK(wemu_mem_write(c, 0x0F001000, &kick, 2) == 0, "OUT notify");
+    desc1_out[12] = 3; desc1_out[13] = 0; /* device-WRITABLE: T_IN data */
+    CHECK(wemu_mem_write(c, desc + 16, desc1_out, 16) == 0, "IN data flags");
+    memset(d, 0, sizeof d); d[8] = 1; /* T_IN, sector 1 */
+    CHECK(wemu_mem_write(c, hdr, d, 16) == 0, "IN header sector 1");
+    idx = 3; ring = 0;
+    CHECK(wemu_mem_write(c, avail + 2, &idx, 2) == 0, "IN idx sector 1");
+    CHECK(wemu_mem_write(c, avail + 8, &ring, 2) == 0, "IN ring sector 1");
+    CHECK(wemu_mem_write(c, 0x0F001000, &kick, 2) == 0, "IN notify sector 1");
+    memset(got, 0, sizeof got);
+    CHECK(wemu_mem_read(c, data, got, sizeof got) == 0, "sector 1 read");
+    CHECK(memcmp(got, written, sizeof written) == 0, "T_OUT data was dropped");
     wemu_machine_destroy(m);
     unsetenv("WEMU_VIRTIO_DISK");
     unlink(path);

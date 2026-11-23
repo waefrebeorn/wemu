@@ -147,14 +147,20 @@ static void process_queue(WemuCpu *cpu) {
                 if (wemu_gpa_read(cpu, addr, h, 16) != 0) return;
                 memcpy(&type, h, 4); memcpy(&sector, h + 8, 8);
                 hdr = addr;
-            } else if (data == 0 && (flags & 2u)) {
-                if (status == 0 && len == 1) { status = addr; }
-                else { data = addr; data_len = len; }
+            } else if (data == 0 && len > 1) {
+                /* data is any non-header descriptor larger than the
+                 * one-byte status. T_IN marks it device-writable; T_OUT
+                 * marks it device-readable. Both must be accepted. */
+                data = addr; data_len = len;
             } else if (status == 0 && len == 1) status = addr;
             if (!(flags & 1u)) break;
             cur = next;
         }
         uint64_t off = sector * BLK_SECTOR_BYTES;
+        if (trace_enabled())
+            fprintf(stderr, "VTRACE req type=%u off=%llu len=%llu data=%llu\n",
+                    (unsigned)type, (unsigned long long)off,
+                    (unsigned long long)data_len, (unsigned long long)data);
         if (type == VIRTIO_BLK_T_IN && data && data_len &&
             off <= (uint64_t)BLK_SECTORS * BLK_SECTOR_BYTES &&
             data_len <= (uint64_t)BLK_SECTORS * BLK_SECTOR_BYTES - off) {
