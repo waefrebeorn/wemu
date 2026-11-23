@@ -226,6 +226,28 @@ int wemu_exec_sse(WemuCpu *c, const WemuInsn *in) {
         else memset(c->ymm_hi[dst], 0, 16);
         return 1;
     }
+    if (full == 0x1C6) { /* (v)shufps / (v)shufpd: 0F C6 /r imm8 */
+        int es = sse66 ? 8 : 4;                 /* 66 selects double precision */
+        int per_lane = 16 / es;
+        if (vex && !L) memset(c->ymm_hi[dst], 0, 16);
+        if (rm_vec(c, in, b, b + 16, nb) != 0) return -1;
+        memcpy(a, c->xmm[dst], 16);
+        if (L) memcpy(a + 16, c->ymm_hi[dst], 16);
+        for (int lane = 0; lane < (L ? 2 : 1); lane++) {
+            int base = lane * 16;
+            for (int k = 0; k < per_lane; k++) {
+                /* SHUFPS uses 2-bit selectors; SHUFPD has only two
+                 * elements per source, so each selector is ONE bit. */
+                int sel = es == 8 ? (int)((in->imm >> k) & 1)
+                                  : (int)((in->imm >> (2 * k)) & 3);
+                const uint8_t *src = (k < per_lane / 2) ? a + base : b + base;
+                memcpy(d + base + k * es, src + sel * es, (size_t)es);
+            }
+        }
+        memcpy(c->xmm[dst], d, 16);
+        if (L) memcpy(c->ymm_hi[dst], d + 16, 16);
+        return 1;
+    }
     /* binary vector ops: legacy (66 required) and VEX */
     int op = -1;
     if (o == 0xEF) op = 0;
