@@ -226,6 +226,37 @@ int wemu_exec_sse(WemuCpu *c, const WemuInsn *in) {
         else memset(c->ymm_hi[dst], 0, 16);
         return 1;
     }
+    if (full == 0x1C5) { /* (v)pextrw r/m32, xmm, imm8 */
+        int xr = (in->modrm & 7) | (REX_B(in) << 3);
+        uint16_t word = 0;
+        memcpy(&word, c->xmm[xr] + 2 * (in->imm & 7), 2);
+        uint32_t v = word; /* zero-extended into the 32-bit destination */
+        if ((in->modrm >> 6) == 3) {
+            int gpr = REG(in) | (REX_R(in) << 3);
+            c->r[gpr] = v;
+        } else {
+            if (wemu_mem_write(c, wemu_eff_addr(c, in), &v, 4) != 0) return -1;
+        }
+        return 1;
+    }
+    if (full == 0x167) { /* (v)packuswb: signed words -> unsigned bytes */
+        if (rm_vec(c, in, b, b + 16, nb) != 0) return -1;
+        memcpy(a, c->xmm[dst], 16);
+        if (L) memcpy(a + 16, c->ymm_hi[dst], 16);
+        for (int lane = 0; lane < (L ? 2 : 1); lane++) {
+            int base = lane * 16;
+            for (int k = 0; k < 16; k++) {
+                const uint8_t *src = k < 8 ? a + base : b + base;
+                int16_t v;
+                memcpy(&v, src + 2 * (k & 7), 2);
+                d[base + k] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+            }
+        }
+        memcpy(c->xmm[dst], d, 16);
+        if (L) memcpy(c->ymm_hi[dst], d + 16, 16);
+        else if (vex) memset(c->ymm_hi[dst], 0, 16);
+        return 1;
+    }
     if (full == 0x1C6) { /* (v)shufps / (v)shufpd: 0F C6 /r imm8 */
         int es = sse66 ? 8 : 4;                 /* 66 selects double precision */
         int per_lane = 16 / es;
