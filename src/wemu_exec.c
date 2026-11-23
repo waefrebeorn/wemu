@@ -452,7 +452,11 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
     case 0x69: case 0x6B: {
         int64_t sv = full == 0x69 ? (int64_t)(int32_t)in->imm
                                   : (int64_t)(int8_t)in->imm;
-        int64_t av = (int64_t)read_rm(c, in, os);
+        /* read_rm zero-extends to 64 bits; 3-operand IMUL takes a SIGNED
+         * r/m source.  Without this, 0xffffffff (i.e. -1) is read as
+         * +4294967295: the truncated destination is unchanged but CF/OF
+         * report overflow for products that fit (and vice versa). */
+        int64_t av = (int64_t)(read_rm(c, in, os) << (64 - os * 8)) >> (64 - os * 8);
         uint64_t res = wemu_mask((uint64_t)(av * sv), os);
         int64_t full_res = av * sv;
         uint64_t f = c->rflags & ~(WF_CF | WF_OF);
