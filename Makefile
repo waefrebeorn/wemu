@@ -172,6 +172,11 @@ test: $(TESTS) $(BUSYBOX_FIXTURE)
 SAN_CFLAGS := -std=gnu11 -O1 -g -Wall -Wextra -fno-omit-frame-pointer \
               -fsanitize=address,undefined -fno-sanitize-recover=all
 SAN_TESTS := test_imul_flags test_flag_diff test_string_diff test_shld test_divmul
+# Deeper opt-in sweep: ten more pure ISA gates were run clean under
+# ASan+UBSan. Kept out of the default gate so tandem_check stays fast.
+SAN_ALL_TESTS := $(SAN_TESTS) test_isa test_avx test_paging test_machine \
+                 test_cpuid test_sse2 test_x87 test_btmem \
+                 test_rep_fault_restart test_isa_atomic_fence
 test_sanitize:
 	@set -e; mkdir -p build-san; for t in $(SAN_TESTS); do \
 	    echo "--- sanitized: $$t"; \
@@ -179,6 +184,9 @@ test_sanitize:
 	    ASAN_OPTIONS=detect_leaks=0 build-san/$$t; \
 	done
 	@echo "WEMU SANITIZE PASS: $(words $(SAN_TESTS)) differential gates under ASan+UBSan"
+
+test_sanitize_all:
+	@$(MAKE) test_sanitize SAN_TESTS="$(SAN_ALL_TESTS)"
 
 STATIC_SRCS := $(wildcard src/*.c)
 static_check:
@@ -198,4 +206,4 @@ clean:
 	rm -rf build-san
 
 -include $(OBJ:.o=.d)
-.PHONY: all test test-clean clean static_check test_sanitize
+.PHONY: all test test-clean clean static_check test_sanitize test_sanitize_all
