@@ -166,6 +166,20 @@ test: $(TESTS) $(BUSYBOX_FIXTURE)
 	done
 	@echo "ALL WEMU GATES PASS"
 
+# Sanitizer leg: rebuild the emulator core and pure ISA differential tests
+# with ASan+UBSan. Excludes usermode/SIGSYS tests, whose trap children are
+# a separate native-execution concern.
+SAN_CFLAGS := -std=gnu11 -O1 -g -Wall -Wextra -fno-omit-frame-pointer \
+              -fsanitize=address,undefined -fno-sanitize-recover=all
+SAN_TESTS := test_imul_flags test_flag_diff test_string_diff test_shld test_divmul
+test_sanitize:
+	@set -e; mkdir -p build-san; for t in $(SAN_TESTS); do \
+	    echo "--- sanitized: $$t"; \
+	    gcc $(SAN_CFLAGS) -Iinclude -Isrc $(SRC) tests/$$t.c -o build-san/$$t -lm; \
+	    ASAN_OPTIONS=detect_leaks=0 build-san/$$t; \
+	done
+	@echo "WEMU SANITIZE PASS: $(words $(SAN_TESTS)) differential gates under ASan+UBSan"
+
 STATIC_SRCS := $(wildcard src/*.c)
 static_check:
 	@set -e; for f in $(STATIC_SRCS); do \
@@ -181,6 +195,7 @@ test-clean:
 
 clean:
 	rm -f $(OBJ) $(OBJ:.o=.d) libwemu.a $(TESTS) $(PIE_BINS) $(C3_FIX) $(SANDBOX_BIN) $(ISOLATE_BIN) $(BUSYBOX_FIXTURE)
+	rm -rf build-san
 
 -include $(OBJ:.o=.d)
-.PHONY: all test test-clean clean static_check
+.PHONY: all test test-clean clean static_check test_sanitize

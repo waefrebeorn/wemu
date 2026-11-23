@@ -24,3 +24,13 @@ jobs:
             echo "::error::WEMU gates failed rc=$rc TAIL: $(tail -c 1600 /tmp/wemu-gates.log | tr '\n' ' ')"
           fi
           exit "$rc"
+      - name: ASan + UBSan differential gates
+        shell: bash
+        run: |
+          set +e
+          make test_sanitize 2>&1 | tee /tmp/wemu-sanitize.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::WEMU sanitizer gate failed rc=$rc: $(tail -c 1600 /tmp/wemu-sanitize.log | tr '\n' ' ')"
+          fi
+          exit "$rc"

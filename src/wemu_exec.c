@@ -660,9 +660,17 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
                 write_reg(c, 2, 8, (uint64_t)(n % (int64_t)a));
             } else {
                 int bits = bytes * 8;
-                int64_t n = (int64_t)((muldiv_hi_read(c, bytes) << bits) |
-                                      wemu_mask(c->r[0], bytes));
-                n = (n << (64 - bits * 2)) >> (64 - bits * 2);
+                /* The dividend is the 2*bits-bit pair HI:LO. */
+                uint64_t wide = ((uint64_t)muldiv_hi_read(c, bytes) << bits) |
+                                wemu_mask(c->r[0], bytes);
+                /* Sign-extend the 2*bits-bit dividend explicitly; shifting
+                 * a signed 64-bit value is UB, and shifting in __int128
+                 * without the sign-bit test stays positive. */
+                int total_bits = bits * 2;
+                __int128 s = (__int128)wide;
+                if (s & ((__int128)1 << (total_bits - 1)))
+                    s -= (__int128)1 << total_bits;
+                int64_t n = (int64_t)s;
                 int64_t av = (int64_t)(a << (64 - bits)) >> (64 - bits);
                 int64_t q = n / av;
                 if (q != (int64_t)(wemu_mask((uint64_t)q, bytes) << (64 - bits)) >> (64 - bits)) {
