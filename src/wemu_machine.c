@@ -52,7 +52,7 @@ static void pci_cfg_init(uint8_t *cfg) {
     memset(cfg, 0, 64);                  /* bus 0 dev 0 fn 0: our device */
     pci_cfg_put32(cfg, 0x00, ((uint32_t)VIRTIO_BLK_MODERN << 16) | VIRTIO_VENDOR);
     pci_cfg_put32(cfg, 0x04, 0x00100000u); /* CAPS bit expected by the driver */
-    pci_cfg_put32(cfg, 0x08, 0x01080000u); /* mass-storage, 0x08, prog 0 */
+    pci_cfg_put32(cfg, 0x08, 0x01800000u); /* mass-storage, subclass 0x80 (other) */
     cfg[0x0C] = 0x00;                    /* header type 0 */
     pci_cfg_put32(cfg, 0x20, 0x0F000000u); /* BAR4: 16 KiB MMIO at 0x0F000000 */
     cfg[0x34] = 0x40;                    /* capability list head */

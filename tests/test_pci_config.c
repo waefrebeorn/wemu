@@ -32,9 +32,9 @@ static uint32_t read_cfg(uint32_t addr) {
 
 int main(void) {
     CHECK(read_cfg(0x80000000u) == 0x10421af4u, "wrong vendor/device ID");
-    CHECK(read_cfg(0x80000008u) == 0x01080000u, "wrong class code");
+    CHECK(read_cfg(0x80000008u) == 0x01800000u, "wrong class code");
     CHECK((read_cfg(0x80000034u) & 0xffu) == 0x40u, "wrong capability pointer");
     CHECK(read_cfg(0x80000800u) == 0xffffffffu, "empty function not all-ones");
-    printf("test_pci_config: PASS (1af4:1042, class 01:08, caps @40)\n");
+    printf("test_pci_config: PASS (1af4:1042, class 01:80, caps @40)\n");
     return 0;
 }
