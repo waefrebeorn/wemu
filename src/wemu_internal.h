@@ -35,6 +35,7 @@ struct WemuCpu {
     int cs_rpl;              /* RPL of the modelled current CS selector */
     uint16_t cs_selector;    /* modelled current CS selector (reset 0x28) */
     uint16_t ss_selector;    /* modelled current SS selector (reset 0) */
+    uint16_t ds_selector, es_selector, fs_selector, gs_selector;
     uint64_t ist[8];         /* IST stack bases (1..7; 0 reserved) */
     unsigned exc_vector;     /* last delivered vector (0 = none yet) */
     uint64_t exc_error;      /* last delivered error code */

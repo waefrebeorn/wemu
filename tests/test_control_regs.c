@@ -47,7 +47,17 @@ int main(void) {
     CHECK(c->gdt.configured && c->gdt.limit == 0x17 && c->gdt.base == base,
           "lgdt loaded wrong descriptor");
 
-    printf("test_control_regs: %s (CR0/CR3 round trip + LGDT)\n", fails ? "FAIL" : "PASS");
+    /* MOV DS/SS, ax — the next 32-bit crt0 step after LGDT. */
+    wemu_cpu_set_reg(c, 0, 0x10);
+    { const uint8_t code[] = { 0x8e, 0xd8 }; /* mov ds,ax */
+      run(c, code, sizeof code, "mov ds,ax faulted"); }
+    CHECK(c->ds_selector == 0x10, "mov ds,ax wrong selector");
+    wemu_cpu_set_reg(c, 0, 0x18);
+    { const uint8_t code[] = { 0x8e, 0xd0 }; /* mov ss,ax */
+      run(c, code, sizeof code, "mov ss,ax faulted"); }
+    CHECK(c->ss_selector == 0x18, "mov ss,ax wrong selector");
+
+    printf("test_control_regs: %s (CR0/CR3, LGDT, DS/SS loads)\n", fails ? "FAIL" : "PASS");
     wemu_cpu_destroy(c);
     return fails ? 1 : 0;
 }

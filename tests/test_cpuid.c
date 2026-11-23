@@ -46,6 +46,22 @@ int main(void) {
         CHECK((wemu_cpu_reg(c, 3) >> 5) & 1, "leaf7 EBX AVX2 claimed");
         wemu_cpu_destroy(c);
     }
+    /* extended leaves: WEMU executes 64-bit code, so claim long mode.
+     * The WuBuOS crt0 refuses to boot when CPUID.80000001:EDX[29] is 0. */
+    {
+        uint8_t code[] = { 0xB8,0x00,0x00,0x00,0x80, 0x0F,0xA2, 0xF4 };
+        WemuCpu *c = boot(code, sizeof code);
+        wemu_cpu_run(c, 10);
+        CHECK(wemu_cpu_reg(c, 0) == 0x80000001ull, "max extended leaf");
+        wemu_cpu_destroy(c);
+    }
+    {
+        uint8_t code[] = { 0xB8,0x01,0x00,0x00,0x80, 0x0F,0xA2, 0xF4 };
+        WemuCpu *c = boot(code, sizeof code);
+        wemu_cpu_run(c, 10);
+        CHECK((wemu_cpu_reg(c, 2) >> 29) & 1, "extended leaf LM claimed");
+        wemu_cpu_destroy(c);
+    }
     /* xgetbv(0) = 7: x87+SSE+AVX state — guests enable AVX only if so */
     {
         uint8_t code[] = { 0x48,0x31,0xC9, 0x0F,0x01,0xD0, 0xF4 };

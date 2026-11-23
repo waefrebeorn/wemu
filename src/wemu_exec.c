@@ -500,6 +500,17 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
         else c->efer = v;
         break;
     }
+    case 0x8E: { /* MOV Sreg, r/m16 — kernel crt0 loads DS/ES/SS */
+        int sreg = REG(in);
+        if (sreg == 1) goto ud; /* MOV CS, r/m is #UD */
+        uint16_t sel = (uint16_t)read_rm(c, in, 2);
+        if (sreg == 0) c->es_selector = sel;
+        else if (sreg == 2) c->ss_selector = sel;
+        else if (sreg == 3) c->ds_selector = sel;
+        else if (sreg == 4) c->fs_selector = sel;
+        else c->gs_selector = sel;
+        break;
+    }
     case 0x50: case 0x51: case 0x52: case 0x53:
     case 0x54: case 0x55: case 0x56: case 0x57:
         push64(c, c->r[(o - 0x50) | (REX_B(in) << 3)]);
@@ -1000,6 +1011,13 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
                 /* ECX: SSE3 SSSE3 XSAVE OSXSAVE POPCNT SSE4.1 SSE4.2 AVX */
                 c->r[1] = (1ull<<0)|(1ull<<9)|(1ull<<26)|(1ull<<27)|(1ull<<23)|
                           (1ull<<19)|(1ull<<20)|(1ull<<28);
+            } else if (leaf == 0x80000000) {
+                c->r[0] = 0x80000001; /* max extended leaf */
+                c->r[3] = c->r[1] = c->r[2] = 0;
+            } else if (leaf == 0x80000001) {
+                /* WEMU executes 64-bit code, so long mode must be claimed. */
+                c->r[0] = 0; c->r[3] = 0; c->r[1] = 0;
+                c->r[2] = 1ull << 29; /* EDX: LM */
             } else if (leaf == 7) {
                 c->r[0] = 0; /* max subleaf */
                 c->r[3] = (1ull<<5); /* EBX: AVX2 — the founding gap, owned */
