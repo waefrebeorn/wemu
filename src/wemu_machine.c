@@ -61,6 +61,48 @@ static void kbd_push(uint8_t sc) {
     kbd_count++;
 }
 
+/* ---- 8042 controller model ------------------------------------------
+ * The controller answers on the SAME output buffer as the keyboard data, so
+ * its replies (self-test 0x55, ACK 0xFA, the config byte) share one FIFO
+ * with the injected scancodes -- that is what real hardware does, and the
+ * guest drains it before it starts polling for keys. Without this the
+ * guest's ps2_self_test() waited out its 25 ms bound: 125k guest steps
+ * (8% of the boot) spent proving an absent controller. */
+static uint8_t ps2_cfg = 0x04;  /* controller config: both clocks enabled */
+static int ps2_want_cfg;        /* next 0x60 write is the config byte */
+static int ps2_aux_next;        /* 0xD4 seen: next 0x60 byte goes to the mouse */
+
+static void kbd_push_cmd(uint16_t cmd) {
+    switch (cmd) {
+    case 0xAA: kbd_push(0x55); break;        /* self-test: pass */
+    case 0xAB: kbd_push(0x00); break;        /* interface test: pass */
+    case 0xA9: kbd_push(0x00); break;        /* aux port test: pass */
+    case 0x20: kbd_push(ps2_cfg); break;     /* read config byte */
+    case 0x60: ps2_want_cfg = 1; break;      /* next 0x60 write stores it */
+    case 0xD4: ps2_aux_next = 1; break;      /* next 0x60 byte -> mouse */
+    case 0xFF: kbd_push(0xFA); kbd_push(0xAA); break;  /* reset: ACK, BAT ok */
+    case 0xFE: kbd_push(0xFE); break;        /* resend */
+    default: break;                          /* A7/A8/AD/AE/D2/D3: silent */
+    }
+}
+
+/* A byte written to 0x60: the config byte, or a command to the device. */
+static void kbd_push_data(uint16_t b) {
+    if (ps2_want_cfg) { ps2_cfg = (uint8_t)b; ps2_want_cfg = 0; return; }
+    if (ps2_aux_next) {                      /* mouse: ACK, then its ID */
+        ps2_aux_next = 0;
+        kbd_push(0xFA);
+        if ((b & 0xFF) == 0xF2) kbd_push(0x00);   /* standard 3-byte mouse */
+        return;
+    }
+    switch (b & 0xFF) {
+    case 0xF2: kbd_push(0xFA); kbd_push(0xAB); kbd_push(0x83); break;
+    case 0xF4: case 0xF5: case 0xF0: kbd_push(0xFA); break;
+    case 0xFF: kbd_push(0xFA); kbd_push(0xAA); break;  /* device reset */
+    default: break;                          /* 0xED/0xE0 etc: silent */
+    }
+}
+
 size_t wemu_machine_queue_keyboard(WemuMachine *m, const char *text) {
     (void)m;
     if (!text || !*text) return 0;
@@ -172,6 +214,8 @@ void wemu_port_out(WemuCpu *cpu, uint16_t port, uint32_t val, int bytes) {
         cpu->serial_out((uint8_t)val, cpu->serial_ud);
     if (port == COM2_DATA && m && m->com2_out)
         m->com2_out((uint8_t)val, m->com2_ud);
+    if (port == PS2_STATUS) { kbd_push_cmd(val & 0xFFu); return; }
+    if (port == PS2_DATA)   { kbd_push_data(val & 0xFFu); return; }
     /* other ports: no device attached yet — writes are dropped honestly */
 }
 
