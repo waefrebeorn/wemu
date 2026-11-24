@@ -15,6 +15,13 @@ struct WemuMachine {
     size_t head, tail, count;
     uint32_t pci_addr;
     uint8_t pci_cfg[256];
+    /* COM2 (0x2F8): the 9P link. Host -> guest via the ring below, guest ->
+     * host via com2_out. Separate from COM1 so the debug log and the 9P wire
+     * never interleave (WuBuOS dedicates COM2 to /n). */
+    uint8_t  c2rx[4096];
+    size_t   c2head, c2tail, c2count;
+    WemuSerialFn com2_out;
+    void        *com2_ud;
 };
 
 /* WEMU_KBD_SEND feeds a minimal PS/2 scancode stream: port 0x64 reports
@@ -85,6 +92,10 @@ static int rx_pop(WemuMachine *m, uint8_t *out) {
 #define COM1_DATA 0x3F8
 #define COM1_IER  0x3F9
 #define COM1_LSR  0x3FD
+
+/* COM2 registers (the 9P link) */
+#define COM2_DATA 0x2F8
+#define COM2_LSR  0x2FD
 
 static void pci_cfg_put32(uint8_t *cfg, unsigned off, uint32_t v) {
     if (off > 252) return;
@@ -159,6 +170,8 @@ void wemu_port_out(WemuCpu *cpu, uint16_t port, uint32_t val, int bytes) {
     }
     if (port == COM1_DATA && cpu->serial_out)
         cpu->serial_out((uint8_t)val, cpu->serial_ud);
+    if (port == COM2_DATA && m && m->com2_out)
+        m->com2_out((uint8_t)val, m->com2_ud);
     /* other ports: no device attached yet — writes are dropped honestly */
 }
 
@@ -169,6 +182,15 @@ uint32_t wemu_port_in(WemuCpu *cpu, uint16_t port, int bytes) {
     if (port == COM1_DATA) {
         uint8_t b = 0;
         (void)rx_pop(m, &b);
+        return b;
+    }
+    if (port == COM2_LSR)
+        return (m && m->c2count) ? 0x61u : 0x60u;  /* DR | THR empty | TSRE */
+    if (port == COM2_DATA) {
+        if (!m || !m->c2count) return 0;
+        uint8_t b = m->c2rx[m->c2tail];
+        m->c2tail = (m->c2tail + 1) % sizeof m->c2rx;
+        m->c2count--;
         return b;
     }
     if (port == PCI_CONFIG_DATA) {
@@ -204,6 +226,25 @@ size_t wemu_machine_queue_input(WemuMachine *m, const void *data, size_t len) {
         m->rx[m->head] = p[i];
         m->head = (m->head + 1) % COM1_RX_SIZE;
         m->count++;
+        accepted++;
+    }
+    return accepted;
+}
+
+void wemu_machine_set_com2(WemuMachine *m, WemuSerialFn out, void *ud) {
+    if (!m) return;
+    m->com2_out = out;
+    m->com2_ud = ud;
+}
+
+size_t wemu_machine_com2_push(WemuMachine *m, const void *data, size_t len) {
+    if (!m || !data) return 0;
+    const uint8_t *p = data;
+    size_t accepted = 0;
+    for (size_t i = 0; i < len && m->c2count < sizeof m->c2rx; i++) {
+        m->c2rx[m->c2head] = p[i];
+        m->c2head = (m->c2head + 1) % sizeof m->c2rx;
+        m->c2count++;
         accepted++;
     }
     return accepted;

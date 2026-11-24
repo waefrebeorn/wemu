@@ -568,6 +568,12 @@ WemuCpu *wemu_machine_cpu(WemuMachine *m);
 /* Queue bytes for the guest's COM1 RX FIFO (0x3F8 data, 0x3FD LSR bit 0).
  * Returns the number of bytes accepted; drops new bytes when full. */
 size_t wemu_machine_queue_input(WemuMachine *m, const void *data, size_t len);
+
+/* COM2 (0x2F8) is the 9P link: guest TX bytes go to `out`, and the host
+ * pushes RX bytes with wemu_machine_com2_push(). Kept separate from COM1 so
+ * the debug log and the 9P wire never interleave. */
+void   wemu_machine_set_com2(WemuMachine *m, WemuSerialFn out, void *ud);
+size_t wemu_machine_com2_push(WemuMachine *m, const void *data, size_t len);
 size_t wemu_machine_queue_keyboard(WemuMachine *m, const char *text);
 
 #ifdef __cplusplus
