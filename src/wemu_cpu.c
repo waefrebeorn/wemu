@@ -2,6 +2,7 @@
  * syscall dispatch. One concern: the architectural state machine. */
 #include "wemu_internal.h"
 #include <stdlib.h>
+#include <stdio.h>
 
 uint64_t wemu_mask(uint64_t v, int bytes) {
     if (bytes >= 8) return v;
@@ -77,11 +78,48 @@ WemuCpu *wemu_cpu_create(uint64_t ram_size) {
     cpu->ss_selector = 0;     /* legacy frame convention: SS slot reads 0 */
     cpu->x87_cw = 0x037F;     /* x87 reset: all exceptions masked, round-nearest */
     cpu->r[4] = ram_size - 0x1000; /* default stack near RAM top */
+    if (getenv("WEMU_PROFILE")) {
+        cpu->hist = calloc(WEMU_PROFILE_BUCKETS, sizeof *cpu->hist);
+        if (cpu->hist) cpu->profile = 1;
+    }
     return cpu;
 }
 
 void wemu_cpu_destroy(WemuCpu *cpu) {
     if (!cpu) return;
+    if (cpu->profile && cpu->hist) {
+        /* Top buckets by step count -> addr2line them. */
+        enum { TOP = 16 };
+        uint32_t best[TOP] = {0};
+        uint64_t bestn[TOP] = {0};
+        for (uint32_t i = 0; i < WEMU_PROFILE_BUCKETS; i++) {
+            if (!cpu->hist[i]) continue;
+            for (int k = 0; k < TOP; k++) {
+                if (cpu->hist[i] > bestn[k]) {
+                    for (int j = TOP - 1; j > k; j--) {
+                        bestn[j] = bestn[j - 1];
+                        best[j] = best[j - 1];
+                    }
+                    bestn[k] = cpu->hist[i];
+                    best[k] = i;
+                    break;
+                }
+            }
+        }
+        fprintf(stderr, "[profile] total=%llu steps\n",
+                (unsigned long long)cpu->prof_total);
+        for (int k = 0; k < TOP && bestn[k]; k++) {
+            /* the bucket keeps the LOW pc bits; report a 64-byte-aligned
+             * offset usable with `addr2line -e kernel.elf`. */
+            uint64_t off = (uint64_t)best[k] << 6;
+            fprintf(stderr, "[profile] %8.3f%%  %12llu  pc_low=%llx\n",
+                    100.0 * (double)bestn[k] / (double)cpu->prof_total,
+                    (unsigned long long)bestn[k],
+                    (unsigned long long)off);
+        }
+        free(cpu->hist);
+        cpu->hist = NULL;
+    }
     free(cpu->ram);
     free(cpu);
 }
@@ -243,6 +281,13 @@ int64_t wemu_cpu_run(WemuCpu *cpu, uint64_t max_insns) {
      * so it can be delivered to a registered handler.  With no handler
      * step() returns -1 and the loop breaks — the old stopping behaviour. */
     while ((uint64_t)n < max_insns && !cpu->halted) {
+        if (cpu->profile) {
+            /* PC histogram: where does the guest actually spend its steps?
+             * 64-byte buckets keyed by the low bits of the PC, dumped at
+             * destroy. Resolve the top buckets with addr2line. */
+            cpu->hist[(cpu->rip >> 6) & (WEMU_PROFILE_BUCKETS - 1)]++;
+            cpu->prof_total++;
+        }
         if (wemu_cpu_step(cpu) < 0) break;
         n++;
     }

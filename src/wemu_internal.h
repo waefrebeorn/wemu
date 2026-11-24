@@ -7,6 +7,9 @@
 
 #define WEMU_RAM_MAX (1ull << 32)
 
+/* PC-histogram buckets for WEMU_PROFILE=1 (64-byte granularity). */
+#define WEMU_PROFILE_BUCKETS 65536u
+
 struct WemuCpu {
     uint64_t r[16];          /* RAX RCX RDX RBX RSP RBP RSI RDI R8..R15 */
     uint64_t rip;
@@ -26,6 +29,11 @@ struct WemuCpu {
     void *machine_ud;        /* owning WemuMachine, for port-I/O devices */
     int (*mmio_read)(WemuCpu *cpu, uint64_t gpa, void *dst, size_t len);
     int (*mmio_write)(WemuCpu *cpu, uint64_t gpa, const void *src, size_t len);
+    /* PC histogram (WEMU_PROFILE=1): where the guest spends its steps. */
+    int       profile;
+    uint32_t  prof_bucket_shift;
+    uint32_t *hist;
+    uint64_t  prof_total;
     int fault;               /* x86 exception vector, 0 = none */
     uint64_t fault_error;    /* error code accompanying a pending fault */
     /* exception delivery (wemu_exception.c owns these): a minimal IDT of
