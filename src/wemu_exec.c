@@ -530,18 +530,18 @@ int wemu_exec(WemuCpu *c, const WemuInsn *in) {
     /* LGDT/LIDT: kernel boot loads its own descriptor tables. */
     /* Control registers: kernel boot needs MOV CRn <-> GPR. The decoder
      * already reads ModRM for 0F 20/22; only the handlers were missing. */
-    case 0x120: { /* MOV r64, CRn — reg=CRn, rm=GPR */
+    case 0x120: { /* MOV r64, CRn — reg=CRn, rm=GPR (+REX.B) */
         int cr = REG(in);
         if (cr == 1 || cr == 5 || cr == 6 || cr == 7) goto ud;
         uint64_t v = cr == 0 ? c->cr0 : cr == 2 ? c->cr2 :
                      cr == 3 ? c->cr3 : cr == 4 ? c->cr4 : c->efer;
-        write_reg(c, in->modrm & 7, 8, v);
+        write_reg(c, (in->modrm & 7) | (REX_B(in) << 3), 8, v);
         break;
     }
-    case 0x122: { /* MOV CRn, r64 — reg=CRn, rm=GPR */
+    case 0x122: { /* MOV CRn, r64 — reg=CRn, rm=GPR (+REX.B) */
         int cr = REG(in);
         if (cr == 1 || cr == 5 || cr == 6 || cr == 7) goto ud;
-        uint64_t v = c->r[in->modrm & 7];
+        uint64_t v = c->r[(in->modrm & 7) | (REX_B(in) << 3)];
         if (cr == 0) c->cr0 = v;
         else if (cr == 2) c->cr2 = v;
         else if (cr == 3) c->cr3 = v & 0x000ffffffffff000ull;

@@ -40,6 +40,18 @@ int main(void) {
       run(c, code, sizeof code, "mov rbx,cr3 faulted"); }
     CHECK(wemu_cpu_reg(c, 1) == 0x12345000ull, "mov rbx,cr3 wrong value");
 
+    /* REX.B: the extended registers. Encodings 0F 20/22 carry the GPR in
+     * ModRM.rm (+REX.B); dropping REX.B silently puts the value in rcx
+     * instead of r9. Found by the kernel's live-CR3 walk. */
+    wemu_cpu_set_reg(c, 9, 0);
+    { const uint8_t code[] = { 0x49, 0x0f, 0x20, 0xd9 }; /* mov r9,cr3 */
+      run(c, code, sizeof code, "mov r9,cr3 faulted"); }
+    CHECK(wemu_cpu_reg(c, 9) == 0x12345000ull, "mov r9,cr3 wrong value");
+    wemu_cpu_set_reg(c, 9, 0x7654000ull);
+    { const uint8_t code[] = { 0x49, 0x0f, 0x22, 0xd9 }; /* mov cr3,r9 */
+      run(c, code, sizeof code, "mov cr3,r9 faulted"); }
+    CHECK(c->cr3 == 0x7654000ull, "mov cr3,r9 wrong value");
+
     /* LGDT [rax] reads the 16:64 descriptor and loads GDTR. */
     uint8_t desc[10] = { 0x17, 0x00 };
     uint64_t base = 0x2100ull;
