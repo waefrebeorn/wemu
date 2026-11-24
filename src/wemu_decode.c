@@ -2,6 +2,7 @@
  * VEX (2/3-byte), opcode maps (1-byte / 0F / 0F38 / 0F3A), ModRM, SIB,
  * displacements, immediates. One concern: bytes -> WemuInsn. */
 #include "wemu_internal.h"
+#include <stdio.h>
 
 typedef struct {
     WemuCpu *cpu;
@@ -14,19 +15,32 @@ typedef struct {
 
 static int fetch(Fetch *f, int need) {
     if (f->faulted) return -1;
-    if (f->n - f->pos >= need) return 0;
-    int have = f->n - f->pos;
-    /* Instruction fetch owns the #PF I/D bit: route through the fetch
-     * reader (is_fetch=1), not the generic data reader.  Once a fetch
-     * faults, keep CR2 at the FIRST faulting address (the SDM reports the
-     * faulting instruction, not a later speculative decode byte). */
-    if (wemu_mem_fetch(f->cpu, f->va + f->pos, f->buf + f->pos,
-                       (size_t)(need - have)) != 0) {
-        f->faulted = 1;
-        return -1;
+    if (need <= f->n) return 0;             /* n = valid bytes from f->va */
+
+    /* Grow the window from what we already have, clipped at the page end and
+     * bounded by the 16-byte buffer. The old code fetched `need` bytes per
+     * call at va+pos, so a 6-byte instruction walked the page tables once per
+     * decoded byte -- that repeated walk was most of a step's host cost
+     * (measured ~7M guest steps/s). One instruction is at most 15 bytes, so a
+     * single 16-byte window covers it; clipping at the page boundary keeps a
+     * decode that finishes early from faulting on a page it never touched.
+     * Instruction fetch owns the #PF I/D bit: route through the fetch reader
+     * (is_fetch=1), not the generic data reader.  Once a fetch faults, keep
+     * CR2 at the FIRST faulting address (the SDM reports the faulting
+     * instruction, not a later speculative decode byte). */
+    while (need > f->n && f->n < (int)sizeof f->buf) {
+        uint64_t va = f->va + (uint64_t)f->n;
+        size_t page_left = (size_t)(0x1000 - (va & 0xfff));
+        size_t room = sizeof f->buf - (size_t)f->n;
+        size_t want = page_left < room ? page_left : room;
+        if (want == 0) { f->faulted = 1; return -1; }
+        if (wemu_mem_fetch(f->cpu, va, f->buf + f->n, want) != 0) {
+            f->faulted = 1;
+            return -1;
+        }
+        f->n += (int)want;
     }
-    f->n = f->pos + need;
-    return 0;
+    return (need <= f->n) ? 0 : -1;
 }
 
 static uint8_t peek(Fetch *f) {
