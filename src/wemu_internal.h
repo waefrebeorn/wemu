@@ -29,6 +29,10 @@ struct WemuCpu {
     void *machine_ud;        /* owning WemuMachine, for port-I/O devices */
     int (*mmio_read)(WemuCpu *cpu, uint64_t gpa, void *dst, size_t len);
     int (*mmio_write)(WemuCpu *cpu, uint64_t gpa, const void *src, size_t len);
+    /* The device window the hooks cover. Every guest byte of RAM used to be
+     * offered to the MMIO hook first (~11 calls per guest step, measured), so
+     * one range test here keeps RAM accesses off the indirect call. */
+    uint64_t mmio_lo, mmio_hi;
     /* PC histogram (WEMU_PROFILE=1): where the guest spends its steps. */
     int       profile;
     uint32_t  prof_bucket_shift;

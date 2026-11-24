@@ -12,6 +12,12 @@
 
 #define VIRTIO_BAR_BASE 0x0F000000ull
 #define VIRTIO_BAR_LEN  0x00004000ull
+
+/* The window the MMIO hooks cover, for the CPU's fast RAM path. */
+void wemu_virtio_bar(uint64_t *base, uint64_t *len) {
+    if (base) *base = VIRTIO_BAR_BASE;
+    if (len) *len = VIRTIO_BAR_LEN;
+}
 #define VQ_SIZE         256u
 #define BLK_SECTORS     2048ull
 #define BLK_SECTOR_BYTES 512u

@@ -3,8 +3,14 @@
 #include "wemu_internal.h"
 #include <stdlib.h>
 
+/* Does [gpa, gpa+len) touch the registered device window? */
+static inline int mmio_hit(const WemuCpu *cpu, uint64_t gpa, size_t len) {
+    return cpu->mmio_hi > cpu->mmio_lo &&
+           gpa + (uint64_t)len > cpu->mmio_lo && gpa < cpu->mmio_hi;
+}
+
 int wemu_gpa_read(WemuCpu *cpu, uint64_t gpa, void *dst, size_t len) {
-    if (cpu->mmio_read) {
+    if (cpu->mmio_read && mmio_hit(cpu, gpa, len)) {
         int rc = cpu->mmio_read(cpu, gpa, dst, len);
         if (rc <= 0) return rc;
     }
@@ -17,7 +23,7 @@ int wemu_gpa_read(WemuCpu *cpu, uint64_t gpa, void *dst, size_t len) {
 }
 
 int wemu_gpa_write(WemuCpu *cpu, uint64_t gpa, const void *src, size_t len) {
-    if (cpu->mmio_write) {
+    if (cpu->mmio_write && mmio_hit(cpu, gpa, len)) {
         int rc = cpu->mmio_write(cpu, gpa, src, len);
         if (rc <= 0) return rc;
     }

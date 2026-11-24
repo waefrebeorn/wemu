@@ -260,6 +260,8 @@ WemuMachine *wemu_machine_create(uint64_t ram_size, WemuSerialFn out, void *ud) 
     m->cpu->machine_ud = m;
     m->cpu->mmio_read = wemu_virtio_mmio_read;
     m->cpu->mmio_write = wemu_virtio_mmio_write;
+    wemu_virtio_bar(&m->cpu->mmio_lo, &m->cpu->mmio_hi);
+    m->cpu->mmio_hi += m->cpu->mmio_lo;   /* wemu_virtio_bar gives base+len */
     pci_cfg_init(m->pci_cfg);
     wemu_virtio_reset();
     return m;

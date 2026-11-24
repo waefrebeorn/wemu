@@ -573,6 +573,8 @@ size_t wemu_machine_queue_input(WemuMachine *m, const void *data, size_t len);
  * pushes RX bytes with wemu_machine_com2_push(). Kept separate from COM1 so
  * the debug log and the 9P wire never interleave. */
 void   wemu_machine_set_com2(WemuMachine *m, WemuSerialFn out, void *ud);
+/* Device window the MMIO hooks answer for (RAM accesses skip the hook). */
+void   wemu_virtio_bar(uint64_t *base, uint64_t *len);
 size_t wemu_machine_com2_push(WemuMachine *m, const void *data, size_t len);
 size_t wemu_machine_queue_keyboard(WemuMachine *m, const char *text);
 
