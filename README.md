@@ -70,3 +70,15 @@ make test     # all four behavior gates
 ```
 
 C11, no external dependencies, `-Werror` clean.
+
+## Standard
+
+- **Layer:** x86-64 emulator (WEMU)
+- **Build:** `make`
+- **Verify:** `make test`
+- **Docs:** no `docs/` yet -- the parent's `docs/compendium/04-roadmap/submodule-standard.md` is the front door
+- **Provenance:** own C11; no vendored third-party source without a note
+
+Part of the ~WuBu~ tree: this repository is held to the same conventions as
+the parent. See the parent's `docs/compendium/04-roadmap/submodule-standard.md`
+for the checklist and why each item exists.

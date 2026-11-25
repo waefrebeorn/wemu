@@ -28,3 +28,6 @@ test_isa_atomic_fence
 /tests/clone3_thread
 /tests/pie_timer
 /tests/wemu_script_*.scr
+# build output: never let a .d file show up as untracked
+build/
+*.bin
