@@ -1,7 +1,7 @@
 # WEMU -- the x86-64 emulator
 
 Runs x86-64 guest code in-process. It is the instrument the compiler back ends are
-verified with, and the guest leg for programs that cannot be run natively.
+verified with, and the guest leg for programs that cannot run natively.
 
 ## Build
 
